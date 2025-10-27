@@ -1,0 +1,6 @@
+# 主要依赖
+psycopg2-binary>=2.9.0
+python-dotenv>=1.0.0
+
+# 可选依赖（用于更好的开发体验）
+# psycopg2>=2.9.0  # 如果需要从源码编译，取消注释此行并注释上面的 psycopg2-binary
