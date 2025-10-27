@@ -27,6 +27,13 @@ class ChangeUserResponse(BaseModel):
     result: float | str
     status: str
 
+class DeleteUserRequest(BaseModel):
+    id: int
+
+class DeleteUserResponse(BaseModel):
+    result: float | str
+    status: str
+
 @app.get("/")
 async def root():
     return {"message": "Hello World"}
@@ -66,6 +73,28 @@ async def change_user(request: ChangeUserRequest):
         }
     try:
         user_id = db.update_user(request.id, email=request.email, name=request.name, age=request.age, password=request.password)
+        return {
+            "result": 200,
+            "status": "success"
+        }
+    except Exception as e:
+        return {
+            "result": e,
+            "status": "error"
+        }
+    finally:
+        db.disconnect
+
+@app.post("/users/delete", response_model=DeleteUserResponse)
+async def delete_user(request: DeleteUserRequest):
+    db = DatabaseManager()
+    if not db.connect():
+        return {
+            "result": "无法连接数据库",
+            "status": "error"
+        }
+    try:
+        user_id = db.delete_user(request.id)
         return {
             "result": 200,
             "status": "success"
