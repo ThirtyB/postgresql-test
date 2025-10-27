@@ -16,6 +16,17 @@ class CreateUserResponse(BaseModel):
     id: int
     status: str
 
+class ChangeUserRequest(BaseModel):
+    id: int
+    name: str
+    age: int
+    email: str
+    password: str
+
+class ChangeUserResponse(BaseModel):
+    result: float | str
+    status: str
+
 @app.get("/")
 async def root():
     return {"message": "Hello World"}
@@ -37,9 +48,32 @@ async def create_user(request: CreateUserRequest):
     if not db.connect():
         return CreateUserResponse(id=None, status="Failed to connect to database")
     try:
-        user_id = db.insert_user(request.name, request.email, request.age, request.password)
+        user_id = db.insert_user(request.id, request.name, request.email, request.age, request.password)
         return CreateUserResponse(id=user_id, status="success")
     except Exception as e:
         return CreateUserResponse(id=None, status=f"Failed to create user: {e}")
     finally:
         db.disconnect()
+
+
+@app.post("/users/change", response_model=ChangeUserResponse)
+async def change_user(request: ChangeUserRequest):
+    db = DatabaseManager()
+    if not db.connect():
+        return {
+            "result": "无法连接数据库",
+            "status": "error"
+        }
+    try:
+        user_id = db.update_user(request.id, email=request.email, name=request.name, age=request.age, password=request.password)
+        return {
+            "result": 200,
+            "status": "success"
+        }
+    except Exception as e:
+        return {
+            "result": e,
+            "status": "error"
+        }
+    finally:
+        db.disconnect
