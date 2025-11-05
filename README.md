@@ -41,7 +41,7 @@ pip install -r requirements.txt
 
 ## 配置数据库连接
 
-复制 `env_example.txt` 为 `.env` 文件，并修改数据库连接信息：
+复制 `env_example.txt` 为 `.env` 文件，并修改数据库连接信息（`.env` 已在 `.gitignore` 中忽略，不会被提交）：
 
 ```bash
 cp env_example.txt .env
@@ -66,6 +66,7 @@ python main.py
 - `main.py`: 主程序，演示各种数据库操作
 - `requirements.txt`: Python 依赖包列表
 - `env_example.txt`: 环境变量配置示例
+  - 请复制为 `.env`，并填写真实的敏感信息（不要提交 `.env`）
 
 ## 数据库表结构
 

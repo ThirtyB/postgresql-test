@@ -2,16 +2,16 @@
 # 复制此文件为 .env 并修改相应的配置值
 
 # 数据库主机地址
-DB_HOST=192.168.0.166
+DB_HOST=192.168.0.1
 
 # 数据库端口
 DB_PORT=5432
 
 # 数据库名称
-DB_NAME=exampledb
+DB_NAME=your_db
 
 # 数据库用户名
-DB_USER=user1
+DB_USER=your_user
 
 # 数据库密码
-DB_PASSWORD=123456
+DB_PASSWORD=your_password
