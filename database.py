@@ -589,10 +589,14 @@ class DatabaseManager:
             start_timestamp = current_timestamp - (time_window_hours * 3600)
             
             select_query = """
-            SELECT DISTINCT ON (ip) *
-            FROM node_monitor_metrics 
-            WHERE ts >= %s
-            ORDER BY ip, ts DESC, inserted_at DESC;
+            SELECT
+                t0.*
+            FROM
+                node_monitor_metrics t0,
+                (SELECT ip, MAX(ts) AS ts FROM node_monitor_metrics WHERE ts > %s GROUP BY ip) t1
+            WHERE
+                t0.ip = t1.ip
+                AND t0.ts = t1.ts
             """
             
             cursor.execute(select_query, (start_timestamp,))
