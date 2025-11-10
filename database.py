@@ -4,6 +4,8 @@ from psycopg2.pool import SimpleConnectionPool
 from typing import List, Dict, Optional
 from config import get_db_config
 import threading
+import bcrypt
+from auth_models import UserCreate, UserUpdate, UserLogin, UserResponse
 
 
 class DatabaseManager:
@@ -615,13 +617,13 @@ class DatabaseManager:
 
     def get_latest_complete_metrics_by_ip(self, ip: str) -> Optional[Dict]:
         """
-        根据IP地址获取该IP的最新完整监控信息
+        根据IP地址获取该IP的最新完整监控信息，包含所有计算字段
         
         Args:
             ip: IP地址
             
         Returns:
-            该IP的最新完整监控信息，包含所有字段
+            该IP的最新完整监控信息，包含原始字段和计算字段
         """
         connection = self.get_connection()
         if not connection:
@@ -642,14 +644,819 @@ class DatabaseManager:
             cursor.close()
             
             if metric:
+                metric_dict = dict(metric)
+                # 在后端完成所有计算
+                enriched_metric = self._enrich_metric_with_calculated_fields(metric_dict)
                 print(f"成功获取IP {ip} 的最新完整监控信息")
-                return dict(metric)
-            else:
-                print(f"未找到IP {ip} 的监控数据")
-                return None
+                return enriched_metric
                 
         except psycopg2.Error as e:
-            print(f"获取IP {ip} 最新完整监控信息失败: {e}")
+            print(f"获取IP {ip} 的最新完整监控信息失败: {e}")
             return None
+        finally:
+            self.return_connection(connection)
+
+    def get_latest_ten_complete_metrics_by_ip(self, ip: str) -> List[Dict]:
+        """
+        根据IP地址获取该IP的最近十条完整监控信息，包含所有计算字段
+        
+        Args:
+            ip: IP地址
+            
+        Returns:
+            该IP的最近十条完整监控信息列表，包含原始字段和计算字段
+        """
+        connection = self.get_connection()
+        if not connection:
+            return []
+            
+        try:
+            cursor = connection.cursor(cursor_factory=RealDictCursor)
+            
+            select_query = """
+            SELECT * FROM node_monitor_metrics 
+            WHERE ip = %s 
+            ORDER BY ts DESC, inserted_at DESC 
+            LIMIT 10;
+            """
+            
+            cursor.execute(select_query, (ip,))
+            metrics = cursor.fetchall()
+            cursor.close()
+            
+            enriched_metrics = []
+            for metric in metrics:
+                metric_dict = dict(metric)
+                # 在后端完成所有计算
+                enriched_metric = self._enrich_metric_with_calculated_fields(metric_dict)
+                enriched_metrics.append(enriched_metric)
+            
+            print(f"成功获取IP {ip} 的 {len(enriched_metrics)} 条完整监控信息")
+            return enriched_metrics
+                
+        except psycopg2.Error as e:
+            print(f"获取IP {ip} 最近十条完整监控信息失败: {e}")
+            return []
+        finally:
+            self.return_connection(connection)
+
+    # ==================== 用户认证相关方法 ====================
+
+    def create_user(self, user_data: UserCreate) -> Optional[int]:
+        """
+        创建新用户
+        
+        Args:
+            user_data: 用户创建数据
+            
+        Returns:
+            创建的用户ID，失败返回None
+        """
+        connection = self.get_connection()
+        if not connection:
+            return None
+            
+        try:
+            cursor = connection.cursor()
+            
+            # 检查用户名是否已存在
+            check_query = """
+            SELECT id FROM users 
+            WHERE username = %s
+            """
+            cursor.execute(check_query, (user_data.username,))
+            existing_user = cursor.fetchone()
+            
+            if existing_user:
+                print(f"用户名 {user_data.username} 已存在")
+                return None
+            
+            # 哈希密码
+            password_hash = bcrypt.hashpw(
+                user_data.password.encode('utf-8'), 
+                bcrypt.gensalt()
+            ).decode('utf-8')
+            
+            # 插入新用户（只插入用户名和密码）
+            insert_query = """
+            INSERT INTO users (username, password_hash)
+            VALUES (%s, %s)
+            RETURNING id
+            """
+            cursor.execute(insert_query, (
+                user_data.username,
+                password_hash
+            ))
+            
+            user_id = cursor.fetchone()[0]
+            connection.commit()
+            cursor.close()
+            
+            print(f"用户 {user_data.username} 创建成功，ID: {user_id}")
+            return user_id
+            
+        except psycopg2.Error as e:
+            print(f"创建用户失败: {e}")
+            connection.rollback()
+            return None
+        finally:
+            self.return_connection(connection)
+
+
+
+    def get_user_by_id(self, user_id: int) -> Optional[UserResponse]:
+        """
+        根据ID获取用户信息
+        
+        Args:
+            user_id: 用户ID
+            
+        Returns:
+            用户信息，不存在返回None
+        """
+        connection = self.get_connection()
+        if not connection:
+            return None
+            
+        try:
+            cursor = connection.cursor(cursor_factory=RealDictCursor)
+            
+            select_query = """
+            SELECT id, username, role, is_active, 
+                   last_login, created_at, updated_at
+            FROM users 
+            WHERE id = %s
+            """
+            cursor.execute(select_query, (user_id,))
+            user_record = cursor.fetchone()
+            cursor.close()
+            
+            if not user_record:
+                return None
+            
+            return UserResponse(
+                id=user_record['id'],
+                username=user_record['username'],
+                email=None,  # 用户表没有email字段
+                full_name=None,  # 用户表没有full_name字段
+                role=user_record['role'],
+                is_active=user_record['is_active'],
+                last_login=str(user_record['last_login']) if user_record['last_login'] else None,
+                created_at=str(user_record['created_at']),
+                updated_at=str(user_record['updated_at'])
+            )
+            
+        except psycopg2.Error as e:
+            print(f"获取用户信息失败: {e}")
+            return None
+        finally:
+            self.return_connection(connection)
+
+    def authenticate_user(self, login_data: UserLogin) -> Optional[UserResponse]:
+        """
+        用户认证
+        
+        Args:
+            login_data: 登录数据
+            
+        Returns:
+            认证成功的用户信息，失败返回None
+        """
+        connection = self.get_connection()
+        if not connection:
+            return None
+            
+        try:
+            cursor = connection.cursor(cursor_factory=RealDictCursor)
+            
+            # 查询用户信息
+            select_query = """
+            SELECT id, username, password_hash, role, 
+                   is_active, last_login, created_at, updated_at
+            FROM users 
+            WHERE username = %s AND is_active = true
+            """
+            cursor.execute(select_query, (login_data.username,))
+            user_record = cursor.fetchone()
+            
+            if not user_record:
+                print(f"用户 {login_data.username} 不存在或未激活")
+                return None
+            
+            # 验证密码
+            if not bcrypt.checkpw(
+                login_data.password.encode('utf-8'),
+                user_record['password_hash'].encode('utf-8')
+            ):
+                print(f"用户 {login_data.username} 密码错误")
+                return None
+            
+            # 更新最后登录时间
+            update_query = """
+            UPDATE users SET last_login = NOW() WHERE id = %s
+            """
+            cursor.execute(update_query, (user_record['id'],))
+            connection.commit()
+            cursor.close()
+            
+            # 转换为响应模型
+            user_response = UserResponse(
+                id=user_record['id'],
+                username=user_record['username'],
+                email=None,  # 用户表没有email字段
+                full_name=None,  # 用户表没有full_name字段
+                role=user_record['role'],
+                is_active=user_record['is_active'],
+                last_login=str(user_record['last_login']) if user_record['last_login'] else None,
+                created_at=str(user_record['created_at']),
+                updated_at=str(user_record['updated_at'])
+            )
+            
+            print(f"用户 {login_data.username} 认证成功")
+            return user_response
+            
+        except psycopg2.Error as e:
+            print(f"用户认证失败: {e}")
+            return None
+        finally:
+            self.return_connection(connection)
+
+    def get_user_by_username(self, username: str) -> Optional[UserResponse]:
+        """
+        根据用户名获取用户信息
+        
+        Args:
+            username: 用户名
+            
+        Returns:
+            用户信息，不存在返回None
+        """
+        connection = self.get_connection()
+        if not connection:
+            return None
+            
+        try:
+            cursor = connection.cursor(cursor_factory=RealDictCursor)
+            
+            select_query = """
+            SELECT id, username, email, full_name, role, is_active, 
+                   last_login, created_at, updated_at
+            FROM users 
+            WHERE username = %s
+            """
+            cursor.execute(select_query, (username,))
+            user_record = cursor.fetchone()
+            cursor.close()
+            
+            if not user_record:
+                return None
+            
+            return UserResponse(
+                id=user_record['id'],
+                username=user_record['username'],
+                email=None,  # 用户表没有email字段
+                full_name=None,  # 用户表没有full_name字段
+                role=user_record['role'],
+                is_active=user_record['is_active'],
+                last_login=str(user_record['last_login']) if user_record['last_login'] else None,
+                created_at=str(user_record['created_at']),
+                updated_at=str(user_record['updated_at'])
+            )
+            
+        except psycopg2.Error as e:
+            print(f"获取用户信息失败: {e}")
+            return None
+        finally:
+            self.return_connection(connection)
+
+    def update_user(self, user_id: int, update_data: UserUpdate) -> bool:
+        """
+        更新用户信息
+        
+        Args:
+            user_id: 用户ID
+            update_data: 更新数据
+            
+        Returns:
+            是否更新成功
+        """
+        connection = self.get_connection()
+        if not connection:
+            return False
+            
+        try:
+            cursor = connection.cursor()
+            
+            # 构建动态更新查询
+            update_fields = []
+            update_values = []
+            
+            if update_data.email is not None:
+                update_fields.append("email = %s")
+                update_values.append(update_data.email)
+            
+            if update_data.full_name is not None:
+                update_fields.append("full_name = %s")
+                update_values.append(update_data.full_name)
+            
+            if update_data.role is not None:
+                update_fields.append("role = %s")
+                update_values.append(update_data.role.value)
+            
+            if update_data.is_active is not None:
+                update_fields.append("is_active = %s")
+                update_values.append(update_data.is_active)
+            
+            if not update_fields:
+                return True  # 没有需要更新的字段
+            
+            update_values.append(user_id)
+            update_query = f"""
+            UPDATE users 
+            SET {', '.join(update_fields)}
+            WHERE id = %s
+            """
+            
+            cursor.execute(update_query, update_values)
+            connection.commit()
+            cursor.close()
+            
+            print(f"用户 {user_id} 更新成功")
+            return True
+            
+        except psycopg2.Error as e:
+            print(f"更新用户失败: {e}")
+            connection.rollback()
+            return False
+        finally:
+            self.return_connection(connection)
+
+    def delete_user(self, user_id: int) -> bool:
+        """
+        删除用户（软删除，设置为非激活状态）
+        
+        Args:
+            user_id: 用户ID
+            
+        Returns:
+            是否删除成功
+        """
+        connection = self.get_connection()
+        if not connection:
+            return False
+            
+        try:
+            cursor = connection.cursor()
+            
+            update_query = """
+            UPDATE users SET is_active = false WHERE id = %s
+            """
+            cursor.execute(update_query, (user_id,))
+            connection.commit()
+            cursor.close()
+            
+            print(f"用户 {user_id} 已删除（设置为非激活状态）")
+            return True
+            
+        except psycopg2.Error as e:
+            print(f"删除用户失败: {e}")
+            connection.rollback()
+            return False
+        finally:
+            self.return_connection(connection)
+
+    def _enrich_metric_with_calculated_fields(self, metric: Dict) -> Dict:
+        """
+        为监控指标添加计算字段
+        
+        Args:
+            metric: 原始监控指标数据
+            
+        Returns:
+            包含计算字段的完整监控指标数据
+        """
+        # 获取原始字段值，处理None值
+        cpu_usr = metric.get('cpu_usr', 0) or 0
+        cpu_sys = metric.get('cpu_sys', 0) or 0
+        cpu_iow = metric.get('cpu_iow', 0) or 0
+        
+        mem_total = metric.get('mem_total', 0) or 0
+        mem_free = metric.get('mem_free', 0) or 0
+        mem_buff = metric.get('mem_buff', 0) or 0
+        mem_cache = metric.get('mem_cache', 0) or 0
+        
+        swap_total = metric.get('swap_total', 0) or 0
+        swap_used = metric.get('swap_used', 0) or 0
+        
+        net_rx_kbytes = metric.get('net_rx_kbytes', 0) or 0
+        net_tx_kbytes = metric.get('net_tx_kbytes', 0) or 0
+        
+        # CPU相关计算字段
+        cpu_total_usage = cpu_usr + cpu_sys + cpu_iow
+        cpu_idle = max(0, 100 - cpu_total_usage)
+        
+        # 内存相关计算字段
+        mem_used = mem_total - mem_free - mem_buff - mem_cache
+        mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+        mem_actual_used = mem_total - mem_free  # 实际使用内存（不含缓存和缓冲区）
+        
+        # Swap相关计算字段
+        swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 网络相关计算字段（字节转换）
+        net_rx_bytes = net_rx_kbytes * 1024  # KBytes 转 Bytes
+        net_tx_bytes = net_tx_kbytes * 1024  # KBytes 转 Bytes
+        
+        # 添加所有计算字段到返回数据中
+        enriched_metric = metric.copy()
+        
+        # CPU相关字段
+        enriched_metric['cpu_total_usage'] = round(cpu_total_usage, 2)
+        enriched_metric['cpu_idle'] = round(cpu_idle, 2)
+        
+        # 内存相关字段
+        enriched_metric['mem_used'] = int(mem_used)
+        enriched_metric['mem_usage_percent'] = round(mem_usage_percent, 2)
+        enriched_metric['mem_actual_used'] = int(mem_actual_used)
+        
+        # Swap相关字段
+        enriched_metric['swap_usage_percent'] = round(swap_usage_percent, 2)
+        
+        # 网络相关字段
+        enriched_metric['net_rx_bytes'] = int(net_rx_bytes)
+        enriched_metric['net_tx_bytes'] = int(net_tx_bytes)
+        
+        # 确保字段名与前端期望的一致
+        enriched_metric['mem_buffer'] = mem_buff  # 添加mem_buffer字段别名
+        enriched_metric['swap_free'] = swap_total - swap_used  # 计算swap_free
+        
+        return enriched_metric
+
+    def get_latest_ten_complete_metrics_by_ip(self, ip: str) -> List[Dict]:
+        """
+        根据IP地址获取该IP的最近十条完整监控信息，包含所有计算字段
+        
+        Args:
+            ip: IP地址
+            
+        Returns:
+            该IP的最近十条完整监控信息列表，包含原始字段和计算字段
+        """
+        connection = self.get_connection()
+        if not connection:
+            return []
+            
+        try:
+            cursor = connection.cursor(cursor_factory=RealDictCursor)
+            
+            select_query = """
+            SELECT * FROM node_monitor_metrics 
+            WHERE ip = %s 
+            ORDER BY ts DESC, inserted_at DESC 
+            LIMIT 10;
+            """
+            
+            cursor.execute(select_query, (ip,))
+            metrics = cursor.fetchall()
+            cursor.close()
+            
+            enriched_metrics = []
+            for metric in metrics:
+                metric_dict = dict(metric)
+                # 在后端完成所有计算
+                enriched_metric = self._enrich_metric_with_calculated_fields(metric_dict)
+                enriched_metrics.append(enriched_metric)
+            
+            print(f"成功获取IP {ip} 的 {len(enriched_metrics)} 条完整监控信息")
+            return enriched_metrics
+                
+        except psycopg2.Error as e:
+            print(f"获取IP {ip} 最近十条完整监控信息失败: {e}")
+            return []
+        finally:
+            self.return_connection(connection)
+
+    # ==================== 用户认证相关方法 ====================
+
+    def create_user(self, user_data: UserCreate) -> Optional[int]:
+        """
+        创建新用户
+        
+        Args:
+            user_data: 用户创建数据
+            
+        Returns:
+            创建的用户ID，失败返回None
+        """
+        connection = self.get_connection()
+        if not connection:
+            return None
+            
+        try:
+            cursor = connection.cursor()
+            
+            # 检查用户名是否已存在
+            check_query = """
+            SELECT id FROM users 
+            WHERE username = %s
+            """
+            cursor.execute(check_query, (user_data.username,))
+            existing_user = cursor.fetchone()
+            
+            if existing_user:
+                print(f"用户名 {user_data.username} 已存在")
+                return None
+            
+            # 哈希密码
+            password_hash = bcrypt.hashpw(
+                user_data.password.encode('utf-8'), 
+                bcrypt.gensalt()
+            ).decode('utf-8')
+            
+            # 插入新用户（只插入用户名和密码）
+            insert_query = """
+            INSERT INTO users (username, password_hash)
+            VALUES (%s, %s)
+            RETURNING id
+            """
+            cursor.execute(insert_query, (
+                user_data.username,
+                password_hash
+            ))
+            
+            user_id = cursor.fetchone()[0]
+            connection.commit()
+            cursor.close()
+            
+            print(f"用户 {user_data.username} 创建成功，ID: {user_id}")
+            return user_id
+            
+        except psycopg2.Error as e:
+            print(f"创建用户失败: {e}")
+            connection.rollback()
+            return None
+        finally:
+            self.return_connection(connection)
+
+
+
+    def get_user_by_id(self, user_id: int) -> Optional[UserResponse]:
+        """
+        根据ID获取用户信息
+        
+        Args:
+            user_id: 用户ID
+            
+        Returns:
+            用户信息，不存在返回None
+        """
+        connection = self.get_connection()
+        if not connection:
+            return None
+            
+        try:
+            cursor = connection.cursor(cursor_factory=RealDictCursor)
+            
+            select_query = """
+            SELECT id, username, role, is_active, 
+                   last_login, created_at, updated_at
+            FROM users 
+            WHERE id = %s
+            """
+            cursor.execute(select_query, (user_id,))
+            user_record = cursor.fetchone()
+            cursor.close()
+            
+            if not user_record:
+                return None
+            
+            return UserResponse(
+                id=user_record['id'],
+                username=user_record['username'],
+                email=None,  # 用户表没有email字段
+                full_name=None,  # 用户表没有full_name字段
+                role=user_record['role'],
+                is_active=user_record['is_active'],
+                last_login=str(user_record['last_login']) if user_record['last_login'] else None,
+                created_at=str(user_record['created_at']),
+                updated_at=str(user_record['updated_at'])
+            )
+            
+        except psycopg2.Error as e:
+            print(f"获取用户信息失败: {e}")
+            return None
+        finally:
+            self.return_connection(connection)
+
+    def authenticate_user(self, login_data: UserLogin) -> Optional[UserResponse]:
+        """
+        用户认证
+        
+        Args:
+            login_data: 登录数据
+            
+        Returns:
+            认证成功的用户信息，失败返回None
+        """
+        connection = self.get_connection()
+        if not connection:
+            return None
+            
+        try:
+            cursor = connection.cursor(cursor_factory=RealDictCursor)
+            
+            # 查询用户信息
+            select_query = """
+            SELECT id, username, password_hash, role, 
+                   is_active, last_login, created_at, updated_at
+            FROM users 
+            WHERE username = %s AND is_active = true
+            """
+            cursor.execute(select_query, (login_data.username,))
+            user_record = cursor.fetchone()
+            
+            if not user_record:
+                print(f"用户 {login_data.username} 不存在或未激活")
+                return None
+            
+            # 验证密码
+            if not bcrypt.checkpw(
+                login_data.password.encode('utf-8'),
+                user_record['password_hash'].encode('utf-8')
+            ):
+                print(f"用户 {login_data.username} 密码错误")
+                return None
+            
+            # 更新最后登录时间
+            update_query = """
+            UPDATE users SET last_login = NOW() WHERE id = %s
+            """
+            cursor.execute(update_query, (user_record['id'],))
+            connection.commit()
+            cursor.close()
+            
+            # 转换为响应模型
+            user_response = UserResponse(
+                id=user_record['id'],
+                username=user_record['username'],
+                email=None,  # 用户表没有email字段
+                full_name=None,  # 用户表没有full_name字段
+                role=user_record['role'],
+                is_active=user_record['is_active'],
+                last_login=str(user_record['last_login']) if user_record['last_login'] else None,
+                created_at=str(user_record['created_at']),
+                updated_at=str(user_record['updated_at'])
+            )
+            
+            print(f"用户 {login_data.username} 认证成功")
+            return user_response
+            
+        except psycopg2.Error as e:
+            print(f"用户认证失败: {e}")
+            return None
+        finally:
+            self.return_connection(connection)
+
+    def get_user_by_username(self, username: str) -> Optional[UserResponse]:
+        """
+        根据用户名获取用户信息
+        
+        Args:
+            username: 用户名
+            
+        Returns:
+            用户信息，不存在返回None
+        """
+        connection = self.get_connection()
+        if not connection:
+            return None
+            
+        try:
+            cursor = connection.cursor(cursor_factory=RealDictCursor)
+            
+            select_query = """
+            SELECT id, username, email, full_name, role, is_active, 
+                   last_login, created_at, updated_at
+            FROM users 
+            WHERE username = %s
+            """
+            cursor.execute(select_query, (username,))
+            user_record = cursor.fetchone()
+            cursor.close()
+            
+            if not user_record:
+                return None
+            
+            return UserResponse(
+                id=user_record['id'],
+                username=user_record['username'],
+                email=None,  # 用户表没有email字段
+                full_name=None,  # 用户表没有full_name字段
+                role=user_record['role'],
+                is_active=user_record['is_active'],
+                last_login=str(user_record['last_login']) if user_record['last_login'] else None,
+                created_at=str(user_record['created_at']),
+                updated_at=str(user_record['updated_at'])
+            )
+            
+        except psycopg2.Error as e:
+            print(f"获取用户信息失败: {e}")
+            return None
+        finally:
+            self.return_connection(connection)
+
+    def update_user(self, user_id: int, update_data: UserUpdate) -> bool:
+        """
+        更新用户信息
+        
+        Args:
+            user_id: 用户ID
+            update_data: 更新数据
+            
+        Returns:
+            是否更新成功
+        """
+        connection = self.get_connection()
+        if not connection:
+            return False
+            
+        try:
+            cursor = connection.cursor()
+            
+            # 构建动态更新查询
+            update_fields = []
+            update_values = []
+            
+            if update_data.email is not None:
+                update_fields.append("email = %s")
+                update_values.append(update_data.email)
+            
+            if update_data.full_name is not None:
+                update_fields.append("full_name = %s")
+                update_values.append(update_data.full_name)
+            
+            if update_data.role is not None:
+                update_fields.append("role = %s")
+                update_values.append(update_data.role.value)
+            
+            if update_data.is_active is not None:
+                update_fields.append("is_active = %s")
+                update_values.append(update_data.is_active)
+            
+            if not update_fields:
+                return True  # 没有需要更新的字段
+            
+            update_values.append(user_id)
+            update_query = f"""
+            UPDATE users 
+            SET {', '.join(update_fields)}
+            WHERE id = %s
+            """
+            
+            cursor.execute(update_query, update_values)
+            connection.commit()
+            cursor.close()
+            
+            print(f"用户 {user_id} 更新成功")
+            return True
+            
+        except psycopg2.Error as e:
+            print(f"更新用户失败: {e}")
+            connection.rollback()
+            return False
+        finally:
+            self.return_connection(connection)
+
+    def delete_user(self, user_id: int) -> bool:
+        """
+        删除用户（软删除，设置为非激活状态）
+        
+        Args:
+            user_id: 用户ID
+            
+        Returns:
+            是否删除成功
+        """
+        connection = self.get_connection()
+        if not connection:
+            return False
+            
+        try:
+            cursor = connection.cursor()
+            
+            update_query = """
+            UPDATE users SET is_active = false WHERE id = %s
+            """
+            cursor.execute(update_query, (user_id,))
+            connection.commit()
+            cursor.close()
+            
+            print(f"用户 {user_id} 已删除（设置为非激活状态）")
+            return True
+            
+        except psycopg2.Error as e:
+            print(f"删除用户失败: {e}")
+            connection.rollback()
+            return False
         finally:
             self.return_connection(connection)

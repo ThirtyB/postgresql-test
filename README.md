@@ -41,18 +41,33 @@ pip install -r requirements.txt
 
 ## 配置数据库连接
 
-复制 `env_example.txt` 为 `.env` 文件，并修改数据库连接信息（`.env` 已在 `.gitignore` 中忽略，不会被提交）：
+复制 `.env.example` 为 `.env` 文件，并修改配置信息（`.env` 已在 `.gitignore` 中忽略，不会被提交）：
 
 ```bash
-cp env_example.txt .env
+cp .env.example .env
 ```
 
 编辑 `.env` 文件，修改以下配置：
+
+### 数据库配置
 - `DB_HOST`: 数据库主机地址
 - `DB_PORT`: 数据库端口
 - `DB_NAME`: 数据库名称
 - `DB_USER`: 数据库用户名
 - `DB_PASSWORD`: 数据库密码
+
+### JWT安全配置（重要！）
+- `JWT_SECRET_KEY`: JWT密钥（生产环境必须修改）
+- `JWT_ALGORITHM`: JWT算法（默认HS256）
+- `JWT_EXPIRE_MINUTES`: 令牌过期时间（默认30分钟）
+
+**重要安全提醒**: 生产环境必须修改 `JWT_SECRET_KEY`，使用强随机密钥：
+```bash
+# 生成安全密钥
+openssl rand -base64 32
+# 或使用Python
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
 
 ## 运行示例
 
