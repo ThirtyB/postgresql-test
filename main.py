@@ -3,7 +3,8 @@ from fastapi.responses import JSONResponse
 from database import DatabaseManager
 from response_models import SuccessResponse, ErrorResponseBuilder, PaginatedResponse, ErrorCode, ErrorDetail
 from auth_models import UserCreate, UserLogin, UserUpdate, UserResponse, Token
-from jwt_auth import create_access_token, get_current_user, get_current_active_user, allow_admin, allow_admin_user, allow_all
+from jwt_auth import create_access_token, refresh_access_token, get_current_user, get_current_active_user, allow_admin, allow_admin_user, allow_all
+from redis_cache import cache_manager, cache_decorator, cache_metrics
 from pydantic import BaseModel, ValidationError
 from typing import Optional, List
 from datetime import datetime, timedelta
@@ -253,14 +254,17 @@ async def delete_user(request_data: DeleteUserRequest, current_user: UserRespons
         )
 
 @app.get("/monitor-metrics/latest")
+@cache_decorator(expire_seconds=60, key_prefix="monitor_metrics")
 async def get_latest_monitor_metrics(limit: int = Query(default=5, ge=1, le=100), current_user: UserResponse = Depends(allow_all), request: Request = None):
-    """获取最新的监控指标数据（需要认证）"""
+    """获取最新的监控指标数据（需要认证，1分钟缓存）"""
     request_id = str(uuid.uuid4())
     
     try:
         metrics = db_manager.get_latest_monitor_metrics(limit=limit)
+        cache_metrics.record_hit()
         return SuccessResponse(data=metrics, request_id=request_id)
     except Exception as e:
+        cache_metrics.record_error()
         return ErrorResponseBuilder.database_error(
             message=f"获取监控指标失败: {str(e)}",
             path=str(request.url) if request else None,
@@ -268,14 +272,17 @@ async def get_latest_monitor_metrics(limit: int = Query(default=5, ge=1, le=100)
         )
 
 @app.get("/monitor-metrics/ip/{ip}")
+@cache_decorator(expire_seconds=60, key_prefix="metrics_by_ip")
 async def get_metrics_by_ip(ip: str, limit: int = Query(default=10, ge=1, le=100), current_user: UserResponse = Depends(allow_all), request: Request = None):
-    """根据IP查询监控指标数据（需要认证）"""
+    """根据IP查询监控指标数据（需要认证，1分钟缓存）"""
     request_id = str(uuid.uuid4())
     
     try:
         metrics = db_manager.get_metrics_by_ip(ip=ip, limit=limit)
+        cache_metrics.record_hit()
         return SuccessResponse(data=metrics, request_id=request_id)
     except Exception as e:
+        cache_metrics.record_error()
         return ErrorResponseBuilder.database_error(
             message=f"根据IP查询监控指标失败: {str(e)}",
             path=str(request.url) if request else None,
@@ -283,18 +290,21 @@ async def get_metrics_by_ip(ip: str, limit: int = Query(default=10, ge=1, le=100
         )
 
 @app.get("/monitor-metrics/ip/{ip}/latest")
+@cache_decorator(expire_seconds=60, key_prefix="latest_metric_by_ip")
 async def get_latest_metric_by_ip(ip: str, current_user: UserResponse = Depends(allow_all), request: Request = None):
-    """获取指定IP的最新一条监控指标数据（需要认证）"""
+    """获取指定IP的最新一条监控指标数据（需要认证，1分钟缓存）"""
     request_id = str(uuid.uuid4())
     
     try:
         metric = db_manager.get_latest_metric_by_ip(ip=ip)
         if not metric:
             raise HTTPException(status_code=404, detail="未找到该IP的监控数据")
+        cache_metrics.record_hit()
         return SuccessResponse(data=metric, request_id=request_id)
     except HTTPException:
         raise
     except Exception as e:
+        cache_metrics.record_error()
         return ErrorResponseBuilder.database_error(
             message=f"获取IP最新监控指标失败: {str(e)}",
             path=str(request.url) if request else None,
@@ -302,6 +312,7 @@ async def get_latest_metric_by_ip(ip: str, current_user: UserResponse = Depends(
         )
 
 @app.get("/monitor-metrics/time-range")
+@cache_decorator(expire_seconds=60, key_prefix="metrics_by_time_range")
 async def get_metrics_by_time_range(
     start_ts: int = Query(..., description="开始时间戳"),
     end_ts: int = Query(..., description="结束时间戳"),
@@ -309,23 +320,27 @@ async def get_metrics_by_time_range(
     limit: int = Query(default=100, ge=1, le=1000, description="返回条数限制"),
     current_user: UserResponse = Depends(allow_all)
 ):
-    """根据时间范围查询监控指标数据（需要认证）"""
+    """根据时间范围查询监控指标数据（需要认证，1分钟缓存）"""
     try:
         metrics = db_manager.get_metrics_by_time_range(start_ts=start_ts, end_ts=end_ts, ip=ip, limit=limit)
+        cache_metrics.record_hit()
         return SuccessResponse(data=metrics)
     except Exception as e:
+        cache_metrics.record_error()
         return ErrorResponse(code=ErrorCode.DATABASE_ERROR, message=f"根据时间范围查询监控指标失败: {str(e)}")
 
 @app.get("/monitor-metrics/paginated")
+@cache_decorator(expire_seconds=60, key_prefix="metrics_paginated")
 async def get_metrics_paginated(
     page: int = Query(default=1, ge=1, description="页码"),
     page_size: int = Query(default=20, ge=1, le=100, description="每页条数"),
     ip: Optional[str] = Query(default=None, description="IP地址（可选）"),
     current_user: UserResponse = Depends(allow_all)
 ):
-    """分页查询监控指标数据（需要认证）"""
+    """分页查询监控指标数据（需要认证，1分钟缓存）"""
     try:
         result = db_manager.get_metrics_paginated(page=page, page_size=page_size, ip=ip)
+        cache_metrics.record_hit()
         return PaginatedResponse(
             data=result["data"],
             total=result["total"],
@@ -334,67 +349,81 @@ async def get_metrics_paginated(
             total_pages=result["total_pages"]
         )
     except Exception as e:
+        cache_metrics.record_error()
         return ErrorResponse(code=ErrorCode.DATABASE_ERROR, message=f"分页查询监控指标失败: {str(e)}")
 
 @app.get("/monitor-metrics/ips")
+@cache_decorator(expire_seconds=60, key_prefix="all_ips")
 async def get_all_ips(current_user: UserResponse = Depends(allow_all)):
-    """获取所有监控的IP列表（需要认证）"""
+    """获取所有监控的IP列表（需要认证，1分钟缓存）"""
     try:
         ips = db_manager.get_all_ips()
+        cache_metrics.record_hit()
         return SuccessResponse(data=ips)
     except Exception as e:
+        cache_metrics.record_error()
         return ErrorResponse(code=ErrorCode.DATABASE_ERROR, message=f"获取IP列表失败: {str(e)}")
 
 @app.get("/monitor-metrics/statistics")
+@cache_decorator(expire_seconds=60, key_prefix="metrics_statistics")
 async def get_metrics_statistics(
     ip: Optional[str] = Query(default=None, description="IP地址（可选）"),
     start_ts: Optional[int] = Query(default=None, description="开始时间戳（可选）"),
     end_ts: Optional[int] = Query(default=None, description="结束时间戳（可选）"),
     current_user: UserResponse = Depends(allow_all)
 ):
-    """获取监控指标的统计信息（平均值、最大值、最小值）（需要认证）"""
+    """获取监控指标的统计信息（平均值、最大值、最小值）（需要认证，1分钟缓存）"""
     try:
         stats = db_manager.get_metrics_statistics(ip=ip, start_ts=start_ts, end_ts=end_ts)
         if not stats:
             raise HTTPException(status_code=404, detail="未找到统计信息")
+        cache_metrics.record_hit()
         return SuccessResponse(data=stats)
     except Exception as e:
+        cache_metrics.record_error()
         return ErrorResponse(code=ErrorCode.DATABASE_ERROR, message=f"获取统计信息失败: {str(e)}")
 
 @app.get("/monitor-metrics/high-cpu")
+@cache_decorator(expire_seconds=60, key_prefix="high_cpu_metrics")
 async def get_high_cpu_metrics(
     cpu_threshold: float = Query(default=80.0, ge=0, le=100, description="CPU使用率阈值（%）"),
     limit: int = Query(default=20, ge=1, le=100, description="返回条数限制"),
     current_user: UserResponse = Depends(allow_all)
 ):
-    """查询CPU使用率超过阈值的监控指标（需要认证）"""
+    """查询CPU使用率超过阈值的监控指标（需要认证，1分钟缓存）"""
     try:
         metrics = db_manager.get_high_cpu_metrics(cpu_threshold=cpu_threshold, limit=limit)
+        cache_metrics.record_hit()
         return SuccessResponse(data=metrics)
     except Exception as e:
+        cache_metrics.record_error()
         return ErrorResponse(code=ErrorCode.DATABASE_ERROR, message=f"查询高CPU使用率监控指标失败: {str(e)}")
 
 @app.get("/monitor-metrics/high-memory")
+@cache_decorator(expire_seconds=60, key_prefix="high_memory_metrics")
 async def get_high_memory_metrics(
     mem_threshold: float = Query(default=80.0, ge=0, le=100, description="内存使用率阈值（%）"),
     limit: int = Query(default=20, ge=1, le=100, description="返回条数限制"),
     current_user: UserResponse = Depends(allow_all)
 ):
-    """查询内存使用率超过阈值的监控指标（需要认证）"""
+    """查询内存使用率超过阈值的监控指标（需要认证，1分钟缓存）"""
     try:
         metrics = db_manager.get_high_memory_metrics(mem_threshold=mem_threshold, limit=limit)
+        cache_metrics.record_hit()
         return SuccessResponse(data=metrics)
     except Exception as e:
+        cache_metrics.record_error()
         return ErrorResponse(code=ErrorCode.DATABASE_ERROR, message=f"查询高内存使用率监控指标失败: {str(e)}")
 
 
 @app.get("/monitor-metrics/active-machines")
+@cache_decorator(expire_seconds=60, key_prefix="active_machines")
 async def get_active_machines_latest_metrics(
     time_window_hours: int = Query(default=1, ge=1, le=24, description="时间窗口（小时），默认为1小时"),
     current_user: UserResponse = Depends(allow_all)
 ):
     """
-    获取指定时间窗口内活跃机器的最新监控指标（需要认证）
+    获取指定时间窗口内活跃机器的最新监控指标（需要认证，1分钟缓存）
     
     参数:
         time_window_hours: 时间窗口（小时），默认1小时，最大24小时
@@ -428,12 +457,14 @@ async def get_active_machines_latest_metrics(
             }
             formatted_metrics.append(formatted_metric)
         
+        cache_metrics.record_hit()
         return SuccessResponse(
             data=formatted_metrics,
             message=f"成功获取{len(formatted_metrics)}个活跃机器的最新监控数据"
         )
         
     except Exception as e:
+        cache_metrics.record_error()
         return ErrorResponse(
             code=ErrorCode.DATABASE_ERROR, 
             message=f"获取活跃机器最新监控指标失败: {str(e)}"
@@ -441,9 +472,10 @@ async def get_active_machines_latest_metrics(
 
 
 @app.get("/monitor-metrics/ip/{ip}/complete")
+@cache_decorator(expire_seconds=60, key_prefix="complete_metrics_by_ip")
 async def get_latest_complete_metrics_by_ip(ip: str, current_user: UserResponse = Depends(allow_all)):
     """
-    根据IP地址获取该IP的最新完整监控信息，包含所有计算字段
+    根据IP地址获取该IP的最新完整监控信息，包含所有计算字段（需要认证，1分钟缓存）
     
     参数:
         ip: IP地址
@@ -487,6 +519,7 @@ async def get_latest_complete_metrics_by_ip(ip: str, current_user: UserResponse 
         if not metric:
             raise HTTPException(status_code=404, detail=f"未找到IP {ip} 的监控数据")
         
+        cache_metrics.record_hit()
         # 返回完整的监控信息，包含所有计算字段
         return SuccessResponse(
             data=metric,
@@ -496,6 +529,7 @@ async def get_latest_complete_metrics_by_ip(ip: str, current_user: UserResponse 
     except HTTPException:
         raise
     except Exception as e:
+        cache_metrics.record_error()
         return ErrorResponse(
             code=ErrorCode.DATABASE_ERROR, 
             message=f"获取IP {ip} 最新完整监控信息失败: {str(e)}"
@@ -503,9 +537,10 @@ async def get_latest_complete_metrics_by_ip(ip: str, current_user: UserResponse 
 
 
 @app.get("/monitor-metrics/ip/{ip}/latest-ten")
+@cache_decorator(expire_seconds=60, key_prefix="latest_ten_metrics_by_ip")
 async def get_latest_ten_complete_metrics_by_ip(ip: str, current_user: UserResponse = Depends(allow_all)):
     """
-    根据IP地址获取该IP的最近十条完整监控信息，包含所有计算字段
+    根据IP地址获取该IP的最近十条完整监控信息，包含所有计算字段（需要认证，1分钟缓存）
     
     参数:
         ip: IP地址
@@ -594,6 +629,7 @@ async def get_latest_ten_complete_metrics_by_ip(ip: str, current_user: UserRespo
             }
         }
         
+        cache_metrics.record_hit()
         return SuccessResponse(
             data=response_data,
             message=f"成功获取IP {ip} 的最近{len(metrics)}条完整监控信息"
@@ -602,6 +638,7 @@ async def get_latest_ten_complete_metrics_by_ip(ip: str, current_user: UserRespo
     except HTTPException:
         raise
     except Exception as e:
+        cache_metrics.record_error()
         return ErrorResponse(
             code=ErrorCode.DATABASE_ERROR, 
             message=f"获取IP {ip} 最近十条完整监控信息失败: {str(e)}"
@@ -643,7 +680,7 @@ async def register_user(user_data: UserCreate):
 @app.post("/auth/login", response_model=SuccessResponse)
 async def login_user(login_data: UserLogin):
     """
-    用户登录
+    用户登录（Token缓存6小时）
     
     Args:
         login_data: 登录信息
@@ -656,9 +693,9 @@ async def login_user(login_data: UserLogin):
         if not user:
             raise HTTPException(status_code=401, detail="用户名或密码错误")
         
-        # 创建访问令牌
-        access_token_expires = timedelta(minutes=30)
-        access_token = create_access_token(
+        # 创建访问令牌（6小时过期）
+        access_token_expires = timedelta(hours=6)
+        access_token = await create_access_token(
             data={
                 "sub": user.username,
                 "user_id": user.id,
@@ -667,9 +704,20 @@ async def login_user(login_data: UserLogin):
             expires_delta=access_token_expires
         )
         
+        # 创建刷新令牌（7天过期）
+        refresh_token = create_refresh_token(
+            data={
+                "sub": user.username,
+                "user_id": user.id,
+                "role": user.role
+            }
+        )
+        
         token_response = Token(
             access_token=access_token,
-            expires_in=access_token_expires.seconds
+            refresh_token=refresh_token,
+            expires_in=access_token_expires.seconds,
+            token_type="bearer"
         )
         
         return SuccessResponse(
@@ -767,6 +815,95 @@ async def get_protected_metrics_by_ip(
         return SuccessResponse(data=metrics)
     except Exception as e:
         return ErrorResponse(code=ErrorCode.DATABASE_ERROR, message=f"根据IP查询监控指标失败: {str(e)}")
+
+
+@app.post("/auth/refresh", response_model=SuccessResponse)
+async def refresh_token(refresh_token: str):
+    """
+    Token续期接口
+    
+    Args:
+        refresh_token: 刷新令牌
+        
+    Returns:
+        新的访问令牌
+    """
+    try:
+        new_token = await refresh_access_token(refresh_token)
+        if not new_token:
+            raise HTTPException(status_code=401, detail="无效的刷新令牌")
+        
+        return SuccessResponse(
+            data={"token": new_token},
+            message="Token续期成功"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        return ErrorResponse(
+            code=ErrorCode.AUTHENTICATION_ERROR,
+            message=f"Token续期失败: {str(e)}"
+        )
+
+
+@app.get("/cache/stats", response_model=SuccessResponse)
+async def get_cache_statistics(current_user: UserResponse = Depends(allow_admin)):
+    """
+    获取缓存统计信息（仅管理员可用）
+    
+    Args:
+        current_user: 当前认证用户（必须是管理员）
+        
+    Returns:
+        缓存统计信息
+    """
+    try:
+        stats = cache_metrics.get_stats()
+        return SuccessResponse(
+            data=stats,
+            message="获取缓存统计信息成功"
+        )
+        
+    except Exception as e:
+        return ErrorResponse(
+            code=ErrorCode.INTERNAL_ERROR,
+            message=f"获取缓存统计信息失败: {str(e)}"
+        )
+
+
+@app.post("/cache/clear", response_model=SuccessResponse)
+async def clear_cache(pattern: str = "*", current_user: UserResponse = Depends(allow_admin)):
+    """
+    清除缓存（仅管理员可用）
+    
+    Args:
+        pattern: 缓存键模式
+        current_user: 当前认证用户（必须是管理员）
+        
+    Returns:
+        清除结果
+    """
+    try:
+        # 清除所有后端的匹配缓存
+        cleared_count = 0
+        for backend in ["default", "tokens", "monitor_metrics"]:
+            count = cache_manager.clear_pattern(pattern, backend)
+            cleared_count += count
+        
+        # 重置统计信息
+        cache_metrics.reset()
+        
+        return SuccessResponse(
+            data={"cleared_count": cleared_count},
+            message=f"成功清除{cleared_count}个缓存项"
+        )
+        
+    except Exception as e:
+        return ErrorResponse(
+            code=ErrorCode.INTERNAL_ERROR,
+            message=f"清除缓存失败: {str(e)}"
+        )
 
 
 @app.get("/admin/users", response_model=SuccessResponse)

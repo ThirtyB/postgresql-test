@@ -3,14 +3,18 @@ from typing import Optional
 from jose import JWTError, jwt
 from fastapi import HTTPException, status, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from auth_models import TokenData, UserResponse
+from auth_models import TokenData, UserResponse, Token
 from database import DatabaseManager
+from redis_cache import cache_manager, token_cache_decorator
+from config import get_jwt_config
 import os
 
 # JWT配置
-SECRET_KEY = os.getenv("JWT_SECRET_KEY")
-ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "30"))  # 30分钟过期
+jwt_config = get_jwt_config()
+SECRET_KEY = jwt_config["secret_key"]
+ALGORITHM = jwt_config["algorithm"]
+ACCESS_TOKEN_EXPIRE_MINUTES = jwt_config["access_token_expire_minutes"]  # 6小时
+REFRESH_TOKEN_EXPIRE_DAYS = jwt_config["refresh_token_expire_days"]  # 7天
 
 # 检查密钥是否配置
 if not SECRET_KEY or SECRET_KEY == "your-super-secure-production-key-change-this-in-production":
@@ -18,9 +22,10 @@ if not SECRET_KEY or SECRET_KEY == "your-super-secure-production-key-change-this
 
 security = HTTPBearer()
 
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+@token_cache_decorator(expire_seconds=ACCESS_TOKEN_EXPIRE_MINUTES * 60, backend="tokens")
+async def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     """
-    创建JWT访问令牌
+    创建JWT访问令牌（支持缓存）
     
     Args:
         data: 要编码的数据
@@ -38,6 +43,65 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
+
+
+def create_refresh_token(data: dict) -> str:
+    """
+    创建刷新令牌
+    
+    Args:
+        data: 要编码的数据
+        
+    Returns:
+        刷新令牌
+    """
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    to_encode.update({"exp": expire, "type": "refresh"})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+
+async def refresh_access_token(refresh_token: str) -> Optional[Token]:
+    """
+    使用刷新令牌续期访问令牌
+    
+    Args:
+        refresh_token: 刷新令牌
+        
+    Returns:
+        新的访问令牌，续期失败返回None
+    """
+    try:
+        # 验证刷新令牌
+        payload = jwt.decode(refresh_token, SECRET_KEY, algorithms=[ALGORITHM])
+        if payload.get("type") != "refresh":
+            return None
+        
+        username = payload.get("sub")
+        user_id = payload.get("user_id")
+        role = payload.get("role")
+        
+        if not username or not user_id:
+            return None
+        
+        # 创建新的访问令牌
+        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        new_access_token = await create_access_token(
+            data={"sub": username, "user_id": user_id, "role": role},
+            expires_delta=access_token_expires
+        )
+        
+        # 返回新的令牌
+        return Token(
+            access_token=new_access_token,
+            refresh_token=refresh_token,
+            expires_in=access_token_expires.seconds,
+            token_type="bearer"
+        )
+        
+    except JWTError:
+        return None
 
 
 def verify_token(token: str) -> Optional[TokenData]:
