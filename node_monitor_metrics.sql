@@ -17,6 +17,17 @@
 
 
 -- ----------------------------
+-- Create sequence for node_monitor_metrics table
+-- ----------------------------
+DROP SEQUENCE IF EXISTS "public"."node_monitor_metrics_id_seq" CASCADE;
+CREATE SEQUENCE "public"."node_monitor_metrics_id_seq"
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+-- ----------------------------
 -- Table structure for node_monitor_metrics
 -- ----------------------------
 DROP TABLE IF EXISTS "public"."node_monitor_metrics";

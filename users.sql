@@ -17,6 +17,28 @@
 
 
 -- ----------------------------
+-- Create sequence for users table
+-- ----------------------------
+DROP SEQUENCE IF EXISTS "public"."users_id_seq" CASCADE;
+CREATE SEQUENCE "public"."users_id_seq"
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+-- ----------------------------
+-- Create trigger function for updated_at
+-- ----------------------------
+CREATE OR REPLACE FUNCTION "public"."update_updated_at_column"()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = now();
+    RETURN NEW;
+END;
+$$ language 'plpgsql';
+
+-- ----------------------------
 -- Table structure for users
 -- ----------------------------
 DROP TABLE IF EXISTS "public"."users";

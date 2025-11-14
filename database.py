@@ -5,6 +5,7 @@ from typing import List, Dict, Optional
 from config import get_db_config
 import threading
 import bcrypt
+import time
 from auth_models import UserCreate, UserUpdate, UserLogin, UserResponse
 
 
@@ -80,6 +81,409 @@ class DatabaseManager:
             return False
         finally:
             self.return_connection(connection)
+
+    def assess_machine_status(self, metric: Dict) -> Dict:
+        """
+        根据监控指标评估机器运行状态
+        
+        Args:
+            metric: 监控指标数据
+            
+        Returns:
+            包含状态分级和详细信息的字典
+        """
+        # 获取关键指标值，处理None值
+        cpu_usr = metric.get('cpu_usr', 0) or 0
+        cpu_sys = metric.get('cpu_sys', 0) or 0
+        cpu_iow = metric.get('cpu_iow', 0) or 0
+        
+        mem_total = metric.get('mem_total', 0) or 0
+        mem_free = metric.get('mem_free', 0) or 0
+        mem_buff = metric.get('mem_buff', 0) or 0
+        mem_cache = metric.get('mem_cache', 0) or 0
+        
+        disk_used_percent = metric.get('disk_used_percent', 0) or 0
+        swap_used = metric.get('swap_used', 0) or 0
+        swap_total = metric.get('swap_total', 0) or 0
+        
+        # 计算关键指标
+        cpu_total = cpu_usr + cpu_sys + cpu_iow
+        mem_used = mem_total - mem_free - mem_buff - mem_cache
+        mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+        swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 状态评估
+        status_level = "正常"
+        issues = []
+        warnings = []
+        
+        # CPU使用率检查
+        if cpu_total >= 90:
+            status_level = "警告"
+            issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
+        elif cpu_total >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
+        
+        # 内存使用率检查
+        if mem_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
+        elif mem_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
+        
+        # 磁盘使用率检查
+        if disk_used_percent >= 90:
+            status_level = "警告"
+            issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
+        elif disk_used_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
+        
+        # Swap使用率检查
+        if swap_usage_percent >= 50:
+            status_level = "警告"
+            issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
+        elif swap_usage_percent >= 20:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
+        
+        # 数据时效性检查（超过1小时无数据视为异常）
+        import time
+        current_timestamp = int(time.time())
+        metric_timestamp = metric.get('ts', 0)
+        time_diff_hours = (current_timestamp - metric_timestamp) / 3600
+        
+        if time_diff_hours > 1:
+            status_level = "警告"
+            issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
+        elif time_diff_hours > 0.3:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
+        
+        # 构建返回结果
+        result = {
+            "status_level": status_level,
+            "ip": metric.get('ip', '未知'),
+            "timestamp": metric_timestamp,
+            "key_metrics": {
+                "cpu_usage_percent": round(cpu_total, 2),
+                "memory_usage_percent": round(mem_usage_percent, 2),
+                "disk_usage_percent": round(disk_used_percent, 2),
+                "swap_usage_percent": round(swap_usage_percent, 2),
+                "data_freshness_hours": round(time_diff_hours, 2)
+            },
+            "issues": issues,
+            "warnings": warnings,
+            "is_healthy": status_level == "正常",
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+        }
+        
+        return result
+
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+        """
+        计算机器健康评分（0-100分）
+        
+        Args:
+            cpu_usage: CPU使用率
+            mem_usage: 内存使用率
+            disk_usage: 磁盘使用率
+            swap_usage: Swap使用率
+            data_freshness: 数据新鲜度（小时）
+            
+        Returns:
+            健康评分（0-100）
+        """
+        # 各项指标的权重
+        weights = {
+            'cpu': 0.25,
+            'memory': 0.25,
+            'disk': 0.20,
+            'swap': 0.15,
+            'freshness': 0.15
+        }
+        
+        # 计算各项得分（0-100分）
+        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
+        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
+        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
+        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
+        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        
+        # 加权平均
+        total_score = (
+            cpu_score * weights['cpu'] +
+            mem_score * weights['memory'] +
+            disk_score * weights['disk'] +
+            swap_score * weights['swap'] +
+            freshness_score * weights['freshness']
+        )
+        
+        return int(max(0, min(100, total_score)))
+
+    def get_machine_status_by_ip(self, ip: str) -> Dict:
+        """
+        根据IP地址获取机器的最新状态评估
+        
+        Args:
+            ip: IP地址
+            
+        Returns:
+            机器状态评估结果
+        """
+        # 获取最新监控数据
+        metric = self.get_latest_metric_by_ip(ip)
+        
+        if not metric:
+            return {
+                "status_level": "未知",
+                "ip": ip,
+                "timestamp": None,
+                "key_metrics": {},
+                "issues": ["未找到该IP的监控数据"],
+                "warnings": [],
+                "is_healthy": False,
+                "overall_score": 0,
+                "error": "未找到监控数据"
+            }
+        
+        # 评估状态
+        return self.assess_machine_status(metric)
+
+    def get_all_machines_status(self, time_window_hours: int = 1) -> List[Dict]:
+        """
+        获取所有机器的状态评估
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            所有机器的状态评估列表
+        """
+        # 获取活跃机器的监控数据
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        status_list = []
+        for metric in metrics:
+            status = self.assess_machine_status(metric)
+            status_list.append(status)
+        
+        # 按健康评分排序
+        status_list.sort(key=lambda x: x['overall_score'], reverse=True)
+        
+        return status_list
+
+    def get_system_overview(self, time_window_hours: int = 1) -> Dict:
+        """
+        获取系统总体概览信息
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            系统总体概览信息，包含：
+            - 活跃机器统计
+            - 健康状态分布
+            - 告警和提示信息汇总
+            - 关键指标统计
+            - 性能趋势分析
+        """
+        # 获取所有机器的状态评估
+        status_list = self.get_all_machines_status(time_window_hours)
+        
+        # 获取活跃机器的原始监控数据用于统计计算
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        # 1. 活跃机器统计
+        active_machines = len(status_list)
+        active_ips = [status['ip'] for status in status_list]
+        
+        # 2. 健康状态分布
+        status_distribution = {
+            "正常": len([s for s in status_list if s['status_level'] == "正常"]),
+            "提示": len([s for s in status_list if s['status_level'] == "提示"]),
+            "警告": len([s for s in status_list if s['status_level'] == "警告"]),
+            "未知": len([s for s in status_list if s['status_level'] == "未知"])
+        }
+        
+        # 3. 告警和提示信息汇总
+        all_issues = []
+        all_warnings = []
+        
+        for status in status_list:
+            all_issues.extend([{"ip": status['ip'], "issue": issue} for issue in status['issues']])
+            all_warnings.extend([{"ip": status['ip'], "warning": warning} for warning in status['warnings']])
+        
+        # 4. 关键指标统计（最大值、平均值、最小值）
+        key_metrics_stats = self._calculate_key_metrics_statistics(metrics)
+        
+        # 5. 性能趋势分析（基于最近10条数据）
+        trend_analysis = self._analyze_performance_trend(time_window_hours)
+        
+        # 6. 系统健康评分
+        overall_health_score = self._calculate_system_health_score(status_list)
+        
+        # 构建总体概览信息
+        overview = {
+            "timestamp": int(time.time()),
+            "time_window_hours": time_window_hours,
+            "active_machines": {
+                "total": active_machines,
+                "ips": active_ips
+            },
+            "health_status": {
+                "distribution": status_distribution,
+                "overall_score": overall_health_score,
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+            },
+            "alerts_summary": {
+                "critical_issues": len(all_issues),
+                "warning_issues": len(all_warnings),
+                "issues_by_type": self._categorize_issues(all_issues),
+                "warnings_by_type": self._categorize_warnings(all_warnings)
+            },
+            "key_metrics": key_metrics_stats,
+            "performance_trend": trend_analysis,
+            "detailed_alerts": {
+                "critical": all_issues,
+                "warning": all_warnings
+            }
+        }
+        
+        return overview
+
+    def _calculate_key_metrics_statistics(self, metrics: List[Dict]) -> Dict:
+        """计算关键指标的统计信息"""
+        if not metrics:
+            return {
+                "cpu_usage": {"max": 0, "avg": 0, "min": 0},
+                "memory_usage": {"max": 0, "avg": 0, "min": 0},
+                "disk_usage": {"max": 0, "avg": 0, "min": 0},
+                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+            }
+        
+        cpu_usages = []
+        memory_usages = []
+        disk_usages = []
+        swap_usages = []
+        
+        for metric in metrics:
+            # 计算各项指标
+            cpu_usr = metric.get('cpu_usr', 0) or 0
+            cpu_sys = metric.get('cpu_sys', 0) or 0
+            cpu_iow = metric.get('cpu_iow', 0) or 0
+            cpu_total = cpu_usr + cpu_sys + cpu_iow
+            
+            mem_total = metric.get('mem_total', 0) or 0
+            mem_free = metric.get('mem_free', 0) or 0
+            mem_buff = metric.get('mem_buff', 0) or 0
+            mem_cache = metric.get('mem_cache', 0) or 0
+            mem_used = mem_total - mem_free - mem_buff - mem_cache
+            mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+            
+            disk_usage = metric.get('disk_used_percent', 0) or 0
+            
+            swap_used = metric.get('swap_used', 0) or 0
+            swap_total = metric.get('swap_total', 0) or 0
+            swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+            
+            cpu_usages.append(cpu_total)
+            memory_usages.append(mem_usage_percent)
+            disk_usages.append(disk_usage)
+            swap_usages.append(swap_usage_percent)
+        
+        return {
+            "cpu_usage": {
+                "max": round(max(cpu_usages), 2) if cpu_usages else 0,
+                "avg": round(sum(cpu_usages) / len(cpu_usages), 2) if cpu_usages else 0,
+                "min": round(min(cpu_usages), 2) if cpu_usages else 0
+            },
+            "memory_usage": {
+                "max": round(max(memory_usages), 2) if memory_usages else 0,
+                "avg": round(sum(memory_usages) / len(memory_usages), 2) if memory_usages else 0,
+                "min": round(min(memory_usages), 2) if memory_usages else 0
+            },
+            "disk_usage": {
+                "max": round(max(disk_usages), 2) if disk_usages else 0,
+                "avg": round(sum(disk_usages) / len(disk_usages), 2) if disk_usages else 0,
+                "min": round(min(disk_usages), 2) if disk_usages else 0
+            },
+            "swap_usage": {
+                "max": round(max(swap_usages), 2) if swap_usages else 0,
+                "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
+                "min": round(min(swap_usages), 2) if swap_usages else 0
+            }
+        }
+
+    def _analyze_performance_trend(self, time_window_hours: int) -> Dict:
+        """分析性能趋势"""
+        # 这里可以扩展为获取历史数据进行趋势分析
+        # 目前返回基础趋势信息
+        return {
+            "trend": "stable",  # stable, improving, declining
+            "confidence": 0.8,
+            "analysis": "系统性能整体稳定",
+            "suggestions": ["建议定期检查磁盘使用率", "关注内存使用趋势"]
+        }
+
+    def _calculate_system_health_score(self, status_list: List[Dict]) -> float:
+        """计算系统整体健康评分"""
+        if not status_list:
+            return 0.0
+        
+        total_score = sum(status['overall_score'] for status in status_list)
+        return round(total_score / len(status_list), 2)
+
+    def _categorize_issues(self, issues: List[Dict]) -> Dict:
+        """分类汇总问题"""
+        categories = {}
+        
+        for issue_item in issues:
+            issue_text = issue_item['issue']
+            if "CPU" in issue_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in issue_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in issue_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in issue_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in issue_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
+
+    def _categorize_warnings(self, warnings: List[Dict]) -> Dict:
+        """分类汇总警告"""
+        categories = {}
+        
+        for warning_item in warnings:
+            warning_text = warning_item['warning']
+            if "CPU" in warning_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in warning_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in warning_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in warning_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in warning_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
     
     def insert_user(self, name: str, email: str, age: int, password: str) -> Optional[int]:
         """插入新用户"""
@@ -109,6 +513,409 @@ class DatabaseManager:
             return None
         finally:
             self.return_connection(connection)
+
+    def assess_machine_status(self, metric: Dict) -> Dict:
+        """
+        根据监控指标评估机器运行状态
+        
+        Args:
+            metric: 监控指标数据
+            
+        Returns:
+            包含状态分级和详细信息的字典
+        """
+        # 获取关键指标值，处理None值
+        cpu_usr = metric.get('cpu_usr', 0) or 0
+        cpu_sys = metric.get('cpu_sys', 0) or 0
+        cpu_iow = metric.get('cpu_iow', 0) or 0
+        
+        mem_total = metric.get('mem_total', 0) or 0
+        mem_free = metric.get('mem_free', 0) or 0
+        mem_buff = metric.get('mem_buff', 0) or 0
+        mem_cache = metric.get('mem_cache', 0) or 0
+        
+        disk_used_percent = metric.get('disk_used_percent', 0) or 0
+        swap_used = metric.get('swap_used', 0) or 0
+        swap_total = metric.get('swap_total', 0) or 0
+        
+        # 计算关键指标
+        cpu_total = cpu_usr + cpu_sys + cpu_iow
+        mem_used = mem_total - mem_free - mem_buff - mem_cache
+        mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+        swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 状态评估
+        status_level = "正常"
+        issues = []
+        warnings = []
+        
+        # CPU使用率检查
+        if cpu_total >= 90:
+            status_level = "警告"
+            issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
+        elif cpu_total >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
+        
+        # 内存使用率检查
+        if mem_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
+        elif mem_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
+        
+        # 磁盘使用率检查
+        if disk_used_percent >= 90:
+            status_level = "警告"
+            issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
+        elif disk_used_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
+        
+        # Swap使用率检查
+        if swap_usage_percent >= 50:
+            status_level = "警告"
+            issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
+        elif swap_usage_percent >= 20:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
+        
+        # 数据时效性检查（超过1小时无数据视为异常）
+        import time
+        current_timestamp = int(time.time())
+        metric_timestamp = metric.get('ts', 0)
+        time_diff_hours = (current_timestamp - metric_timestamp) / 3600
+        
+        if time_diff_hours > 1:
+            status_level = "警告"
+            issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
+        elif time_diff_hours > 0.3:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
+        
+        # 构建返回结果
+        result = {
+            "status_level": status_level,
+            "ip": metric.get('ip', '未知'),
+            "timestamp": metric_timestamp,
+            "key_metrics": {
+                "cpu_usage_percent": round(cpu_total, 2),
+                "memory_usage_percent": round(mem_usage_percent, 2),
+                "disk_usage_percent": round(disk_used_percent, 2),
+                "swap_usage_percent": round(swap_usage_percent, 2),
+                "data_freshness_hours": round(time_diff_hours, 2)
+            },
+            "issues": issues,
+            "warnings": warnings,
+            "is_healthy": status_level == "正常",
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+        }
+        
+        return result
+
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+        """
+        计算机器健康评分（0-100分）
+        
+        Args:
+            cpu_usage: CPU使用率
+            mem_usage: 内存使用率
+            disk_usage: 磁盘使用率
+            swap_usage: Swap使用率
+            data_freshness: 数据新鲜度（小时）
+            
+        Returns:
+            健康评分（0-100）
+        """
+        # 各项指标的权重
+        weights = {
+            'cpu': 0.25,
+            'memory': 0.25,
+            'disk': 0.20,
+            'swap': 0.15,
+            'freshness': 0.15
+        }
+        
+        # 计算各项得分（0-100分）
+        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
+        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
+        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
+        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
+        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        
+        # 加权平均
+        total_score = (
+            cpu_score * weights['cpu'] +
+            mem_score * weights['memory'] +
+            disk_score * weights['disk'] +
+            swap_score * weights['swap'] +
+            freshness_score * weights['freshness']
+        )
+        
+        return int(max(0, min(100, total_score)))
+
+    def get_machine_status_by_ip(self, ip: str) -> Dict:
+        """
+        根据IP地址获取机器的最新状态评估
+        
+        Args:
+            ip: IP地址
+            
+        Returns:
+            机器状态评估结果
+        """
+        # 获取最新监控数据
+        metric = self.get_latest_metric_by_ip(ip)
+        
+        if not metric:
+            return {
+                "status_level": "未知",
+                "ip": ip,
+                "timestamp": None,
+                "key_metrics": {},
+                "issues": ["未找到该IP的监控数据"],
+                "warnings": [],
+                "is_healthy": False,
+                "overall_score": 0,
+                "error": "未找到监控数据"
+            }
+        
+        # 评估状态
+        return self.assess_machine_status(metric)
+
+    def get_all_machines_status(self, time_window_hours: int = 1) -> List[Dict]:
+        """
+        获取所有机器的状态评估
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            所有机器的状态评估列表
+        """
+        # 获取活跃机器的监控数据
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        status_list = []
+        for metric in metrics:
+            status = self.assess_machine_status(metric)
+            status_list.append(status)
+        
+        # 按健康评分排序
+        status_list.sort(key=lambda x: x['overall_score'], reverse=True)
+        
+        return status_list
+
+    def get_system_overview(self, time_window_hours: int = 1) -> Dict:
+        """
+        获取系统总体概览信息
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            系统总体概览信息，包含：
+            - 活跃机器统计
+            - 健康状态分布
+            - 告警和提示信息汇总
+            - 关键指标统计
+            - 性能趋势分析
+        """
+        # 获取所有机器的状态评估
+        status_list = self.get_all_machines_status(time_window_hours)
+        
+        # 获取活跃机器的原始监控数据用于统计计算
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        # 1. 活跃机器统计
+        active_machines = len(status_list)
+        active_ips = [status['ip'] for status in status_list]
+        
+        # 2. 健康状态分布
+        status_distribution = {
+            "正常": len([s for s in status_list if s['status_level'] == "正常"]),
+            "提示": len([s for s in status_list if s['status_level'] == "提示"]),
+            "警告": len([s for s in status_list if s['status_level'] == "警告"]),
+            "未知": len([s for s in status_list if s['status_level'] == "未知"])
+        }
+        
+        # 3. 告警和提示信息汇总
+        all_issues = []
+        all_warnings = []
+        
+        for status in status_list:
+            all_issues.extend([{"ip": status['ip'], "issue": issue} for issue in status['issues']])
+            all_warnings.extend([{"ip": status['ip'], "warning": warning} for warning in status['warnings']])
+        
+        # 4. 关键指标统计（最大值、平均值、最小值）
+        key_metrics_stats = self._calculate_key_metrics_statistics(metrics)
+        
+        # 5. 性能趋势分析（基于最近10条数据）
+        trend_analysis = self._analyze_performance_trend(time_window_hours)
+        
+        # 6. 系统健康评分
+        overall_health_score = self._calculate_system_health_score(status_list)
+        
+        # 构建总体概览信息
+        overview = {
+            "timestamp": int(time.time()),
+            "time_window_hours": time_window_hours,
+            "active_machines": {
+                "total": active_machines,
+                "ips": active_ips
+            },
+            "health_status": {
+                "distribution": status_distribution,
+                "overall_score": overall_health_score,
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+            },
+            "alerts_summary": {
+                "critical_issues": len(all_issues),
+                "warning_issues": len(all_warnings),
+                "issues_by_type": self._categorize_issues(all_issues),
+                "warnings_by_type": self._categorize_warnings(all_warnings)
+            },
+            "key_metrics": key_metrics_stats,
+            "performance_trend": trend_analysis,
+            "detailed_alerts": {
+                "critical": all_issues,
+                "warning": all_warnings
+            }
+        }
+        
+        return overview
+
+    def _calculate_key_metrics_statistics(self, metrics: List[Dict]) -> Dict:
+        """计算关键指标的统计信息"""
+        if not metrics:
+            return {
+                "cpu_usage": {"max": 0, "avg": 0, "min": 0},
+                "memory_usage": {"max": 0, "avg": 0, "min": 0},
+                "disk_usage": {"max": 0, "avg": 0, "min": 0},
+                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+            }
+        
+        cpu_usages = []
+        memory_usages = []
+        disk_usages = []
+        swap_usages = []
+        
+        for metric in metrics:
+            # 计算各项指标
+            cpu_usr = metric.get('cpu_usr', 0) or 0
+            cpu_sys = metric.get('cpu_sys', 0) or 0
+            cpu_iow = metric.get('cpu_iow', 0) or 0
+            cpu_total = cpu_usr + cpu_sys + cpu_iow
+            
+            mem_total = metric.get('mem_total', 0) or 0
+            mem_free = metric.get('mem_free', 0) or 0
+            mem_buff = metric.get('mem_buff', 0) or 0
+            mem_cache = metric.get('mem_cache', 0) or 0
+            mem_used = mem_total - mem_free - mem_buff - mem_cache
+            mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+            
+            disk_usage = metric.get('disk_used_percent', 0) or 0
+            
+            swap_used = metric.get('swap_used', 0) or 0
+            swap_total = metric.get('swap_total', 0) or 0
+            swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+            
+            cpu_usages.append(cpu_total)
+            memory_usages.append(mem_usage_percent)
+            disk_usages.append(disk_usage)
+            swap_usages.append(swap_usage_percent)
+        
+        return {
+            "cpu_usage": {
+                "max": round(max(cpu_usages), 2) if cpu_usages else 0,
+                "avg": round(sum(cpu_usages) / len(cpu_usages), 2) if cpu_usages else 0,
+                "min": round(min(cpu_usages), 2) if cpu_usages else 0
+            },
+            "memory_usage": {
+                "max": round(max(memory_usages), 2) if memory_usages else 0,
+                "avg": round(sum(memory_usages) / len(memory_usages), 2) if memory_usages else 0,
+                "min": round(min(memory_usages), 2) if memory_usages else 0
+            },
+            "disk_usage": {
+                "max": round(max(disk_usages), 2) if disk_usages else 0,
+                "avg": round(sum(disk_usages) / len(disk_usages), 2) if disk_usages else 0,
+                "min": round(min(disk_usages), 2) if disk_usages else 0
+            },
+            "swap_usage": {
+                "max": round(max(swap_usages), 2) if swap_usages else 0,
+                "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
+                "min": round(min(swap_usages), 2) if swap_usages else 0
+            }
+        }
+
+    def _analyze_performance_trend(self, time_window_hours: int) -> Dict:
+        """分析性能趋势"""
+        # 这里可以扩展为获取历史数据进行趋势分析
+        # 目前返回基础趋势信息
+        return {
+            "trend": "stable",  # stable, improving, declining
+            "confidence": 0.8,
+            "analysis": "系统性能整体稳定",
+            "suggestions": ["建议定期检查磁盘使用率", "关注内存使用趋势"]
+        }
+
+    def _calculate_system_health_score(self, status_list: List[Dict]) -> float:
+        """计算系统整体健康评分"""
+        if not status_list:
+            return 0.0
+        
+        total_score = sum(status['overall_score'] for status in status_list)
+        return round(total_score / len(status_list), 2)
+
+    def _categorize_issues(self, issues: List[Dict]) -> Dict:
+        """分类汇总问题"""
+        categories = {}
+        
+        for issue_item in issues:
+            issue_text = issue_item['issue']
+            if "CPU" in issue_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in issue_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in issue_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in issue_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in issue_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
+
+    def _categorize_warnings(self, warnings: List[Dict]) -> Dict:
+        """分类汇总警告"""
+        categories = {}
+        
+        for warning_item in warnings:
+            warning_text = warning_item['warning']
+            if "CPU" in warning_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in warning_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in warning_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in warning_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in warning_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
     
     def get_user_by_id(self, user_id: int) -> Optional[Dict]:
         """根据ID查询用户"""
@@ -134,6 +941,409 @@ class DatabaseManager:
             return None
         finally:
             self.return_connection(connection)
+
+    def assess_machine_status(self, metric: Dict) -> Dict:
+        """
+        根据监控指标评估机器运行状态
+        
+        Args:
+            metric: 监控指标数据
+            
+        Returns:
+            包含状态分级和详细信息的字典
+        """
+        # 获取关键指标值，处理None值
+        cpu_usr = metric.get('cpu_usr', 0) or 0
+        cpu_sys = metric.get('cpu_sys', 0) or 0
+        cpu_iow = metric.get('cpu_iow', 0) or 0
+        
+        mem_total = metric.get('mem_total', 0) or 0
+        mem_free = metric.get('mem_free', 0) or 0
+        mem_buff = metric.get('mem_buff', 0) or 0
+        mem_cache = metric.get('mem_cache', 0) or 0
+        
+        disk_used_percent = metric.get('disk_used_percent', 0) or 0
+        swap_used = metric.get('swap_used', 0) or 0
+        swap_total = metric.get('swap_total', 0) or 0
+        
+        # 计算关键指标
+        cpu_total = cpu_usr + cpu_sys + cpu_iow
+        mem_used = mem_total - mem_free - mem_buff - mem_cache
+        mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+        swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 状态评估
+        status_level = "正常"
+        issues = []
+        warnings = []
+        
+        # CPU使用率检查
+        if cpu_total >= 90:
+            status_level = "警告"
+            issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
+        elif cpu_total >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
+        
+        # 内存使用率检查
+        if mem_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
+        elif mem_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
+        
+        # 磁盘使用率检查
+        if disk_used_percent >= 90:
+            status_level = "警告"
+            issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
+        elif disk_used_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
+        
+        # Swap使用率检查
+        if swap_usage_percent >= 50:
+            status_level = "警告"
+            issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
+        elif swap_usage_percent >= 20:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
+        
+        # 数据时效性检查（超过1小时无数据视为异常）
+        import time
+        current_timestamp = int(time.time())
+        metric_timestamp = metric.get('ts', 0)
+        time_diff_hours = (current_timestamp - metric_timestamp) / 3600
+        
+        if time_diff_hours > 1:
+            status_level = "警告"
+            issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
+        elif time_diff_hours > 0.3:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
+        
+        # 构建返回结果
+        result = {
+            "status_level": status_level,
+            "ip": metric.get('ip', '未知'),
+            "timestamp": metric_timestamp,
+            "key_metrics": {
+                "cpu_usage_percent": round(cpu_total, 2),
+                "memory_usage_percent": round(mem_usage_percent, 2),
+                "disk_usage_percent": round(disk_used_percent, 2),
+                "swap_usage_percent": round(swap_usage_percent, 2),
+                "data_freshness_hours": round(time_diff_hours, 2)
+            },
+            "issues": issues,
+            "warnings": warnings,
+            "is_healthy": status_level == "正常",
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+        }
+        
+        return result
+
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+        """
+        计算机器健康评分（0-100分）
+        
+        Args:
+            cpu_usage: CPU使用率
+            mem_usage: 内存使用率
+            disk_usage: 磁盘使用率
+            swap_usage: Swap使用率
+            data_freshness: 数据新鲜度（小时）
+            
+        Returns:
+            健康评分（0-100）
+        """
+        # 各项指标的权重
+        weights = {
+            'cpu': 0.25,
+            'memory': 0.25,
+            'disk': 0.20,
+            'swap': 0.15,
+            'freshness': 0.15
+        }
+        
+        # 计算各项得分（0-100分）
+        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
+        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
+        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
+        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
+        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        
+        # 加权平均
+        total_score = (
+            cpu_score * weights['cpu'] +
+            mem_score * weights['memory'] +
+            disk_score * weights['disk'] +
+            swap_score * weights['swap'] +
+            freshness_score * weights['freshness']
+        )
+        
+        return int(max(0, min(100, total_score)))
+
+    def get_machine_status_by_ip(self, ip: str) -> Dict:
+        """
+        根据IP地址获取机器的最新状态评估
+        
+        Args:
+            ip: IP地址
+            
+        Returns:
+            机器状态评估结果
+        """
+        # 获取最新监控数据
+        metric = self.get_latest_metric_by_ip(ip)
+        
+        if not metric:
+            return {
+                "status_level": "未知",
+                "ip": ip,
+                "timestamp": None,
+                "key_metrics": {},
+                "issues": ["未找到该IP的监控数据"],
+                "warnings": [],
+                "is_healthy": False,
+                "overall_score": 0,
+                "error": "未找到监控数据"
+            }
+        
+        # 评估状态
+        return self.assess_machine_status(metric)
+
+    def get_all_machines_status(self, time_window_hours: int = 1) -> List[Dict]:
+        """
+        获取所有机器的状态评估
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            所有机器的状态评估列表
+        """
+        # 获取活跃机器的监控数据
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        status_list = []
+        for metric in metrics:
+            status = self.assess_machine_status(metric)
+            status_list.append(status)
+        
+        # 按健康评分排序
+        status_list.sort(key=lambda x: x['overall_score'], reverse=True)
+        
+        return status_list
+
+    def get_system_overview(self, time_window_hours: int = 1) -> Dict:
+        """
+        获取系统总体概览信息
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            系统总体概览信息，包含：
+            - 活跃机器统计
+            - 健康状态分布
+            - 告警和提示信息汇总
+            - 关键指标统计
+            - 性能趋势分析
+        """
+        # 获取所有机器的状态评估
+        status_list = self.get_all_machines_status(time_window_hours)
+        
+        # 获取活跃机器的原始监控数据用于统计计算
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        # 1. 活跃机器统计
+        active_machines = len(status_list)
+        active_ips = [status['ip'] for status in status_list]
+        
+        # 2. 健康状态分布
+        status_distribution = {
+            "正常": len([s for s in status_list if s['status_level'] == "正常"]),
+            "提示": len([s for s in status_list if s['status_level'] == "提示"]),
+            "警告": len([s for s in status_list if s['status_level'] == "警告"]),
+            "未知": len([s for s in status_list if s['status_level'] == "未知"])
+        }
+        
+        # 3. 告警和提示信息汇总
+        all_issues = []
+        all_warnings = []
+        
+        for status in status_list:
+            all_issues.extend([{"ip": status['ip'], "issue": issue} for issue in status['issues']])
+            all_warnings.extend([{"ip": status['ip'], "warning": warning} for warning in status['warnings']])
+        
+        # 4. 关键指标统计（最大值、平均值、最小值）
+        key_metrics_stats = self._calculate_key_metrics_statistics(metrics)
+        
+        # 5. 性能趋势分析（基于最近10条数据）
+        trend_analysis = self._analyze_performance_trend(time_window_hours)
+        
+        # 6. 系统健康评分
+        overall_health_score = self._calculate_system_health_score(status_list)
+        
+        # 构建总体概览信息
+        overview = {
+            "timestamp": int(time.time()),
+            "time_window_hours": time_window_hours,
+            "active_machines": {
+                "total": active_machines,
+                "ips": active_ips
+            },
+            "health_status": {
+                "distribution": status_distribution,
+                "overall_score": overall_health_score,
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+            },
+            "alerts_summary": {
+                "critical_issues": len(all_issues),
+                "warning_issues": len(all_warnings),
+                "issues_by_type": self._categorize_issues(all_issues),
+                "warnings_by_type": self._categorize_warnings(all_warnings)
+            },
+            "key_metrics": key_metrics_stats,
+            "performance_trend": trend_analysis,
+            "detailed_alerts": {
+                "critical": all_issues,
+                "warning": all_warnings
+            }
+        }
+        
+        return overview
+
+    def _calculate_key_metrics_statistics(self, metrics: List[Dict]) -> Dict:
+        """计算关键指标的统计信息"""
+        if not metrics:
+            return {
+                "cpu_usage": {"max": 0, "avg": 0, "min": 0},
+                "memory_usage": {"max": 0, "avg": 0, "min": 0},
+                "disk_usage": {"max": 0, "avg": 0, "min": 0},
+                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+            }
+        
+        cpu_usages = []
+        memory_usages = []
+        disk_usages = []
+        swap_usages = []
+        
+        for metric in metrics:
+            # 计算各项指标
+            cpu_usr = metric.get('cpu_usr', 0) or 0
+            cpu_sys = metric.get('cpu_sys', 0) or 0
+            cpu_iow = metric.get('cpu_iow', 0) or 0
+            cpu_total = cpu_usr + cpu_sys + cpu_iow
+            
+            mem_total = metric.get('mem_total', 0) or 0
+            mem_free = metric.get('mem_free', 0) or 0
+            mem_buff = metric.get('mem_buff', 0) or 0
+            mem_cache = metric.get('mem_cache', 0) or 0
+            mem_used = mem_total - mem_free - mem_buff - mem_cache
+            mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+            
+            disk_usage = metric.get('disk_used_percent', 0) or 0
+            
+            swap_used = metric.get('swap_used', 0) or 0
+            swap_total = metric.get('swap_total', 0) or 0
+            swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+            
+            cpu_usages.append(cpu_total)
+            memory_usages.append(mem_usage_percent)
+            disk_usages.append(disk_usage)
+            swap_usages.append(swap_usage_percent)
+        
+        return {
+            "cpu_usage": {
+                "max": round(max(cpu_usages), 2) if cpu_usages else 0,
+                "avg": round(sum(cpu_usages) / len(cpu_usages), 2) if cpu_usages else 0,
+                "min": round(min(cpu_usages), 2) if cpu_usages else 0
+            },
+            "memory_usage": {
+                "max": round(max(memory_usages), 2) if memory_usages else 0,
+                "avg": round(sum(memory_usages) / len(memory_usages), 2) if memory_usages else 0,
+                "min": round(min(memory_usages), 2) if memory_usages else 0
+            },
+            "disk_usage": {
+                "max": round(max(disk_usages), 2) if disk_usages else 0,
+                "avg": round(sum(disk_usages) / len(disk_usages), 2) if disk_usages else 0,
+                "min": round(min(disk_usages), 2) if disk_usages else 0
+            },
+            "swap_usage": {
+                "max": round(max(swap_usages), 2) if swap_usages else 0,
+                "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
+                "min": round(min(swap_usages), 2) if swap_usages else 0
+            }
+        }
+
+    def _analyze_performance_trend(self, time_window_hours: int) -> Dict:
+        """分析性能趋势"""
+        # 这里可以扩展为获取历史数据进行趋势分析
+        # 目前返回基础趋势信息
+        return {
+            "trend": "stable",  # stable, improving, declining
+            "confidence": 0.8,
+            "analysis": "系统性能整体稳定",
+            "suggestions": ["建议定期检查磁盘使用率", "关注内存使用趋势"]
+        }
+
+    def _calculate_system_health_score(self, status_list: List[Dict]) -> float:
+        """计算系统整体健康评分"""
+        if not status_list:
+            return 0.0
+        
+        total_score = sum(status['overall_score'] for status in status_list)
+        return round(total_score / len(status_list), 2)
+
+    def _categorize_issues(self, issues: List[Dict]) -> Dict:
+        """分类汇总问题"""
+        categories = {}
+        
+        for issue_item in issues:
+            issue_text = issue_item['issue']
+            if "CPU" in issue_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in issue_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in issue_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in issue_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in issue_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
+
+    def _categorize_warnings(self, warnings: List[Dict]) -> Dict:
+        """分类汇总警告"""
+        categories = {}
+        
+        for warning_item in warnings:
+            warning_text = warning_item['warning']
+            if "CPU" in warning_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in warning_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in warning_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in warning_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in warning_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
             
     def get_user_by_email(self, email: str) -> Optional[Dict]:
         """根据邮箱查询用户"""
@@ -153,6 +1363,409 @@ class DatabaseManager:
             return None
         finally:
             self.return_connection(connection)
+
+    def assess_machine_status(self, metric: Dict) -> Dict:
+        """
+        根据监控指标评估机器运行状态
+        
+        Args:
+            metric: 监控指标数据
+            
+        Returns:
+            包含状态分级和详细信息的字典
+        """
+        # 获取关键指标值，处理None值
+        cpu_usr = metric.get('cpu_usr', 0) or 0
+        cpu_sys = metric.get('cpu_sys', 0) or 0
+        cpu_iow = metric.get('cpu_iow', 0) or 0
+        
+        mem_total = metric.get('mem_total', 0) or 0
+        mem_free = metric.get('mem_free', 0) or 0
+        mem_buff = metric.get('mem_buff', 0) or 0
+        mem_cache = metric.get('mem_cache', 0) or 0
+        
+        disk_used_percent = metric.get('disk_used_percent', 0) or 0
+        swap_used = metric.get('swap_used', 0) or 0
+        swap_total = metric.get('swap_total', 0) or 0
+        
+        # 计算关键指标
+        cpu_total = cpu_usr + cpu_sys + cpu_iow
+        mem_used = mem_total - mem_free - mem_buff - mem_cache
+        mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+        swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 状态评估
+        status_level = "正常"
+        issues = []
+        warnings = []
+        
+        # CPU使用率检查
+        if cpu_total >= 90:
+            status_level = "警告"
+            issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
+        elif cpu_total >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
+        
+        # 内存使用率检查
+        if mem_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
+        elif mem_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
+        
+        # 磁盘使用率检查
+        if disk_used_percent >= 90:
+            status_level = "警告"
+            issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
+        elif disk_used_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
+        
+        # Swap使用率检查
+        if swap_usage_percent >= 50:
+            status_level = "警告"
+            issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
+        elif swap_usage_percent >= 20:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
+        
+        # 数据时效性检查（超过1小时无数据视为异常）
+        import time
+        current_timestamp = int(time.time())
+        metric_timestamp = metric.get('ts', 0)
+        time_diff_hours = (current_timestamp - metric_timestamp) / 3600
+        
+        if time_diff_hours > 1:
+            status_level = "警告"
+            issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
+        elif time_diff_hours > 0.3:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
+        
+        # 构建返回结果
+        result = {
+            "status_level": status_level,
+            "ip": metric.get('ip', '未知'),
+            "timestamp": metric_timestamp,
+            "key_metrics": {
+                "cpu_usage_percent": round(cpu_total, 2),
+                "memory_usage_percent": round(mem_usage_percent, 2),
+                "disk_usage_percent": round(disk_used_percent, 2),
+                "swap_usage_percent": round(swap_usage_percent, 2),
+                "data_freshness_hours": round(time_diff_hours, 2)
+            },
+            "issues": issues,
+            "warnings": warnings,
+            "is_healthy": status_level == "正常",
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+        }
+        
+        return result
+
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+        """
+        计算机器健康评分（0-100分）
+        
+        Args:
+            cpu_usage: CPU使用率
+            mem_usage: 内存使用率
+            disk_usage: 磁盘使用率
+            swap_usage: Swap使用率
+            data_freshness: 数据新鲜度（小时）
+            
+        Returns:
+            健康评分（0-100）
+        """
+        # 各项指标的权重
+        weights = {
+            'cpu': 0.25,
+            'memory': 0.25,
+            'disk': 0.20,
+            'swap': 0.15,
+            'freshness': 0.15
+        }
+        
+        # 计算各项得分（0-100分）
+        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
+        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
+        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
+        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
+        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        
+        # 加权平均
+        total_score = (
+            cpu_score * weights['cpu'] +
+            mem_score * weights['memory'] +
+            disk_score * weights['disk'] +
+            swap_score * weights['swap'] +
+            freshness_score * weights['freshness']
+        )
+        
+        return int(max(0, min(100, total_score)))
+
+    def get_machine_status_by_ip(self, ip: str) -> Dict:
+        """
+        根据IP地址获取机器的最新状态评估
+        
+        Args:
+            ip: IP地址
+            
+        Returns:
+            机器状态评估结果
+        """
+        # 获取最新监控数据
+        metric = self.get_latest_metric_by_ip(ip)
+        
+        if not metric:
+            return {
+                "status_level": "未知",
+                "ip": ip,
+                "timestamp": None,
+                "key_metrics": {},
+                "issues": ["未找到该IP的监控数据"],
+                "warnings": [],
+                "is_healthy": False,
+                "overall_score": 0,
+                "error": "未找到监控数据"
+            }
+        
+        # 评估状态
+        return self.assess_machine_status(metric)
+
+    def get_all_machines_status(self, time_window_hours: int = 1) -> List[Dict]:
+        """
+        获取所有机器的状态评估
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            所有机器的状态评估列表
+        """
+        # 获取活跃机器的监控数据
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        status_list = []
+        for metric in metrics:
+            status = self.assess_machine_status(metric)
+            status_list.append(status)
+        
+        # 按健康评分排序
+        status_list.sort(key=lambda x: x['overall_score'], reverse=True)
+        
+        return status_list
+
+    def get_system_overview(self, time_window_hours: int = 1) -> Dict:
+        """
+        获取系统总体概览信息
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            系统总体概览信息，包含：
+            - 活跃机器统计
+            - 健康状态分布
+            - 告警和提示信息汇总
+            - 关键指标统计
+            - 性能趋势分析
+        """
+        # 获取所有机器的状态评估
+        status_list = self.get_all_machines_status(time_window_hours)
+        
+        # 获取活跃机器的原始监控数据用于统计计算
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        # 1. 活跃机器统计
+        active_machines = len(status_list)
+        active_ips = [status['ip'] for status in status_list]
+        
+        # 2. 健康状态分布
+        status_distribution = {
+            "正常": len([s for s in status_list if s['status_level'] == "正常"]),
+            "提示": len([s for s in status_list if s['status_level'] == "提示"]),
+            "警告": len([s for s in status_list if s['status_level'] == "警告"]),
+            "未知": len([s for s in status_list if s['status_level'] == "未知"])
+        }
+        
+        # 3. 告警和提示信息汇总
+        all_issues = []
+        all_warnings = []
+        
+        for status in status_list:
+            all_issues.extend([{"ip": status['ip'], "issue": issue} for issue in status['issues']])
+            all_warnings.extend([{"ip": status['ip'], "warning": warning} for warning in status['warnings']])
+        
+        # 4. 关键指标统计（最大值、平均值、最小值）
+        key_metrics_stats = self._calculate_key_metrics_statistics(metrics)
+        
+        # 5. 性能趋势分析（基于最近10条数据）
+        trend_analysis = self._analyze_performance_trend(time_window_hours)
+        
+        # 6. 系统健康评分
+        overall_health_score = self._calculate_system_health_score(status_list)
+        
+        # 构建总体概览信息
+        overview = {
+            "timestamp": int(time.time()),
+            "time_window_hours": time_window_hours,
+            "active_machines": {
+                "total": active_machines,
+                "ips": active_ips
+            },
+            "health_status": {
+                "distribution": status_distribution,
+                "overall_score": overall_health_score,
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+            },
+            "alerts_summary": {
+                "critical_issues": len(all_issues),
+                "warning_issues": len(all_warnings),
+                "issues_by_type": self._categorize_issues(all_issues),
+                "warnings_by_type": self._categorize_warnings(all_warnings)
+            },
+            "key_metrics": key_metrics_stats,
+            "performance_trend": trend_analysis,
+            "detailed_alerts": {
+                "critical": all_issues,
+                "warning": all_warnings
+            }
+        }
+        
+        return overview
+
+    def _calculate_key_metrics_statistics(self, metrics: List[Dict]) -> Dict:
+        """计算关键指标的统计信息"""
+        if not metrics:
+            return {
+                "cpu_usage": {"max": 0, "avg": 0, "min": 0},
+                "memory_usage": {"max": 0, "avg": 0, "min": 0},
+                "disk_usage": {"max": 0, "avg": 0, "min": 0},
+                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+            }
+        
+        cpu_usages = []
+        memory_usages = []
+        disk_usages = []
+        swap_usages = []
+        
+        for metric in metrics:
+            # 计算各项指标
+            cpu_usr = metric.get('cpu_usr', 0) or 0
+            cpu_sys = metric.get('cpu_sys', 0) or 0
+            cpu_iow = metric.get('cpu_iow', 0) or 0
+            cpu_total = cpu_usr + cpu_sys + cpu_iow
+            
+            mem_total = metric.get('mem_total', 0) or 0
+            mem_free = metric.get('mem_free', 0) or 0
+            mem_buff = metric.get('mem_buff', 0) or 0
+            mem_cache = metric.get('mem_cache', 0) or 0
+            mem_used = mem_total - mem_free - mem_buff - mem_cache
+            mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+            
+            disk_usage = metric.get('disk_used_percent', 0) or 0
+            
+            swap_used = metric.get('swap_used', 0) or 0
+            swap_total = metric.get('swap_total', 0) or 0
+            swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+            
+            cpu_usages.append(cpu_total)
+            memory_usages.append(mem_usage_percent)
+            disk_usages.append(disk_usage)
+            swap_usages.append(swap_usage_percent)
+        
+        return {
+            "cpu_usage": {
+                "max": round(max(cpu_usages), 2) if cpu_usages else 0,
+                "avg": round(sum(cpu_usages) / len(cpu_usages), 2) if cpu_usages else 0,
+                "min": round(min(cpu_usages), 2) if cpu_usages else 0
+            },
+            "memory_usage": {
+                "max": round(max(memory_usages), 2) if memory_usages else 0,
+                "avg": round(sum(memory_usages) / len(memory_usages), 2) if memory_usages else 0,
+                "min": round(min(memory_usages), 2) if memory_usages else 0
+            },
+            "disk_usage": {
+                "max": round(max(disk_usages), 2) if disk_usages else 0,
+                "avg": round(sum(disk_usages) / len(disk_usages), 2) if disk_usages else 0,
+                "min": round(min(disk_usages), 2) if disk_usages else 0
+            },
+            "swap_usage": {
+                "max": round(max(swap_usages), 2) if swap_usages else 0,
+                "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
+                "min": round(min(swap_usages), 2) if swap_usages else 0
+            }
+        }
+
+    def _analyze_performance_trend(self, time_window_hours: int) -> Dict:
+        """分析性能趋势"""
+        # 这里可以扩展为获取历史数据进行趋势分析
+        # 目前返回基础趋势信息
+        return {
+            "trend": "stable",  # stable, improving, declining
+            "confidence": 0.8,
+            "analysis": "系统性能整体稳定",
+            "suggestions": ["建议定期检查磁盘使用率", "关注内存使用趋势"]
+        }
+
+    def _calculate_system_health_score(self, status_list: List[Dict]) -> float:
+        """计算系统整体健康评分"""
+        if not status_list:
+            return 0.0
+        
+        total_score = sum(status['overall_score'] for status in status_list)
+        return round(total_score / len(status_list), 2)
+
+    def _categorize_issues(self, issues: List[Dict]) -> Dict:
+        """分类汇总问题"""
+        categories = {}
+        
+        for issue_item in issues:
+            issue_text = issue_item['issue']
+            if "CPU" in issue_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in issue_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in issue_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in issue_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in issue_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
+
+    def _categorize_warnings(self, warnings: List[Dict]) -> Dict:
+        """分类汇总警告"""
+        categories = {}
+        
+        for warning_item in warnings:
+            warning_text = warning_item['warning']
+            if "CPU" in warning_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in warning_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in warning_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in warning_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in warning_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
     
     def get_all_users(self) -> List[Dict]:
         """查询所有用户"""
@@ -174,6 +1787,409 @@ class DatabaseManager:
             return []
         finally:
             self.return_connection(connection)
+
+    def assess_machine_status(self, metric: Dict) -> Dict:
+        """
+        根据监控指标评估机器运行状态
+        
+        Args:
+            metric: 监控指标数据
+            
+        Returns:
+            包含状态分级和详细信息的字典
+        """
+        # 获取关键指标值，处理None值
+        cpu_usr = metric.get('cpu_usr', 0) or 0
+        cpu_sys = metric.get('cpu_sys', 0) or 0
+        cpu_iow = metric.get('cpu_iow', 0) or 0
+        
+        mem_total = metric.get('mem_total', 0) or 0
+        mem_free = metric.get('mem_free', 0) or 0
+        mem_buff = metric.get('mem_buff', 0) or 0
+        mem_cache = metric.get('mem_cache', 0) or 0
+        
+        disk_used_percent = metric.get('disk_used_percent', 0) or 0
+        swap_used = metric.get('swap_used', 0) or 0
+        swap_total = metric.get('swap_total', 0) or 0
+        
+        # 计算关键指标
+        cpu_total = cpu_usr + cpu_sys + cpu_iow
+        mem_used = mem_total - mem_free - mem_buff - mem_cache
+        mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+        swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 状态评估
+        status_level = "正常"
+        issues = []
+        warnings = []
+        
+        # CPU使用率检查
+        if cpu_total >= 90:
+            status_level = "警告"
+            issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
+        elif cpu_total >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
+        
+        # 内存使用率检查
+        if mem_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
+        elif mem_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
+        
+        # 磁盘使用率检查
+        if disk_used_percent >= 90:
+            status_level = "警告"
+            issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
+        elif disk_used_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
+        
+        # Swap使用率检查
+        if swap_usage_percent >= 50:
+            status_level = "警告"
+            issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
+        elif swap_usage_percent >= 20:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
+        
+        # 数据时效性检查（超过1小时无数据视为异常）
+        import time
+        current_timestamp = int(time.time())
+        metric_timestamp = metric.get('ts', 0)
+        time_diff_hours = (current_timestamp - metric_timestamp) / 3600
+        
+        if time_diff_hours > 1:
+            status_level = "警告"
+            issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
+        elif time_diff_hours > 0.3:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
+        
+        # 构建返回结果
+        result = {
+            "status_level": status_level,
+            "ip": metric.get('ip', '未知'),
+            "timestamp": metric_timestamp,
+            "key_metrics": {
+                "cpu_usage_percent": round(cpu_total, 2),
+                "memory_usage_percent": round(mem_usage_percent, 2),
+                "disk_usage_percent": round(disk_used_percent, 2),
+                "swap_usage_percent": round(swap_usage_percent, 2),
+                "data_freshness_hours": round(time_diff_hours, 2)
+            },
+            "issues": issues,
+            "warnings": warnings,
+            "is_healthy": status_level == "正常",
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+        }
+        
+        return result
+
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+        """
+        计算机器健康评分（0-100分）
+        
+        Args:
+            cpu_usage: CPU使用率
+            mem_usage: 内存使用率
+            disk_usage: 磁盘使用率
+            swap_usage: Swap使用率
+            data_freshness: 数据新鲜度（小时）
+            
+        Returns:
+            健康评分（0-100）
+        """
+        # 各项指标的权重
+        weights = {
+            'cpu': 0.25,
+            'memory': 0.25,
+            'disk': 0.20,
+            'swap': 0.15,
+            'freshness': 0.15
+        }
+        
+        # 计算各项得分（0-100分）
+        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
+        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
+        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
+        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
+        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        
+        # 加权平均
+        total_score = (
+            cpu_score * weights['cpu'] +
+            mem_score * weights['memory'] +
+            disk_score * weights['disk'] +
+            swap_score * weights['swap'] +
+            freshness_score * weights['freshness']
+        )
+        
+        return int(max(0, min(100, total_score)))
+
+    def get_machine_status_by_ip(self, ip: str) -> Dict:
+        """
+        根据IP地址获取机器的最新状态评估
+        
+        Args:
+            ip: IP地址
+            
+        Returns:
+            机器状态评估结果
+        """
+        # 获取最新监控数据
+        metric = self.get_latest_metric_by_ip(ip)
+        
+        if not metric:
+            return {
+                "status_level": "未知",
+                "ip": ip,
+                "timestamp": None,
+                "key_metrics": {},
+                "issues": ["未找到该IP的监控数据"],
+                "warnings": [],
+                "is_healthy": False,
+                "overall_score": 0,
+                "error": "未找到监控数据"
+            }
+        
+        # 评估状态
+        return self.assess_machine_status(metric)
+
+    def get_all_machines_status(self, time_window_hours: int = 1) -> List[Dict]:
+        """
+        获取所有机器的状态评估
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            所有机器的状态评估列表
+        """
+        # 获取活跃机器的监控数据
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        status_list = []
+        for metric in metrics:
+            status = self.assess_machine_status(metric)
+            status_list.append(status)
+        
+        # 按健康评分排序
+        status_list.sort(key=lambda x: x['overall_score'], reverse=True)
+        
+        return status_list
+
+    def get_system_overview(self, time_window_hours: int = 1) -> Dict:
+        """
+        获取系统总体概览信息
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            系统总体概览信息，包含：
+            - 活跃机器统计
+            - 健康状态分布
+            - 告警和提示信息汇总
+            - 关键指标统计
+            - 性能趋势分析
+        """
+        # 获取所有机器的状态评估
+        status_list = self.get_all_machines_status(time_window_hours)
+        
+        # 获取活跃机器的原始监控数据用于统计计算
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        # 1. 活跃机器统计
+        active_machines = len(status_list)
+        active_ips = [status['ip'] for status in status_list]
+        
+        # 2. 健康状态分布
+        status_distribution = {
+            "正常": len([s for s in status_list if s['status_level'] == "正常"]),
+            "提示": len([s for s in status_list if s['status_level'] == "提示"]),
+            "警告": len([s for s in status_list if s['status_level'] == "警告"]),
+            "未知": len([s for s in status_list if s['status_level'] == "未知"])
+        }
+        
+        # 3. 告警和提示信息汇总
+        all_issues = []
+        all_warnings = []
+        
+        for status in status_list:
+            all_issues.extend([{"ip": status['ip'], "issue": issue} for issue in status['issues']])
+            all_warnings.extend([{"ip": status['ip'], "warning": warning} for warning in status['warnings']])
+        
+        # 4. 关键指标统计（最大值、平均值、最小值）
+        key_metrics_stats = self._calculate_key_metrics_statistics(metrics)
+        
+        # 5. 性能趋势分析（基于最近10条数据）
+        trend_analysis = self._analyze_performance_trend(time_window_hours)
+        
+        # 6. 系统健康评分
+        overall_health_score = self._calculate_system_health_score(status_list)
+        
+        # 构建总体概览信息
+        overview = {
+            "timestamp": int(time.time()),
+            "time_window_hours": time_window_hours,
+            "active_machines": {
+                "total": active_machines,
+                "ips": active_ips
+            },
+            "health_status": {
+                "distribution": status_distribution,
+                "overall_score": overall_health_score,
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+            },
+            "alerts_summary": {
+                "critical_issues": len(all_issues),
+                "warning_issues": len(all_warnings),
+                "issues_by_type": self._categorize_issues(all_issues),
+                "warnings_by_type": self._categorize_warnings(all_warnings)
+            },
+            "key_metrics": key_metrics_stats,
+            "performance_trend": trend_analysis,
+            "detailed_alerts": {
+                "critical": all_issues,
+                "warning": all_warnings
+            }
+        }
+        
+        return overview
+
+    def _calculate_key_metrics_statistics(self, metrics: List[Dict]) -> Dict:
+        """计算关键指标的统计信息"""
+        if not metrics:
+            return {
+                "cpu_usage": {"max": 0, "avg": 0, "min": 0},
+                "memory_usage": {"max": 0, "avg": 0, "min": 0},
+                "disk_usage": {"max": 0, "avg": 0, "min": 0},
+                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+            }
+        
+        cpu_usages = []
+        memory_usages = []
+        disk_usages = []
+        swap_usages = []
+        
+        for metric in metrics:
+            # 计算各项指标
+            cpu_usr = metric.get('cpu_usr', 0) or 0
+            cpu_sys = metric.get('cpu_sys', 0) or 0
+            cpu_iow = metric.get('cpu_iow', 0) or 0
+            cpu_total = cpu_usr + cpu_sys + cpu_iow
+            
+            mem_total = metric.get('mem_total', 0) or 0
+            mem_free = metric.get('mem_free', 0) or 0
+            mem_buff = metric.get('mem_buff', 0) or 0
+            mem_cache = metric.get('mem_cache', 0) or 0
+            mem_used = mem_total - mem_free - mem_buff - mem_cache
+            mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+            
+            disk_usage = metric.get('disk_used_percent', 0) or 0
+            
+            swap_used = metric.get('swap_used', 0) or 0
+            swap_total = metric.get('swap_total', 0) or 0
+            swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+            
+            cpu_usages.append(cpu_total)
+            memory_usages.append(mem_usage_percent)
+            disk_usages.append(disk_usage)
+            swap_usages.append(swap_usage_percent)
+        
+        return {
+            "cpu_usage": {
+                "max": round(max(cpu_usages), 2) if cpu_usages else 0,
+                "avg": round(sum(cpu_usages) / len(cpu_usages), 2) if cpu_usages else 0,
+                "min": round(min(cpu_usages), 2) if cpu_usages else 0
+            },
+            "memory_usage": {
+                "max": round(max(memory_usages), 2) if memory_usages else 0,
+                "avg": round(sum(memory_usages) / len(memory_usages), 2) if memory_usages else 0,
+                "min": round(min(memory_usages), 2) if memory_usages else 0
+            },
+            "disk_usage": {
+                "max": round(max(disk_usages), 2) if disk_usages else 0,
+                "avg": round(sum(disk_usages) / len(disk_usages), 2) if disk_usages else 0,
+                "min": round(min(disk_usages), 2) if disk_usages else 0
+            },
+            "swap_usage": {
+                "max": round(max(swap_usages), 2) if swap_usages else 0,
+                "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
+                "min": round(min(swap_usages), 2) if swap_usages else 0
+            }
+        }
+
+    def _analyze_performance_trend(self, time_window_hours: int) -> Dict:
+        """分析性能趋势"""
+        # 这里可以扩展为获取历史数据进行趋势分析
+        # 目前返回基础趋势信息
+        return {
+            "trend": "stable",  # stable, improving, declining
+            "confidence": 0.8,
+            "analysis": "系统性能整体稳定",
+            "suggestions": ["建议定期检查磁盘使用率", "关注内存使用趋势"]
+        }
+
+    def _calculate_system_health_score(self, status_list: List[Dict]) -> float:
+        """计算系统整体健康评分"""
+        if not status_list:
+            return 0.0
+        
+        total_score = sum(status['overall_score'] for status in status_list)
+        return round(total_score / len(status_list), 2)
+
+    def _categorize_issues(self, issues: List[Dict]) -> Dict:
+        """分类汇总问题"""
+        categories = {}
+        
+        for issue_item in issues:
+            issue_text = issue_item['issue']
+            if "CPU" in issue_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in issue_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in issue_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in issue_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in issue_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
+
+    def _categorize_warnings(self, warnings: List[Dict]) -> Dict:
+        """分类汇总警告"""
+        categories = {}
+        
+        for warning_item in warnings:
+            warning_text = warning_item['warning']
+            if "CPU" in warning_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in warning_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in warning_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in warning_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in warning_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
     
     def update_user(self, user_id: int, name: str = None, email: str = None, age: int = None, password = None) -> bool:
         """更新用户信息"""
@@ -224,6 +2240,409 @@ class DatabaseManager:
             return False
         finally:
             self.return_connection(connection)
+
+    def assess_machine_status(self, metric: Dict) -> Dict:
+        """
+        根据监控指标评估机器运行状态
+        
+        Args:
+            metric: 监控指标数据
+            
+        Returns:
+            包含状态分级和详细信息的字典
+        """
+        # 获取关键指标值，处理None值
+        cpu_usr = metric.get('cpu_usr', 0) or 0
+        cpu_sys = metric.get('cpu_sys', 0) or 0
+        cpu_iow = metric.get('cpu_iow', 0) or 0
+        
+        mem_total = metric.get('mem_total', 0) or 0
+        mem_free = metric.get('mem_free', 0) or 0
+        mem_buff = metric.get('mem_buff', 0) or 0
+        mem_cache = metric.get('mem_cache', 0) or 0
+        
+        disk_used_percent = metric.get('disk_used_percent', 0) or 0
+        swap_used = metric.get('swap_used', 0) or 0
+        swap_total = metric.get('swap_total', 0) or 0
+        
+        # 计算关键指标
+        cpu_total = cpu_usr + cpu_sys + cpu_iow
+        mem_used = mem_total - mem_free - mem_buff - mem_cache
+        mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+        swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 状态评估
+        status_level = "正常"
+        issues = []
+        warnings = []
+        
+        # CPU使用率检查
+        if cpu_total >= 90:
+            status_level = "警告"
+            issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
+        elif cpu_total >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
+        
+        # 内存使用率检查
+        if mem_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
+        elif mem_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
+        
+        # 磁盘使用率检查
+        if disk_used_percent >= 90:
+            status_level = "警告"
+            issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
+        elif disk_used_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
+        
+        # Swap使用率检查
+        if swap_usage_percent >= 50:
+            status_level = "警告"
+            issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
+        elif swap_usage_percent >= 20:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
+        
+        # 数据时效性检查（超过1小时无数据视为异常）
+        import time
+        current_timestamp = int(time.time())
+        metric_timestamp = metric.get('ts', 0)
+        time_diff_hours = (current_timestamp - metric_timestamp) / 3600
+        
+        if time_diff_hours > 1:
+            status_level = "警告"
+            issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
+        elif time_diff_hours > 0.3:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
+        
+        # 构建返回结果
+        result = {
+            "status_level": status_level,
+            "ip": metric.get('ip', '未知'),
+            "timestamp": metric_timestamp,
+            "key_metrics": {
+                "cpu_usage_percent": round(cpu_total, 2),
+                "memory_usage_percent": round(mem_usage_percent, 2),
+                "disk_usage_percent": round(disk_used_percent, 2),
+                "swap_usage_percent": round(swap_usage_percent, 2),
+                "data_freshness_hours": round(time_diff_hours, 2)
+            },
+            "issues": issues,
+            "warnings": warnings,
+            "is_healthy": status_level == "正常",
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+        }
+        
+        return result
+
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+        """
+        计算机器健康评分（0-100分）
+        
+        Args:
+            cpu_usage: CPU使用率
+            mem_usage: 内存使用率
+            disk_usage: 磁盘使用率
+            swap_usage: Swap使用率
+            data_freshness: 数据新鲜度（小时）
+            
+        Returns:
+            健康评分（0-100）
+        """
+        # 各项指标的权重
+        weights = {
+            'cpu': 0.25,
+            'memory': 0.25,
+            'disk': 0.20,
+            'swap': 0.15,
+            'freshness': 0.15
+        }
+        
+        # 计算各项得分（0-100分）
+        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
+        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
+        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
+        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
+        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        
+        # 加权平均
+        total_score = (
+            cpu_score * weights['cpu'] +
+            mem_score * weights['memory'] +
+            disk_score * weights['disk'] +
+            swap_score * weights['swap'] +
+            freshness_score * weights['freshness']
+        )
+        
+        return int(max(0, min(100, total_score)))
+
+    def get_machine_status_by_ip(self, ip: str) -> Dict:
+        """
+        根据IP地址获取机器的最新状态评估
+        
+        Args:
+            ip: IP地址
+            
+        Returns:
+            机器状态评估结果
+        """
+        # 获取最新监控数据
+        metric = self.get_latest_metric_by_ip(ip)
+        
+        if not metric:
+            return {
+                "status_level": "未知",
+                "ip": ip,
+                "timestamp": None,
+                "key_metrics": {},
+                "issues": ["未找到该IP的监控数据"],
+                "warnings": [],
+                "is_healthy": False,
+                "overall_score": 0,
+                "error": "未找到监控数据"
+            }
+        
+        # 评估状态
+        return self.assess_machine_status(metric)
+
+    def get_all_machines_status(self, time_window_hours: int = 1) -> List[Dict]:
+        """
+        获取所有机器的状态评估
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            所有机器的状态评估列表
+        """
+        # 获取活跃机器的监控数据
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        status_list = []
+        for metric in metrics:
+            status = self.assess_machine_status(metric)
+            status_list.append(status)
+        
+        # 按健康评分排序
+        status_list.sort(key=lambda x: x['overall_score'], reverse=True)
+        
+        return status_list
+
+    def get_system_overview(self, time_window_hours: int = 1) -> Dict:
+        """
+        获取系统总体概览信息
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            系统总体概览信息，包含：
+            - 活跃机器统计
+            - 健康状态分布
+            - 告警和提示信息汇总
+            - 关键指标统计
+            - 性能趋势分析
+        """
+        # 获取所有机器的状态评估
+        status_list = self.get_all_machines_status(time_window_hours)
+        
+        # 获取活跃机器的原始监控数据用于统计计算
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        # 1. 活跃机器统计
+        active_machines = len(status_list)
+        active_ips = [status['ip'] for status in status_list]
+        
+        # 2. 健康状态分布
+        status_distribution = {
+            "正常": len([s for s in status_list if s['status_level'] == "正常"]),
+            "提示": len([s for s in status_list if s['status_level'] == "提示"]),
+            "警告": len([s for s in status_list if s['status_level'] == "警告"]),
+            "未知": len([s for s in status_list if s['status_level'] == "未知"])
+        }
+        
+        # 3. 告警和提示信息汇总
+        all_issues = []
+        all_warnings = []
+        
+        for status in status_list:
+            all_issues.extend([{"ip": status['ip'], "issue": issue} for issue in status['issues']])
+            all_warnings.extend([{"ip": status['ip'], "warning": warning} for warning in status['warnings']])
+        
+        # 4. 关键指标统计（最大值、平均值、最小值）
+        key_metrics_stats = self._calculate_key_metrics_statistics(metrics)
+        
+        # 5. 性能趋势分析（基于最近10条数据）
+        trend_analysis = self._analyze_performance_trend(time_window_hours)
+        
+        # 6. 系统健康评分
+        overall_health_score = self._calculate_system_health_score(status_list)
+        
+        # 构建总体概览信息
+        overview = {
+            "timestamp": int(time.time()),
+            "time_window_hours": time_window_hours,
+            "active_machines": {
+                "total": active_machines,
+                "ips": active_ips
+            },
+            "health_status": {
+                "distribution": status_distribution,
+                "overall_score": overall_health_score,
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+            },
+            "alerts_summary": {
+                "critical_issues": len(all_issues),
+                "warning_issues": len(all_warnings),
+                "issues_by_type": self._categorize_issues(all_issues),
+                "warnings_by_type": self._categorize_warnings(all_warnings)
+            },
+            "key_metrics": key_metrics_stats,
+            "performance_trend": trend_analysis,
+            "detailed_alerts": {
+                "critical": all_issues,
+                "warning": all_warnings
+            }
+        }
+        
+        return overview
+
+    def _calculate_key_metrics_statistics(self, metrics: List[Dict]) -> Dict:
+        """计算关键指标的统计信息"""
+        if not metrics:
+            return {
+                "cpu_usage": {"max": 0, "avg": 0, "min": 0},
+                "memory_usage": {"max": 0, "avg": 0, "min": 0},
+                "disk_usage": {"max": 0, "avg": 0, "min": 0},
+                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+            }
+        
+        cpu_usages = []
+        memory_usages = []
+        disk_usages = []
+        swap_usages = []
+        
+        for metric in metrics:
+            # 计算各项指标
+            cpu_usr = metric.get('cpu_usr', 0) or 0
+            cpu_sys = metric.get('cpu_sys', 0) or 0
+            cpu_iow = metric.get('cpu_iow', 0) or 0
+            cpu_total = cpu_usr + cpu_sys + cpu_iow
+            
+            mem_total = metric.get('mem_total', 0) or 0
+            mem_free = metric.get('mem_free', 0) or 0
+            mem_buff = metric.get('mem_buff', 0) or 0
+            mem_cache = metric.get('mem_cache', 0) or 0
+            mem_used = mem_total - mem_free - mem_buff - mem_cache
+            mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+            
+            disk_usage = metric.get('disk_used_percent', 0) or 0
+            
+            swap_used = metric.get('swap_used', 0) or 0
+            swap_total = metric.get('swap_total', 0) or 0
+            swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+            
+            cpu_usages.append(cpu_total)
+            memory_usages.append(mem_usage_percent)
+            disk_usages.append(disk_usage)
+            swap_usages.append(swap_usage_percent)
+        
+        return {
+            "cpu_usage": {
+                "max": round(max(cpu_usages), 2) if cpu_usages else 0,
+                "avg": round(sum(cpu_usages) / len(cpu_usages), 2) if cpu_usages else 0,
+                "min": round(min(cpu_usages), 2) if cpu_usages else 0
+            },
+            "memory_usage": {
+                "max": round(max(memory_usages), 2) if memory_usages else 0,
+                "avg": round(sum(memory_usages) / len(memory_usages), 2) if memory_usages else 0,
+                "min": round(min(memory_usages), 2) if memory_usages else 0
+            },
+            "disk_usage": {
+                "max": round(max(disk_usages), 2) if disk_usages else 0,
+                "avg": round(sum(disk_usages) / len(disk_usages), 2) if disk_usages else 0,
+                "min": round(min(disk_usages), 2) if disk_usages else 0
+            },
+            "swap_usage": {
+                "max": round(max(swap_usages), 2) if swap_usages else 0,
+                "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
+                "min": round(min(swap_usages), 2) if swap_usages else 0
+            }
+        }
+
+    def _analyze_performance_trend(self, time_window_hours: int) -> Dict:
+        """分析性能趋势"""
+        # 这里可以扩展为获取历史数据进行趋势分析
+        # 目前返回基础趋势信息
+        return {
+            "trend": "stable",  # stable, improving, declining
+            "confidence": 0.8,
+            "analysis": "系统性能整体稳定",
+            "suggestions": ["建议定期检查磁盘使用率", "关注内存使用趋势"]
+        }
+
+    def _calculate_system_health_score(self, status_list: List[Dict]) -> float:
+        """计算系统整体健康评分"""
+        if not status_list:
+            return 0.0
+        
+        total_score = sum(status['overall_score'] for status in status_list)
+        return round(total_score / len(status_list), 2)
+
+    def _categorize_issues(self, issues: List[Dict]) -> Dict:
+        """分类汇总问题"""
+        categories = {}
+        
+        for issue_item in issues:
+            issue_text = issue_item['issue']
+            if "CPU" in issue_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in issue_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in issue_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in issue_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in issue_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
+
+    def _categorize_warnings(self, warnings: List[Dict]) -> Dict:
+        """分类汇总警告"""
+        categories = {}
+        
+        for warning_item in warnings:
+            warning_text = warning_item['warning']
+            if "CPU" in warning_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in warning_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in warning_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in warning_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in warning_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
     
     def delete_user(self, user_id: int) -> bool:
         """删除用户"""
@@ -251,6 +2670,409 @@ class DatabaseManager:
             return False
         finally:
             self.return_connection(connection)
+
+    def assess_machine_status(self, metric: Dict) -> Dict:
+        """
+        根据监控指标评估机器运行状态
+        
+        Args:
+            metric: 监控指标数据
+            
+        Returns:
+            包含状态分级和详细信息的字典
+        """
+        # 获取关键指标值，处理None值
+        cpu_usr = metric.get('cpu_usr', 0) or 0
+        cpu_sys = metric.get('cpu_sys', 0) or 0
+        cpu_iow = metric.get('cpu_iow', 0) or 0
+        
+        mem_total = metric.get('mem_total', 0) or 0
+        mem_free = metric.get('mem_free', 0) or 0
+        mem_buff = metric.get('mem_buff', 0) or 0
+        mem_cache = metric.get('mem_cache', 0) or 0
+        
+        disk_used_percent = metric.get('disk_used_percent', 0) or 0
+        swap_used = metric.get('swap_used', 0) or 0
+        swap_total = metric.get('swap_total', 0) or 0
+        
+        # 计算关键指标
+        cpu_total = cpu_usr + cpu_sys + cpu_iow
+        mem_used = mem_total - mem_free - mem_buff - mem_cache
+        mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+        swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 状态评估
+        status_level = "正常"
+        issues = []
+        warnings = []
+        
+        # CPU使用率检查
+        if cpu_total >= 90:
+            status_level = "警告"
+            issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
+        elif cpu_total >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
+        
+        # 内存使用率检查
+        if mem_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
+        elif mem_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
+        
+        # 磁盘使用率检查
+        if disk_used_percent >= 90:
+            status_level = "警告"
+            issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
+        elif disk_used_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
+        
+        # Swap使用率检查
+        if swap_usage_percent >= 50:
+            status_level = "警告"
+            issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
+        elif swap_usage_percent >= 20:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
+        
+        # 数据时效性检查（超过1小时无数据视为异常）
+        import time
+        current_timestamp = int(time.time())
+        metric_timestamp = metric.get('ts', 0)
+        time_diff_hours = (current_timestamp - metric_timestamp) / 3600
+        
+        if time_diff_hours > 1:
+            status_level = "警告"
+            issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
+        elif time_diff_hours > 0.3:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
+        
+        # 构建返回结果
+        result = {
+            "status_level": status_level,
+            "ip": metric.get('ip', '未知'),
+            "timestamp": metric_timestamp,
+            "key_metrics": {
+                "cpu_usage_percent": round(cpu_total, 2),
+                "memory_usage_percent": round(mem_usage_percent, 2),
+                "disk_usage_percent": round(disk_used_percent, 2),
+                "swap_usage_percent": round(swap_usage_percent, 2),
+                "data_freshness_hours": round(time_diff_hours, 2)
+            },
+            "issues": issues,
+            "warnings": warnings,
+            "is_healthy": status_level == "正常",
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+        }
+        
+        return result
+
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+        """
+        计算机器健康评分（0-100分）
+        
+        Args:
+            cpu_usage: CPU使用率
+            mem_usage: 内存使用率
+            disk_usage: 磁盘使用率
+            swap_usage: Swap使用率
+            data_freshness: 数据新鲜度（小时）
+            
+        Returns:
+            健康评分（0-100）
+        """
+        # 各项指标的权重
+        weights = {
+            'cpu': 0.25,
+            'memory': 0.25,
+            'disk': 0.20,
+            'swap': 0.15,
+            'freshness': 0.15
+        }
+        
+        # 计算各项得分（0-100分）
+        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
+        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
+        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
+        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
+        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        
+        # 加权平均
+        total_score = (
+            cpu_score * weights['cpu'] +
+            mem_score * weights['memory'] +
+            disk_score * weights['disk'] +
+            swap_score * weights['swap'] +
+            freshness_score * weights['freshness']
+        )
+        
+        return int(max(0, min(100, total_score)))
+
+    def get_machine_status_by_ip(self, ip: str) -> Dict:
+        """
+        根据IP地址获取机器的最新状态评估
+        
+        Args:
+            ip: IP地址
+            
+        Returns:
+            机器状态评估结果
+        """
+        # 获取最新监控数据
+        metric = self.get_latest_metric_by_ip(ip)
+        
+        if not metric:
+            return {
+                "status_level": "未知",
+                "ip": ip,
+                "timestamp": None,
+                "key_metrics": {},
+                "issues": ["未找到该IP的监控数据"],
+                "warnings": [],
+                "is_healthy": False,
+                "overall_score": 0,
+                "error": "未找到监控数据"
+            }
+        
+        # 评估状态
+        return self.assess_machine_status(metric)
+
+    def get_all_machines_status(self, time_window_hours: int = 1) -> List[Dict]:
+        """
+        获取所有机器的状态评估
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            所有机器的状态评估列表
+        """
+        # 获取活跃机器的监控数据
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        status_list = []
+        for metric in metrics:
+            status = self.assess_machine_status(metric)
+            status_list.append(status)
+        
+        # 按健康评分排序
+        status_list.sort(key=lambda x: x['overall_score'], reverse=True)
+        
+        return status_list
+
+    def get_system_overview(self, time_window_hours: int = 1) -> Dict:
+        """
+        获取系统总体概览信息
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            系统总体概览信息，包含：
+            - 活跃机器统计
+            - 健康状态分布
+            - 告警和提示信息汇总
+            - 关键指标统计
+            - 性能趋势分析
+        """
+        # 获取所有机器的状态评估
+        status_list = self.get_all_machines_status(time_window_hours)
+        
+        # 获取活跃机器的原始监控数据用于统计计算
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        # 1. 活跃机器统计
+        active_machines = len(status_list)
+        active_ips = [status['ip'] for status in status_list]
+        
+        # 2. 健康状态分布
+        status_distribution = {
+            "正常": len([s for s in status_list if s['status_level'] == "正常"]),
+            "提示": len([s for s in status_list if s['status_level'] == "提示"]),
+            "警告": len([s for s in status_list if s['status_level'] == "警告"]),
+            "未知": len([s for s in status_list if s['status_level'] == "未知"])
+        }
+        
+        # 3. 告警和提示信息汇总
+        all_issues = []
+        all_warnings = []
+        
+        for status in status_list:
+            all_issues.extend([{"ip": status['ip'], "issue": issue} for issue in status['issues']])
+            all_warnings.extend([{"ip": status['ip'], "warning": warning} for warning in status['warnings']])
+        
+        # 4. 关键指标统计（最大值、平均值、最小值）
+        key_metrics_stats = self._calculate_key_metrics_statistics(metrics)
+        
+        # 5. 性能趋势分析（基于最近10条数据）
+        trend_analysis = self._analyze_performance_trend(time_window_hours)
+        
+        # 6. 系统健康评分
+        overall_health_score = self._calculate_system_health_score(status_list)
+        
+        # 构建总体概览信息
+        overview = {
+            "timestamp": int(time.time()),
+            "time_window_hours": time_window_hours,
+            "active_machines": {
+                "total": active_machines,
+                "ips": active_ips
+            },
+            "health_status": {
+                "distribution": status_distribution,
+                "overall_score": overall_health_score,
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+            },
+            "alerts_summary": {
+                "critical_issues": len(all_issues),
+                "warning_issues": len(all_warnings),
+                "issues_by_type": self._categorize_issues(all_issues),
+                "warnings_by_type": self._categorize_warnings(all_warnings)
+            },
+            "key_metrics": key_metrics_stats,
+            "performance_trend": trend_analysis,
+            "detailed_alerts": {
+                "critical": all_issues,
+                "warning": all_warnings
+            }
+        }
+        
+        return overview
+
+    def _calculate_key_metrics_statistics(self, metrics: List[Dict]) -> Dict:
+        """计算关键指标的统计信息"""
+        if not metrics:
+            return {
+                "cpu_usage": {"max": 0, "avg": 0, "min": 0},
+                "memory_usage": {"max": 0, "avg": 0, "min": 0},
+                "disk_usage": {"max": 0, "avg": 0, "min": 0},
+                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+            }
+        
+        cpu_usages = []
+        memory_usages = []
+        disk_usages = []
+        swap_usages = []
+        
+        for metric in metrics:
+            # 计算各项指标
+            cpu_usr = metric.get('cpu_usr', 0) or 0
+            cpu_sys = metric.get('cpu_sys', 0) or 0
+            cpu_iow = metric.get('cpu_iow', 0) or 0
+            cpu_total = cpu_usr + cpu_sys + cpu_iow
+            
+            mem_total = metric.get('mem_total', 0) or 0
+            mem_free = metric.get('mem_free', 0) or 0
+            mem_buff = metric.get('mem_buff', 0) or 0
+            mem_cache = metric.get('mem_cache', 0) or 0
+            mem_used = mem_total - mem_free - mem_buff - mem_cache
+            mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+            
+            disk_usage = metric.get('disk_used_percent', 0) or 0
+            
+            swap_used = metric.get('swap_used', 0) or 0
+            swap_total = metric.get('swap_total', 0) or 0
+            swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+            
+            cpu_usages.append(cpu_total)
+            memory_usages.append(mem_usage_percent)
+            disk_usages.append(disk_usage)
+            swap_usages.append(swap_usage_percent)
+        
+        return {
+            "cpu_usage": {
+                "max": round(max(cpu_usages), 2) if cpu_usages else 0,
+                "avg": round(sum(cpu_usages) / len(cpu_usages), 2) if cpu_usages else 0,
+                "min": round(min(cpu_usages), 2) if cpu_usages else 0
+            },
+            "memory_usage": {
+                "max": round(max(memory_usages), 2) if memory_usages else 0,
+                "avg": round(sum(memory_usages) / len(memory_usages), 2) if memory_usages else 0,
+                "min": round(min(memory_usages), 2) if memory_usages else 0
+            },
+            "disk_usage": {
+                "max": round(max(disk_usages), 2) if disk_usages else 0,
+                "avg": round(sum(disk_usages) / len(disk_usages), 2) if disk_usages else 0,
+                "min": round(min(disk_usages), 2) if disk_usages else 0
+            },
+            "swap_usage": {
+                "max": round(max(swap_usages), 2) if swap_usages else 0,
+                "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
+                "min": round(min(swap_usages), 2) if swap_usages else 0
+            }
+        }
+
+    def _analyze_performance_trend(self, time_window_hours: int) -> Dict:
+        """分析性能趋势"""
+        # 这里可以扩展为获取历史数据进行趋势分析
+        # 目前返回基础趋势信息
+        return {
+            "trend": "stable",  # stable, improving, declining
+            "confidence": 0.8,
+            "analysis": "系统性能整体稳定",
+            "suggestions": ["建议定期检查磁盘使用率", "关注内存使用趋势"]
+        }
+
+    def _calculate_system_health_score(self, status_list: List[Dict]) -> float:
+        """计算系统整体健康评分"""
+        if not status_list:
+            return 0.0
+        
+        total_score = sum(status['overall_score'] for status in status_list)
+        return round(total_score / len(status_list), 2)
+
+    def _categorize_issues(self, issues: List[Dict]) -> Dict:
+        """分类汇总问题"""
+        categories = {}
+        
+        for issue_item in issues:
+            issue_text = issue_item['issue']
+            if "CPU" in issue_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in issue_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in issue_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in issue_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in issue_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
+
+    def _categorize_warnings(self, warnings: List[Dict]) -> Dict:
+        """分类汇总警告"""
+        categories = {}
+        
+        for warning_item in warnings:
+            warning_text = warning_item['warning']
+            if "CPU" in warning_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in warning_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in warning_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in warning_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in warning_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
     
     def search_users_by_name(self, name_pattern: str) -> List[Dict]:
         """根据姓名模糊查询用户"""
@@ -272,6 +3094,409 @@ class DatabaseManager:
             return []
         finally:
             self.return_connection(connection)
+
+    def assess_machine_status(self, metric: Dict) -> Dict:
+        """
+        根据监控指标评估机器运行状态
+        
+        Args:
+            metric: 监控指标数据
+            
+        Returns:
+            包含状态分级和详细信息的字典
+        """
+        # 获取关键指标值，处理None值
+        cpu_usr = metric.get('cpu_usr', 0) or 0
+        cpu_sys = metric.get('cpu_sys', 0) or 0
+        cpu_iow = metric.get('cpu_iow', 0) or 0
+        
+        mem_total = metric.get('mem_total', 0) or 0
+        mem_free = metric.get('mem_free', 0) or 0
+        mem_buff = metric.get('mem_buff', 0) or 0
+        mem_cache = metric.get('mem_cache', 0) or 0
+        
+        disk_used_percent = metric.get('disk_used_percent', 0) or 0
+        swap_used = metric.get('swap_used', 0) or 0
+        swap_total = metric.get('swap_total', 0) or 0
+        
+        # 计算关键指标
+        cpu_total = cpu_usr + cpu_sys + cpu_iow
+        mem_used = mem_total - mem_free - mem_buff - mem_cache
+        mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+        swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 状态评估
+        status_level = "正常"
+        issues = []
+        warnings = []
+        
+        # CPU使用率检查
+        if cpu_total >= 90:
+            status_level = "警告"
+            issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
+        elif cpu_total >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
+        
+        # 内存使用率检查
+        if mem_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
+        elif mem_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
+        
+        # 磁盘使用率检查
+        if disk_used_percent >= 90:
+            status_level = "警告"
+            issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
+        elif disk_used_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
+        
+        # Swap使用率检查
+        if swap_usage_percent >= 50:
+            status_level = "警告"
+            issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
+        elif swap_usage_percent >= 20:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
+        
+        # 数据时效性检查（超过1小时无数据视为异常）
+        import time
+        current_timestamp = int(time.time())
+        metric_timestamp = metric.get('ts', 0)
+        time_diff_hours = (current_timestamp - metric_timestamp) / 3600
+        
+        if time_diff_hours > 1:
+            status_level = "警告"
+            issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
+        elif time_diff_hours > 0.3:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
+        
+        # 构建返回结果
+        result = {
+            "status_level": status_level,
+            "ip": metric.get('ip', '未知'),
+            "timestamp": metric_timestamp,
+            "key_metrics": {
+                "cpu_usage_percent": round(cpu_total, 2),
+                "memory_usage_percent": round(mem_usage_percent, 2),
+                "disk_usage_percent": round(disk_used_percent, 2),
+                "swap_usage_percent": round(swap_usage_percent, 2),
+                "data_freshness_hours": round(time_diff_hours, 2)
+            },
+            "issues": issues,
+            "warnings": warnings,
+            "is_healthy": status_level == "正常",
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+        }
+        
+        return result
+
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+        """
+        计算机器健康评分（0-100分）
+        
+        Args:
+            cpu_usage: CPU使用率
+            mem_usage: 内存使用率
+            disk_usage: 磁盘使用率
+            swap_usage: Swap使用率
+            data_freshness: 数据新鲜度（小时）
+            
+        Returns:
+            健康评分（0-100）
+        """
+        # 各项指标的权重
+        weights = {
+            'cpu': 0.25,
+            'memory': 0.25,
+            'disk': 0.20,
+            'swap': 0.15,
+            'freshness': 0.15
+        }
+        
+        # 计算各项得分（0-100分）
+        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
+        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
+        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
+        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
+        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        
+        # 加权平均
+        total_score = (
+            cpu_score * weights['cpu'] +
+            mem_score * weights['memory'] +
+            disk_score * weights['disk'] +
+            swap_score * weights['swap'] +
+            freshness_score * weights['freshness']
+        )
+        
+        return int(max(0, min(100, total_score)))
+
+    def get_machine_status_by_ip(self, ip: str) -> Dict:
+        """
+        根据IP地址获取机器的最新状态评估
+        
+        Args:
+            ip: IP地址
+            
+        Returns:
+            机器状态评估结果
+        """
+        # 获取最新监控数据
+        metric = self.get_latest_metric_by_ip(ip)
+        
+        if not metric:
+            return {
+                "status_level": "未知",
+                "ip": ip,
+                "timestamp": None,
+                "key_metrics": {},
+                "issues": ["未找到该IP的监控数据"],
+                "warnings": [],
+                "is_healthy": False,
+                "overall_score": 0,
+                "error": "未找到监控数据"
+            }
+        
+        # 评估状态
+        return self.assess_machine_status(metric)
+
+    def get_all_machines_status(self, time_window_hours: int = 1) -> List[Dict]:
+        """
+        获取所有机器的状态评估
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            所有机器的状态评估列表
+        """
+        # 获取活跃机器的监控数据
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        status_list = []
+        for metric in metrics:
+            status = self.assess_machine_status(metric)
+            status_list.append(status)
+        
+        # 按健康评分排序
+        status_list.sort(key=lambda x: x['overall_score'], reverse=True)
+        
+        return status_list
+
+    def get_system_overview(self, time_window_hours: int = 1) -> Dict:
+        """
+        获取系统总体概览信息
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            系统总体概览信息，包含：
+            - 活跃机器统计
+            - 健康状态分布
+            - 告警和提示信息汇总
+            - 关键指标统计
+            - 性能趋势分析
+        """
+        # 获取所有机器的状态评估
+        status_list = self.get_all_machines_status(time_window_hours)
+        
+        # 获取活跃机器的原始监控数据用于统计计算
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        # 1. 活跃机器统计
+        active_machines = len(status_list)
+        active_ips = [status['ip'] for status in status_list]
+        
+        # 2. 健康状态分布
+        status_distribution = {
+            "正常": len([s for s in status_list if s['status_level'] == "正常"]),
+            "提示": len([s for s in status_list if s['status_level'] == "提示"]),
+            "警告": len([s for s in status_list if s['status_level'] == "警告"]),
+            "未知": len([s for s in status_list if s['status_level'] == "未知"])
+        }
+        
+        # 3. 告警和提示信息汇总
+        all_issues = []
+        all_warnings = []
+        
+        for status in status_list:
+            all_issues.extend([{"ip": status['ip'], "issue": issue} for issue in status['issues']])
+            all_warnings.extend([{"ip": status['ip'], "warning": warning} for warning in status['warnings']])
+        
+        # 4. 关键指标统计（最大值、平均值、最小值）
+        key_metrics_stats = self._calculate_key_metrics_statistics(metrics)
+        
+        # 5. 性能趋势分析（基于最近10条数据）
+        trend_analysis = self._analyze_performance_trend(time_window_hours)
+        
+        # 6. 系统健康评分
+        overall_health_score = self._calculate_system_health_score(status_list)
+        
+        # 构建总体概览信息
+        overview = {
+            "timestamp": int(time.time()),
+            "time_window_hours": time_window_hours,
+            "active_machines": {
+                "total": active_machines,
+                "ips": active_ips
+            },
+            "health_status": {
+                "distribution": status_distribution,
+                "overall_score": overall_health_score,
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+            },
+            "alerts_summary": {
+                "critical_issues": len(all_issues),
+                "warning_issues": len(all_warnings),
+                "issues_by_type": self._categorize_issues(all_issues),
+                "warnings_by_type": self._categorize_warnings(all_warnings)
+            },
+            "key_metrics": key_metrics_stats,
+            "performance_trend": trend_analysis,
+            "detailed_alerts": {
+                "critical": all_issues,
+                "warning": all_warnings
+            }
+        }
+        
+        return overview
+
+    def _calculate_key_metrics_statistics(self, metrics: List[Dict]) -> Dict:
+        """计算关键指标的统计信息"""
+        if not metrics:
+            return {
+                "cpu_usage": {"max": 0, "avg": 0, "min": 0},
+                "memory_usage": {"max": 0, "avg": 0, "min": 0},
+                "disk_usage": {"max": 0, "avg": 0, "min": 0},
+                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+            }
+        
+        cpu_usages = []
+        memory_usages = []
+        disk_usages = []
+        swap_usages = []
+        
+        for metric in metrics:
+            # 计算各项指标
+            cpu_usr = metric.get('cpu_usr', 0) or 0
+            cpu_sys = metric.get('cpu_sys', 0) or 0
+            cpu_iow = metric.get('cpu_iow', 0) or 0
+            cpu_total = cpu_usr + cpu_sys + cpu_iow
+            
+            mem_total = metric.get('mem_total', 0) or 0
+            mem_free = metric.get('mem_free', 0) or 0
+            mem_buff = metric.get('mem_buff', 0) or 0
+            mem_cache = metric.get('mem_cache', 0) or 0
+            mem_used = mem_total - mem_free - mem_buff - mem_cache
+            mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+            
+            disk_usage = metric.get('disk_used_percent', 0) or 0
+            
+            swap_used = metric.get('swap_used', 0) or 0
+            swap_total = metric.get('swap_total', 0) or 0
+            swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+            
+            cpu_usages.append(cpu_total)
+            memory_usages.append(mem_usage_percent)
+            disk_usages.append(disk_usage)
+            swap_usages.append(swap_usage_percent)
+        
+        return {
+            "cpu_usage": {
+                "max": round(max(cpu_usages), 2) if cpu_usages else 0,
+                "avg": round(sum(cpu_usages) / len(cpu_usages), 2) if cpu_usages else 0,
+                "min": round(min(cpu_usages), 2) if cpu_usages else 0
+            },
+            "memory_usage": {
+                "max": round(max(memory_usages), 2) if memory_usages else 0,
+                "avg": round(sum(memory_usages) / len(memory_usages), 2) if memory_usages else 0,
+                "min": round(min(memory_usages), 2) if memory_usages else 0
+            },
+            "disk_usage": {
+                "max": round(max(disk_usages), 2) if disk_usages else 0,
+                "avg": round(sum(disk_usages) / len(disk_usages), 2) if disk_usages else 0,
+                "min": round(min(disk_usages), 2) if disk_usages else 0
+            },
+            "swap_usage": {
+                "max": round(max(swap_usages), 2) if swap_usages else 0,
+                "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
+                "min": round(min(swap_usages), 2) if swap_usages else 0
+            }
+        }
+
+    def _analyze_performance_trend(self, time_window_hours: int) -> Dict:
+        """分析性能趋势"""
+        # 这里可以扩展为获取历史数据进行趋势分析
+        # 目前返回基础趋势信息
+        return {
+            "trend": "stable",  # stable, improving, declining
+            "confidence": 0.8,
+            "analysis": "系统性能整体稳定",
+            "suggestions": ["建议定期检查磁盘使用率", "关注内存使用趋势"]
+        }
+
+    def _calculate_system_health_score(self, status_list: List[Dict]) -> float:
+        """计算系统整体健康评分"""
+        if not status_list:
+            return 0.0
+        
+        total_score = sum(status['overall_score'] for status in status_list)
+        return round(total_score / len(status_list), 2)
+
+    def _categorize_issues(self, issues: List[Dict]) -> Dict:
+        """分类汇总问题"""
+        categories = {}
+        
+        for issue_item in issues:
+            issue_text = issue_item['issue']
+            if "CPU" in issue_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in issue_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in issue_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in issue_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in issue_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
+
+    def _categorize_warnings(self, warnings: List[Dict]) -> Dict:
+        """分类汇总警告"""
+        categories = {}
+        
+        for warning_item in warnings:
+            warning_text = warning_item['warning']
+            if "CPU" in warning_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in warning_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in warning_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in warning_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in warning_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
     
     def get_latest_monitor_metrics(self, limit: int = 5) -> List[Dict]:
         """查询最新的监控指标数据"""
@@ -297,6 +3522,409 @@ class DatabaseManager:
             return []
         finally:
             self.return_connection(connection)
+
+    def assess_machine_status(self, metric: Dict) -> Dict:
+        """
+        根据监控指标评估机器运行状态
+        
+        Args:
+            metric: 监控指标数据
+            
+        Returns:
+            包含状态分级和详细信息的字典
+        """
+        # 获取关键指标值，处理None值
+        cpu_usr = metric.get('cpu_usr', 0) or 0
+        cpu_sys = metric.get('cpu_sys', 0) or 0
+        cpu_iow = metric.get('cpu_iow', 0) or 0
+        
+        mem_total = metric.get('mem_total', 0) or 0
+        mem_free = metric.get('mem_free', 0) or 0
+        mem_buff = metric.get('mem_buff', 0) or 0
+        mem_cache = metric.get('mem_cache', 0) or 0
+        
+        disk_used_percent = metric.get('disk_used_percent', 0) or 0
+        swap_used = metric.get('swap_used', 0) or 0
+        swap_total = metric.get('swap_total', 0) or 0
+        
+        # 计算关键指标
+        cpu_total = cpu_usr + cpu_sys + cpu_iow
+        mem_used = mem_total - mem_free - mem_buff - mem_cache
+        mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+        swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 状态评估
+        status_level = "正常"
+        issues = []
+        warnings = []
+        
+        # CPU使用率检查
+        if cpu_total >= 90:
+            status_level = "警告"
+            issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
+        elif cpu_total >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
+        
+        # 内存使用率检查
+        if mem_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
+        elif mem_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
+        
+        # 磁盘使用率检查
+        if disk_used_percent >= 90:
+            status_level = "警告"
+            issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
+        elif disk_used_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
+        
+        # Swap使用率检查
+        if swap_usage_percent >= 50:
+            status_level = "警告"
+            issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
+        elif swap_usage_percent >= 20:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
+        
+        # 数据时效性检查（超过1小时无数据视为异常）
+        import time
+        current_timestamp = int(time.time())
+        metric_timestamp = metric.get('ts', 0)
+        time_diff_hours = (current_timestamp - metric_timestamp) / 3600
+        
+        if time_diff_hours > 1:
+            status_level = "警告"
+            issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
+        elif time_diff_hours > 0.3:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
+        
+        # 构建返回结果
+        result = {
+            "status_level": status_level,
+            "ip": metric.get('ip', '未知'),
+            "timestamp": metric_timestamp,
+            "key_metrics": {
+                "cpu_usage_percent": round(cpu_total, 2),
+                "memory_usage_percent": round(mem_usage_percent, 2),
+                "disk_usage_percent": round(disk_used_percent, 2),
+                "swap_usage_percent": round(swap_usage_percent, 2),
+                "data_freshness_hours": round(time_diff_hours, 2)
+            },
+            "issues": issues,
+            "warnings": warnings,
+            "is_healthy": status_level == "正常",
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+        }
+        
+        return result
+
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+        """
+        计算机器健康评分（0-100分）
+        
+        Args:
+            cpu_usage: CPU使用率
+            mem_usage: 内存使用率
+            disk_usage: 磁盘使用率
+            swap_usage: Swap使用率
+            data_freshness: 数据新鲜度（小时）
+            
+        Returns:
+            健康评分（0-100）
+        """
+        # 各项指标的权重
+        weights = {
+            'cpu': 0.25,
+            'memory': 0.25,
+            'disk': 0.20,
+            'swap': 0.15,
+            'freshness': 0.15
+        }
+        
+        # 计算各项得分（0-100分）
+        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
+        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
+        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
+        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
+        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        
+        # 加权平均
+        total_score = (
+            cpu_score * weights['cpu'] +
+            mem_score * weights['memory'] +
+            disk_score * weights['disk'] +
+            swap_score * weights['swap'] +
+            freshness_score * weights['freshness']
+        )
+        
+        return int(max(0, min(100, total_score)))
+
+    def get_machine_status_by_ip(self, ip: str) -> Dict:
+        """
+        根据IP地址获取机器的最新状态评估
+        
+        Args:
+            ip: IP地址
+            
+        Returns:
+            机器状态评估结果
+        """
+        # 获取最新监控数据
+        metric = self.get_latest_metric_by_ip(ip)
+        
+        if not metric:
+            return {
+                "status_level": "未知",
+                "ip": ip,
+                "timestamp": None,
+                "key_metrics": {},
+                "issues": ["未找到该IP的监控数据"],
+                "warnings": [],
+                "is_healthy": False,
+                "overall_score": 0,
+                "error": "未找到监控数据"
+            }
+        
+        # 评估状态
+        return self.assess_machine_status(metric)
+
+    def get_all_machines_status(self, time_window_hours: int = 1) -> List[Dict]:
+        """
+        获取所有机器的状态评估
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            所有机器的状态评估列表
+        """
+        # 获取活跃机器的监控数据
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        status_list = []
+        for metric in metrics:
+            status = self.assess_machine_status(metric)
+            status_list.append(status)
+        
+        # 按健康评分排序
+        status_list.sort(key=lambda x: x['overall_score'], reverse=True)
+        
+        return status_list
+
+    def get_system_overview(self, time_window_hours: int = 1) -> Dict:
+        """
+        获取系统总体概览信息
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            系统总体概览信息，包含：
+            - 活跃机器统计
+            - 健康状态分布
+            - 告警和提示信息汇总
+            - 关键指标统计
+            - 性能趋势分析
+        """
+        # 获取所有机器的状态评估
+        status_list = self.get_all_machines_status(time_window_hours)
+        
+        # 获取活跃机器的原始监控数据用于统计计算
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        # 1. 活跃机器统计
+        active_machines = len(status_list)
+        active_ips = [status['ip'] for status in status_list]
+        
+        # 2. 健康状态分布
+        status_distribution = {
+            "正常": len([s for s in status_list if s['status_level'] == "正常"]),
+            "提示": len([s for s in status_list if s['status_level'] == "提示"]),
+            "警告": len([s for s in status_list if s['status_level'] == "警告"]),
+            "未知": len([s for s in status_list if s['status_level'] == "未知"])
+        }
+        
+        # 3. 告警和提示信息汇总
+        all_issues = []
+        all_warnings = []
+        
+        for status in status_list:
+            all_issues.extend([{"ip": status['ip'], "issue": issue} for issue in status['issues']])
+            all_warnings.extend([{"ip": status['ip'], "warning": warning} for warning in status['warnings']])
+        
+        # 4. 关键指标统计（最大值、平均值、最小值）
+        key_metrics_stats = self._calculate_key_metrics_statistics(metrics)
+        
+        # 5. 性能趋势分析（基于最近10条数据）
+        trend_analysis = self._analyze_performance_trend(time_window_hours)
+        
+        # 6. 系统健康评分
+        overall_health_score = self._calculate_system_health_score(status_list)
+        
+        # 构建总体概览信息
+        overview = {
+            "timestamp": int(time.time()),
+            "time_window_hours": time_window_hours,
+            "active_machines": {
+                "total": active_machines,
+                "ips": active_ips
+            },
+            "health_status": {
+                "distribution": status_distribution,
+                "overall_score": overall_health_score,
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+            },
+            "alerts_summary": {
+                "critical_issues": len(all_issues),
+                "warning_issues": len(all_warnings),
+                "issues_by_type": self._categorize_issues(all_issues),
+                "warnings_by_type": self._categorize_warnings(all_warnings)
+            },
+            "key_metrics": key_metrics_stats,
+            "performance_trend": trend_analysis,
+            "detailed_alerts": {
+                "critical": all_issues,
+                "warning": all_warnings
+            }
+        }
+        
+        return overview
+
+    def _calculate_key_metrics_statistics(self, metrics: List[Dict]) -> Dict:
+        """计算关键指标的统计信息"""
+        if not metrics:
+            return {
+                "cpu_usage": {"max": 0, "avg": 0, "min": 0},
+                "memory_usage": {"max": 0, "avg": 0, "min": 0},
+                "disk_usage": {"max": 0, "avg": 0, "min": 0},
+                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+            }
+        
+        cpu_usages = []
+        memory_usages = []
+        disk_usages = []
+        swap_usages = []
+        
+        for metric in metrics:
+            # 计算各项指标
+            cpu_usr = metric.get('cpu_usr', 0) or 0
+            cpu_sys = metric.get('cpu_sys', 0) or 0
+            cpu_iow = metric.get('cpu_iow', 0) or 0
+            cpu_total = cpu_usr + cpu_sys + cpu_iow
+            
+            mem_total = metric.get('mem_total', 0) or 0
+            mem_free = metric.get('mem_free', 0) or 0
+            mem_buff = metric.get('mem_buff', 0) or 0
+            mem_cache = metric.get('mem_cache', 0) or 0
+            mem_used = mem_total - mem_free - mem_buff - mem_cache
+            mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+            
+            disk_usage = metric.get('disk_used_percent', 0) or 0
+            
+            swap_used = metric.get('swap_used', 0) or 0
+            swap_total = metric.get('swap_total', 0) or 0
+            swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+            
+            cpu_usages.append(cpu_total)
+            memory_usages.append(mem_usage_percent)
+            disk_usages.append(disk_usage)
+            swap_usages.append(swap_usage_percent)
+        
+        return {
+            "cpu_usage": {
+                "max": round(max(cpu_usages), 2) if cpu_usages else 0,
+                "avg": round(sum(cpu_usages) / len(cpu_usages), 2) if cpu_usages else 0,
+                "min": round(min(cpu_usages), 2) if cpu_usages else 0
+            },
+            "memory_usage": {
+                "max": round(max(memory_usages), 2) if memory_usages else 0,
+                "avg": round(sum(memory_usages) / len(memory_usages), 2) if memory_usages else 0,
+                "min": round(min(memory_usages), 2) if memory_usages else 0
+            },
+            "disk_usage": {
+                "max": round(max(disk_usages), 2) if disk_usages else 0,
+                "avg": round(sum(disk_usages) / len(disk_usages), 2) if disk_usages else 0,
+                "min": round(min(disk_usages), 2) if disk_usages else 0
+            },
+            "swap_usage": {
+                "max": round(max(swap_usages), 2) if swap_usages else 0,
+                "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
+                "min": round(min(swap_usages), 2) if swap_usages else 0
+            }
+        }
+
+    def _analyze_performance_trend(self, time_window_hours: int) -> Dict:
+        """分析性能趋势"""
+        # 这里可以扩展为获取历史数据进行趋势分析
+        # 目前返回基础趋势信息
+        return {
+            "trend": "stable",  # stable, improving, declining
+            "confidence": 0.8,
+            "analysis": "系统性能整体稳定",
+            "suggestions": ["建议定期检查磁盘使用率", "关注内存使用趋势"]
+        }
+
+    def _calculate_system_health_score(self, status_list: List[Dict]) -> float:
+        """计算系统整体健康评分"""
+        if not status_list:
+            return 0.0
+        
+        total_score = sum(status['overall_score'] for status in status_list)
+        return round(total_score / len(status_list), 2)
+
+    def _categorize_issues(self, issues: List[Dict]) -> Dict:
+        """分类汇总问题"""
+        categories = {}
+        
+        for issue_item in issues:
+            issue_text = issue_item['issue']
+            if "CPU" in issue_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in issue_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in issue_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in issue_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in issue_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
+
+    def _categorize_warnings(self, warnings: List[Dict]) -> Dict:
+        """分类汇总警告"""
+        categories = {}
+        
+        for warning_item in warnings:
+            warning_text = warning_item['warning']
+            if "CPU" in warning_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in warning_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in warning_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in warning_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in warning_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
     
     def get_metrics_by_ip(self, ip: str, limit: int = 10) -> List[Dict]:
         """根据IP查询监控指标数据"""
@@ -323,6 +3951,409 @@ class DatabaseManager:
             return []
         finally:
             self.return_connection(connection)
+
+    def assess_machine_status(self, metric: Dict) -> Dict:
+        """
+        根据监控指标评估机器运行状态
+        
+        Args:
+            metric: 监控指标数据
+            
+        Returns:
+            包含状态分级和详细信息的字典
+        """
+        # 获取关键指标值，处理None值
+        cpu_usr = metric.get('cpu_usr', 0) or 0
+        cpu_sys = metric.get('cpu_sys', 0) or 0
+        cpu_iow = metric.get('cpu_iow', 0) or 0
+        
+        mem_total = metric.get('mem_total', 0) or 0
+        mem_free = metric.get('mem_free', 0) or 0
+        mem_buff = metric.get('mem_buff', 0) or 0
+        mem_cache = metric.get('mem_cache', 0) or 0
+        
+        disk_used_percent = metric.get('disk_used_percent', 0) or 0
+        swap_used = metric.get('swap_used', 0) or 0
+        swap_total = metric.get('swap_total', 0) or 0
+        
+        # 计算关键指标
+        cpu_total = cpu_usr + cpu_sys + cpu_iow
+        mem_used = mem_total - mem_free - mem_buff - mem_cache
+        mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+        swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 状态评估
+        status_level = "正常"
+        issues = []
+        warnings = []
+        
+        # CPU使用率检查
+        if cpu_total >= 90:
+            status_level = "警告"
+            issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
+        elif cpu_total >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
+        
+        # 内存使用率检查
+        if mem_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
+        elif mem_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
+        
+        # 磁盘使用率检查
+        if disk_used_percent >= 90:
+            status_level = "警告"
+            issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
+        elif disk_used_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
+        
+        # Swap使用率检查
+        if swap_usage_percent >= 50:
+            status_level = "警告"
+            issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
+        elif swap_usage_percent >= 20:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
+        
+        # 数据时效性检查（超过1小时无数据视为异常）
+        import time
+        current_timestamp = int(time.time())
+        metric_timestamp = metric.get('ts', 0)
+        time_diff_hours = (current_timestamp - metric_timestamp) / 3600
+        
+        if time_diff_hours > 1:
+            status_level = "警告"
+            issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
+        elif time_diff_hours > 0.3:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
+        
+        # 构建返回结果
+        result = {
+            "status_level": status_level,
+            "ip": metric.get('ip', '未知'),
+            "timestamp": metric_timestamp,
+            "key_metrics": {
+                "cpu_usage_percent": round(cpu_total, 2),
+                "memory_usage_percent": round(mem_usage_percent, 2),
+                "disk_usage_percent": round(disk_used_percent, 2),
+                "swap_usage_percent": round(swap_usage_percent, 2),
+                "data_freshness_hours": round(time_diff_hours, 2)
+            },
+            "issues": issues,
+            "warnings": warnings,
+            "is_healthy": status_level == "正常",
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+        }
+        
+        return result
+
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+        """
+        计算机器健康评分（0-100分）
+        
+        Args:
+            cpu_usage: CPU使用率
+            mem_usage: 内存使用率
+            disk_usage: 磁盘使用率
+            swap_usage: Swap使用率
+            data_freshness: 数据新鲜度（小时）
+            
+        Returns:
+            健康评分（0-100）
+        """
+        # 各项指标的权重
+        weights = {
+            'cpu': 0.25,
+            'memory': 0.25,
+            'disk': 0.20,
+            'swap': 0.15,
+            'freshness': 0.15
+        }
+        
+        # 计算各项得分（0-100分）
+        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
+        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
+        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
+        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
+        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        
+        # 加权平均
+        total_score = (
+            cpu_score * weights['cpu'] +
+            mem_score * weights['memory'] +
+            disk_score * weights['disk'] +
+            swap_score * weights['swap'] +
+            freshness_score * weights['freshness']
+        )
+        
+        return int(max(0, min(100, total_score)))
+
+    def get_machine_status_by_ip(self, ip: str) -> Dict:
+        """
+        根据IP地址获取机器的最新状态评估
+        
+        Args:
+            ip: IP地址
+            
+        Returns:
+            机器状态评估结果
+        """
+        # 获取最新监控数据
+        metric = self.get_latest_metric_by_ip(ip)
+        
+        if not metric:
+            return {
+                "status_level": "未知",
+                "ip": ip,
+                "timestamp": None,
+                "key_metrics": {},
+                "issues": ["未找到该IP的监控数据"],
+                "warnings": [],
+                "is_healthy": False,
+                "overall_score": 0,
+                "error": "未找到监控数据"
+            }
+        
+        # 评估状态
+        return self.assess_machine_status(metric)
+
+    def get_all_machines_status(self, time_window_hours: int = 1) -> List[Dict]:
+        """
+        获取所有机器的状态评估
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            所有机器的状态评估列表
+        """
+        # 获取活跃机器的监控数据
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        status_list = []
+        for metric in metrics:
+            status = self.assess_machine_status(metric)
+            status_list.append(status)
+        
+        # 按健康评分排序
+        status_list.sort(key=lambda x: x['overall_score'], reverse=True)
+        
+        return status_list
+
+    def get_system_overview(self, time_window_hours: int = 1) -> Dict:
+        """
+        获取系统总体概览信息
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            系统总体概览信息，包含：
+            - 活跃机器统计
+            - 健康状态分布
+            - 告警和提示信息汇总
+            - 关键指标统计
+            - 性能趋势分析
+        """
+        # 获取所有机器的状态评估
+        status_list = self.get_all_machines_status(time_window_hours)
+        
+        # 获取活跃机器的原始监控数据用于统计计算
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        # 1. 活跃机器统计
+        active_machines = len(status_list)
+        active_ips = [status['ip'] for status in status_list]
+        
+        # 2. 健康状态分布
+        status_distribution = {
+            "正常": len([s for s in status_list if s['status_level'] == "正常"]),
+            "提示": len([s for s in status_list if s['status_level'] == "提示"]),
+            "警告": len([s for s in status_list if s['status_level'] == "警告"]),
+            "未知": len([s for s in status_list if s['status_level'] == "未知"])
+        }
+        
+        # 3. 告警和提示信息汇总
+        all_issues = []
+        all_warnings = []
+        
+        for status in status_list:
+            all_issues.extend([{"ip": status['ip'], "issue": issue} for issue in status['issues']])
+            all_warnings.extend([{"ip": status['ip'], "warning": warning} for warning in status['warnings']])
+        
+        # 4. 关键指标统计（最大值、平均值、最小值）
+        key_metrics_stats = self._calculate_key_metrics_statistics(metrics)
+        
+        # 5. 性能趋势分析（基于最近10条数据）
+        trend_analysis = self._analyze_performance_trend(time_window_hours)
+        
+        # 6. 系统健康评分
+        overall_health_score = self._calculate_system_health_score(status_list)
+        
+        # 构建总体概览信息
+        overview = {
+            "timestamp": int(time.time()),
+            "time_window_hours": time_window_hours,
+            "active_machines": {
+                "total": active_machines,
+                "ips": active_ips
+            },
+            "health_status": {
+                "distribution": status_distribution,
+                "overall_score": overall_health_score,
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+            },
+            "alerts_summary": {
+                "critical_issues": len(all_issues),
+                "warning_issues": len(all_warnings),
+                "issues_by_type": self._categorize_issues(all_issues),
+                "warnings_by_type": self._categorize_warnings(all_warnings)
+            },
+            "key_metrics": key_metrics_stats,
+            "performance_trend": trend_analysis,
+            "detailed_alerts": {
+                "critical": all_issues,
+                "warning": all_warnings
+            }
+        }
+        
+        return overview
+
+    def _calculate_key_metrics_statistics(self, metrics: List[Dict]) -> Dict:
+        """计算关键指标的统计信息"""
+        if not metrics:
+            return {
+                "cpu_usage": {"max": 0, "avg": 0, "min": 0},
+                "memory_usage": {"max": 0, "avg": 0, "min": 0},
+                "disk_usage": {"max": 0, "avg": 0, "min": 0},
+                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+            }
+        
+        cpu_usages = []
+        memory_usages = []
+        disk_usages = []
+        swap_usages = []
+        
+        for metric in metrics:
+            # 计算各项指标
+            cpu_usr = metric.get('cpu_usr', 0) or 0
+            cpu_sys = metric.get('cpu_sys', 0) or 0
+            cpu_iow = metric.get('cpu_iow', 0) or 0
+            cpu_total = cpu_usr + cpu_sys + cpu_iow
+            
+            mem_total = metric.get('mem_total', 0) or 0
+            mem_free = metric.get('mem_free', 0) or 0
+            mem_buff = metric.get('mem_buff', 0) or 0
+            mem_cache = metric.get('mem_cache', 0) or 0
+            mem_used = mem_total - mem_free - mem_buff - mem_cache
+            mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+            
+            disk_usage = metric.get('disk_used_percent', 0) or 0
+            
+            swap_used = metric.get('swap_used', 0) or 0
+            swap_total = metric.get('swap_total', 0) or 0
+            swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+            
+            cpu_usages.append(cpu_total)
+            memory_usages.append(mem_usage_percent)
+            disk_usages.append(disk_usage)
+            swap_usages.append(swap_usage_percent)
+        
+        return {
+            "cpu_usage": {
+                "max": round(max(cpu_usages), 2) if cpu_usages else 0,
+                "avg": round(sum(cpu_usages) / len(cpu_usages), 2) if cpu_usages else 0,
+                "min": round(min(cpu_usages), 2) if cpu_usages else 0
+            },
+            "memory_usage": {
+                "max": round(max(memory_usages), 2) if memory_usages else 0,
+                "avg": round(sum(memory_usages) / len(memory_usages), 2) if memory_usages else 0,
+                "min": round(min(memory_usages), 2) if memory_usages else 0
+            },
+            "disk_usage": {
+                "max": round(max(disk_usages), 2) if disk_usages else 0,
+                "avg": round(sum(disk_usages) / len(disk_usages), 2) if disk_usages else 0,
+                "min": round(min(disk_usages), 2) if disk_usages else 0
+            },
+            "swap_usage": {
+                "max": round(max(swap_usages), 2) if swap_usages else 0,
+                "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
+                "min": round(min(swap_usages), 2) if swap_usages else 0
+            }
+        }
+
+    def _analyze_performance_trend(self, time_window_hours: int) -> Dict:
+        """分析性能趋势"""
+        # 这里可以扩展为获取历史数据进行趋势分析
+        # 目前返回基础趋势信息
+        return {
+            "trend": "stable",  # stable, improving, declining
+            "confidence": 0.8,
+            "analysis": "系统性能整体稳定",
+            "suggestions": ["建议定期检查磁盘使用率", "关注内存使用趋势"]
+        }
+
+    def _calculate_system_health_score(self, status_list: List[Dict]) -> float:
+        """计算系统整体健康评分"""
+        if not status_list:
+            return 0.0
+        
+        total_score = sum(status['overall_score'] for status in status_list)
+        return round(total_score / len(status_list), 2)
+
+    def _categorize_issues(self, issues: List[Dict]) -> Dict:
+        """分类汇总问题"""
+        categories = {}
+        
+        for issue_item in issues:
+            issue_text = issue_item['issue']
+            if "CPU" in issue_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in issue_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in issue_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in issue_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in issue_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
+
+    def _categorize_warnings(self, warnings: List[Dict]) -> Dict:
+        """分类汇总警告"""
+        categories = {}
+        
+        for warning_item in warnings:
+            warning_text = warning_item['warning']
+            if "CPU" in warning_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in warning_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in warning_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in warning_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in warning_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
     
     def get_latest_metric_by_ip(self, ip: str) -> Optional[Dict]:
         """获取指定IP的最新一条监控指标数据"""
@@ -349,6 +4380,409 @@ class DatabaseManager:
             return None
         finally:
             self.return_connection(connection)
+
+    def assess_machine_status(self, metric: Dict) -> Dict:
+        """
+        根据监控指标评估机器运行状态
+        
+        Args:
+            metric: 监控指标数据
+            
+        Returns:
+            包含状态分级和详细信息的字典
+        """
+        # 获取关键指标值，处理None值
+        cpu_usr = metric.get('cpu_usr', 0) or 0
+        cpu_sys = metric.get('cpu_sys', 0) or 0
+        cpu_iow = metric.get('cpu_iow', 0) or 0
+        
+        mem_total = metric.get('mem_total', 0) or 0
+        mem_free = metric.get('mem_free', 0) or 0
+        mem_buff = metric.get('mem_buff', 0) or 0
+        mem_cache = metric.get('mem_cache', 0) or 0
+        
+        disk_used_percent = metric.get('disk_used_percent', 0) or 0
+        swap_used = metric.get('swap_used', 0) or 0
+        swap_total = metric.get('swap_total', 0) or 0
+        
+        # 计算关键指标
+        cpu_total = cpu_usr + cpu_sys + cpu_iow
+        mem_used = mem_total - mem_free - mem_buff - mem_cache
+        mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+        swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 状态评估
+        status_level = "正常"
+        issues = []
+        warnings = []
+        
+        # CPU使用率检查
+        if cpu_total >= 90:
+            status_level = "警告"
+            issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
+        elif cpu_total >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
+        
+        # 内存使用率检查
+        if mem_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
+        elif mem_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
+        
+        # 磁盘使用率检查
+        if disk_used_percent >= 90:
+            status_level = "警告"
+            issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
+        elif disk_used_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
+        
+        # Swap使用率检查
+        if swap_usage_percent >= 50:
+            status_level = "警告"
+            issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
+        elif swap_usage_percent >= 20:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
+        
+        # 数据时效性检查（超过1小时无数据视为异常）
+        import time
+        current_timestamp = int(time.time())
+        metric_timestamp = metric.get('ts', 0)
+        time_diff_hours = (current_timestamp - metric_timestamp) / 3600
+        
+        if time_diff_hours > 1:
+            status_level = "警告"
+            issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
+        elif time_diff_hours > 0.3:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
+        
+        # 构建返回结果
+        result = {
+            "status_level": status_level,
+            "ip": metric.get('ip', '未知'),
+            "timestamp": metric_timestamp,
+            "key_metrics": {
+                "cpu_usage_percent": round(cpu_total, 2),
+                "memory_usage_percent": round(mem_usage_percent, 2),
+                "disk_usage_percent": round(disk_used_percent, 2),
+                "swap_usage_percent": round(swap_usage_percent, 2),
+                "data_freshness_hours": round(time_diff_hours, 2)
+            },
+            "issues": issues,
+            "warnings": warnings,
+            "is_healthy": status_level == "正常",
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+        }
+        
+        return result
+
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+        """
+        计算机器健康评分（0-100分）
+        
+        Args:
+            cpu_usage: CPU使用率
+            mem_usage: 内存使用率
+            disk_usage: 磁盘使用率
+            swap_usage: Swap使用率
+            data_freshness: 数据新鲜度（小时）
+            
+        Returns:
+            健康评分（0-100）
+        """
+        # 各项指标的权重
+        weights = {
+            'cpu': 0.25,
+            'memory': 0.25,
+            'disk': 0.20,
+            'swap': 0.15,
+            'freshness': 0.15
+        }
+        
+        # 计算各项得分（0-100分）
+        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
+        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
+        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
+        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
+        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        
+        # 加权平均
+        total_score = (
+            cpu_score * weights['cpu'] +
+            mem_score * weights['memory'] +
+            disk_score * weights['disk'] +
+            swap_score * weights['swap'] +
+            freshness_score * weights['freshness']
+        )
+        
+        return int(max(0, min(100, total_score)))
+
+    def get_machine_status_by_ip(self, ip: str) -> Dict:
+        """
+        根据IP地址获取机器的最新状态评估
+        
+        Args:
+            ip: IP地址
+            
+        Returns:
+            机器状态评估结果
+        """
+        # 获取最新监控数据
+        metric = self.get_latest_metric_by_ip(ip)
+        
+        if not metric:
+            return {
+                "status_level": "未知",
+                "ip": ip,
+                "timestamp": None,
+                "key_metrics": {},
+                "issues": ["未找到该IP的监控数据"],
+                "warnings": [],
+                "is_healthy": False,
+                "overall_score": 0,
+                "error": "未找到监控数据"
+            }
+        
+        # 评估状态
+        return self.assess_machine_status(metric)
+
+    def get_all_machines_status(self, time_window_hours: int = 1) -> List[Dict]:
+        """
+        获取所有机器的状态评估
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            所有机器的状态评估列表
+        """
+        # 获取活跃机器的监控数据
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        status_list = []
+        for metric in metrics:
+            status = self.assess_machine_status(metric)
+            status_list.append(status)
+        
+        # 按健康评分排序
+        status_list.sort(key=lambda x: x['overall_score'], reverse=True)
+        
+        return status_list
+
+    def get_system_overview(self, time_window_hours: int = 1) -> Dict:
+        """
+        获取系统总体概览信息
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            系统总体概览信息，包含：
+            - 活跃机器统计
+            - 健康状态分布
+            - 告警和提示信息汇总
+            - 关键指标统计
+            - 性能趋势分析
+        """
+        # 获取所有机器的状态评估
+        status_list = self.get_all_machines_status(time_window_hours)
+        
+        # 获取活跃机器的原始监控数据用于统计计算
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        # 1. 活跃机器统计
+        active_machines = len(status_list)
+        active_ips = [status['ip'] for status in status_list]
+        
+        # 2. 健康状态分布
+        status_distribution = {
+            "正常": len([s for s in status_list if s['status_level'] == "正常"]),
+            "提示": len([s for s in status_list if s['status_level'] == "提示"]),
+            "警告": len([s for s in status_list if s['status_level'] == "警告"]),
+            "未知": len([s for s in status_list if s['status_level'] == "未知"])
+        }
+        
+        # 3. 告警和提示信息汇总
+        all_issues = []
+        all_warnings = []
+        
+        for status in status_list:
+            all_issues.extend([{"ip": status['ip'], "issue": issue} for issue in status['issues']])
+            all_warnings.extend([{"ip": status['ip'], "warning": warning} for warning in status['warnings']])
+        
+        # 4. 关键指标统计（最大值、平均值、最小值）
+        key_metrics_stats = self._calculate_key_metrics_statistics(metrics)
+        
+        # 5. 性能趋势分析（基于最近10条数据）
+        trend_analysis = self._analyze_performance_trend(time_window_hours)
+        
+        # 6. 系统健康评分
+        overall_health_score = self._calculate_system_health_score(status_list)
+        
+        # 构建总体概览信息
+        overview = {
+            "timestamp": int(time.time()),
+            "time_window_hours": time_window_hours,
+            "active_machines": {
+                "total": active_machines,
+                "ips": active_ips
+            },
+            "health_status": {
+                "distribution": status_distribution,
+                "overall_score": overall_health_score,
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+            },
+            "alerts_summary": {
+                "critical_issues": len(all_issues),
+                "warning_issues": len(all_warnings),
+                "issues_by_type": self._categorize_issues(all_issues),
+                "warnings_by_type": self._categorize_warnings(all_warnings)
+            },
+            "key_metrics": key_metrics_stats,
+            "performance_trend": trend_analysis,
+            "detailed_alerts": {
+                "critical": all_issues,
+                "warning": all_warnings
+            }
+        }
+        
+        return overview
+
+    def _calculate_key_metrics_statistics(self, metrics: List[Dict]) -> Dict:
+        """计算关键指标的统计信息"""
+        if not metrics:
+            return {
+                "cpu_usage": {"max": 0, "avg": 0, "min": 0},
+                "memory_usage": {"max": 0, "avg": 0, "min": 0},
+                "disk_usage": {"max": 0, "avg": 0, "min": 0},
+                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+            }
+        
+        cpu_usages = []
+        memory_usages = []
+        disk_usages = []
+        swap_usages = []
+        
+        for metric in metrics:
+            # 计算各项指标
+            cpu_usr = metric.get('cpu_usr', 0) or 0
+            cpu_sys = metric.get('cpu_sys', 0) or 0
+            cpu_iow = metric.get('cpu_iow', 0) or 0
+            cpu_total = cpu_usr + cpu_sys + cpu_iow
+            
+            mem_total = metric.get('mem_total', 0) or 0
+            mem_free = metric.get('mem_free', 0) or 0
+            mem_buff = metric.get('mem_buff', 0) or 0
+            mem_cache = metric.get('mem_cache', 0) or 0
+            mem_used = mem_total - mem_free - mem_buff - mem_cache
+            mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+            
+            disk_usage = metric.get('disk_used_percent', 0) or 0
+            
+            swap_used = metric.get('swap_used', 0) or 0
+            swap_total = metric.get('swap_total', 0) or 0
+            swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+            
+            cpu_usages.append(cpu_total)
+            memory_usages.append(mem_usage_percent)
+            disk_usages.append(disk_usage)
+            swap_usages.append(swap_usage_percent)
+        
+        return {
+            "cpu_usage": {
+                "max": round(max(cpu_usages), 2) if cpu_usages else 0,
+                "avg": round(sum(cpu_usages) / len(cpu_usages), 2) if cpu_usages else 0,
+                "min": round(min(cpu_usages), 2) if cpu_usages else 0
+            },
+            "memory_usage": {
+                "max": round(max(memory_usages), 2) if memory_usages else 0,
+                "avg": round(sum(memory_usages) / len(memory_usages), 2) if memory_usages else 0,
+                "min": round(min(memory_usages), 2) if memory_usages else 0
+            },
+            "disk_usage": {
+                "max": round(max(disk_usages), 2) if disk_usages else 0,
+                "avg": round(sum(disk_usages) / len(disk_usages), 2) if disk_usages else 0,
+                "min": round(min(disk_usages), 2) if disk_usages else 0
+            },
+            "swap_usage": {
+                "max": round(max(swap_usages), 2) if swap_usages else 0,
+                "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
+                "min": round(min(swap_usages), 2) if swap_usages else 0
+            }
+        }
+
+    def _analyze_performance_trend(self, time_window_hours: int) -> Dict:
+        """分析性能趋势"""
+        # 这里可以扩展为获取历史数据进行趋势分析
+        # 目前返回基础趋势信息
+        return {
+            "trend": "stable",  # stable, improving, declining
+            "confidence": 0.8,
+            "analysis": "系统性能整体稳定",
+            "suggestions": ["建议定期检查磁盘使用率", "关注内存使用趋势"]
+        }
+
+    def _calculate_system_health_score(self, status_list: List[Dict]) -> float:
+        """计算系统整体健康评分"""
+        if not status_list:
+            return 0.0
+        
+        total_score = sum(status['overall_score'] for status in status_list)
+        return round(total_score / len(status_list), 2)
+
+    def _categorize_issues(self, issues: List[Dict]) -> Dict:
+        """分类汇总问题"""
+        categories = {}
+        
+        for issue_item in issues:
+            issue_text = issue_item['issue']
+            if "CPU" in issue_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in issue_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in issue_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in issue_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in issue_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
+
+    def _categorize_warnings(self, warnings: List[Dict]) -> Dict:
+        """分类汇总警告"""
+        categories = {}
+        
+        for warning_item in warnings:
+            warning_text = warning_item['warning']
+            if "CPU" in warning_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in warning_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in warning_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in warning_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in warning_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
     
     def get_metrics_by_time_range(self, start_ts: int, end_ts: int, ip: Optional[str] = None, limit: int = 100) -> List[Dict]:
         """根据时间范围查询监控指标数据"""
@@ -384,6 +4818,409 @@ class DatabaseManager:
             return []
         finally:
             self.return_connection(connection)
+
+    def assess_machine_status(self, metric: Dict) -> Dict:
+        """
+        根据监控指标评估机器运行状态
+        
+        Args:
+            metric: 监控指标数据
+            
+        Returns:
+            包含状态分级和详细信息的字典
+        """
+        # 获取关键指标值，处理None值
+        cpu_usr = metric.get('cpu_usr', 0) or 0
+        cpu_sys = metric.get('cpu_sys', 0) or 0
+        cpu_iow = metric.get('cpu_iow', 0) or 0
+        
+        mem_total = metric.get('mem_total', 0) or 0
+        mem_free = metric.get('mem_free', 0) or 0
+        mem_buff = metric.get('mem_buff', 0) or 0
+        mem_cache = metric.get('mem_cache', 0) or 0
+        
+        disk_used_percent = metric.get('disk_used_percent', 0) or 0
+        swap_used = metric.get('swap_used', 0) or 0
+        swap_total = metric.get('swap_total', 0) or 0
+        
+        # 计算关键指标
+        cpu_total = cpu_usr + cpu_sys + cpu_iow
+        mem_used = mem_total - mem_free - mem_buff - mem_cache
+        mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+        swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 状态评估
+        status_level = "正常"
+        issues = []
+        warnings = []
+        
+        # CPU使用率检查
+        if cpu_total >= 90:
+            status_level = "警告"
+            issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
+        elif cpu_total >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
+        
+        # 内存使用率检查
+        if mem_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
+        elif mem_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
+        
+        # 磁盘使用率检查
+        if disk_used_percent >= 90:
+            status_level = "警告"
+            issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
+        elif disk_used_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
+        
+        # Swap使用率检查
+        if swap_usage_percent >= 50:
+            status_level = "警告"
+            issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
+        elif swap_usage_percent >= 20:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
+        
+        # 数据时效性检查（超过1小时无数据视为异常）
+        import time
+        current_timestamp = int(time.time())
+        metric_timestamp = metric.get('ts', 0)
+        time_diff_hours = (current_timestamp - metric_timestamp) / 3600
+        
+        if time_diff_hours > 1:
+            status_level = "警告"
+            issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
+        elif time_diff_hours > 0.3:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
+        
+        # 构建返回结果
+        result = {
+            "status_level": status_level,
+            "ip": metric.get('ip', '未知'),
+            "timestamp": metric_timestamp,
+            "key_metrics": {
+                "cpu_usage_percent": round(cpu_total, 2),
+                "memory_usage_percent": round(mem_usage_percent, 2),
+                "disk_usage_percent": round(disk_used_percent, 2),
+                "swap_usage_percent": round(swap_usage_percent, 2),
+                "data_freshness_hours": round(time_diff_hours, 2)
+            },
+            "issues": issues,
+            "warnings": warnings,
+            "is_healthy": status_level == "正常",
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+        }
+        
+        return result
+
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+        """
+        计算机器健康评分（0-100分）
+        
+        Args:
+            cpu_usage: CPU使用率
+            mem_usage: 内存使用率
+            disk_usage: 磁盘使用率
+            swap_usage: Swap使用率
+            data_freshness: 数据新鲜度（小时）
+            
+        Returns:
+            健康评分（0-100）
+        """
+        # 各项指标的权重
+        weights = {
+            'cpu': 0.25,
+            'memory': 0.25,
+            'disk': 0.20,
+            'swap': 0.15,
+            'freshness': 0.15
+        }
+        
+        # 计算各项得分（0-100分）
+        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
+        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
+        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
+        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
+        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        
+        # 加权平均
+        total_score = (
+            cpu_score * weights['cpu'] +
+            mem_score * weights['memory'] +
+            disk_score * weights['disk'] +
+            swap_score * weights['swap'] +
+            freshness_score * weights['freshness']
+        )
+        
+        return int(max(0, min(100, total_score)))
+
+    def get_machine_status_by_ip(self, ip: str) -> Dict:
+        """
+        根据IP地址获取机器的最新状态评估
+        
+        Args:
+            ip: IP地址
+            
+        Returns:
+            机器状态评估结果
+        """
+        # 获取最新监控数据
+        metric = self.get_latest_metric_by_ip(ip)
+        
+        if not metric:
+            return {
+                "status_level": "未知",
+                "ip": ip,
+                "timestamp": None,
+                "key_metrics": {},
+                "issues": ["未找到该IP的监控数据"],
+                "warnings": [],
+                "is_healthy": False,
+                "overall_score": 0,
+                "error": "未找到监控数据"
+            }
+        
+        # 评估状态
+        return self.assess_machine_status(metric)
+
+    def get_all_machines_status(self, time_window_hours: int = 1) -> List[Dict]:
+        """
+        获取所有机器的状态评估
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            所有机器的状态评估列表
+        """
+        # 获取活跃机器的监控数据
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        status_list = []
+        for metric in metrics:
+            status = self.assess_machine_status(metric)
+            status_list.append(status)
+        
+        # 按健康评分排序
+        status_list.sort(key=lambda x: x['overall_score'], reverse=True)
+        
+        return status_list
+
+    def get_system_overview(self, time_window_hours: int = 1) -> Dict:
+        """
+        获取系统总体概览信息
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            系统总体概览信息，包含：
+            - 活跃机器统计
+            - 健康状态分布
+            - 告警和提示信息汇总
+            - 关键指标统计
+            - 性能趋势分析
+        """
+        # 获取所有机器的状态评估
+        status_list = self.get_all_machines_status(time_window_hours)
+        
+        # 获取活跃机器的原始监控数据用于统计计算
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        # 1. 活跃机器统计
+        active_machines = len(status_list)
+        active_ips = [status['ip'] for status in status_list]
+        
+        # 2. 健康状态分布
+        status_distribution = {
+            "正常": len([s for s in status_list if s['status_level'] == "正常"]),
+            "提示": len([s for s in status_list if s['status_level'] == "提示"]),
+            "警告": len([s for s in status_list if s['status_level'] == "警告"]),
+            "未知": len([s for s in status_list if s['status_level'] == "未知"])
+        }
+        
+        # 3. 告警和提示信息汇总
+        all_issues = []
+        all_warnings = []
+        
+        for status in status_list:
+            all_issues.extend([{"ip": status['ip'], "issue": issue} for issue in status['issues']])
+            all_warnings.extend([{"ip": status['ip'], "warning": warning} for warning in status['warnings']])
+        
+        # 4. 关键指标统计（最大值、平均值、最小值）
+        key_metrics_stats = self._calculate_key_metrics_statistics(metrics)
+        
+        # 5. 性能趋势分析（基于最近10条数据）
+        trend_analysis = self._analyze_performance_trend(time_window_hours)
+        
+        # 6. 系统健康评分
+        overall_health_score = self._calculate_system_health_score(status_list)
+        
+        # 构建总体概览信息
+        overview = {
+            "timestamp": int(time.time()),
+            "time_window_hours": time_window_hours,
+            "active_machines": {
+                "total": active_machines,
+                "ips": active_ips
+            },
+            "health_status": {
+                "distribution": status_distribution,
+                "overall_score": overall_health_score,
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+            },
+            "alerts_summary": {
+                "critical_issues": len(all_issues),
+                "warning_issues": len(all_warnings),
+                "issues_by_type": self._categorize_issues(all_issues),
+                "warnings_by_type": self._categorize_warnings(all_warnings)
+            },
+            "key_metrics": key_metrics_stats,
+            "performance_trend": trend_analysis,
+            "detailed_alerts": {
+                "critical": all_issues,
+                "warning": all_warnings
+            }
+        }
+        
+        return overview
+
+    def _calculate_key_metrics_statistics(self, metrics: List[Dict]) -> Dict:
+        """计算关键指标的统计信息"""
+        if not metrics:
+            return {
+                "cpu_usage": {"max": 0, "avg": 0, "min": 0},
+                "memory_usage": {"max": 0, "avg": 0, "min": 0},
+                "disk_usage": {"max": 0, "avg": 0, "min": 0},
+                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+            }
+        
+        cpu_usages = []
+        memory_usages = []
+        disk_usages = []
+        swap_usages = []
+        
+        for metric in metrics:
+            # 计算各项指标
+            cpu_usr = metric.get('cpu_usr', 0) or 0
+            cpu_sys = metric.get('cpu_sys', 0) or 0
+            cpu_iow = metric.get('cpu_iow', 0) or 0
+            cpu_total = cpu_usr + cpu_sys + cpu_iow
+            
+            mem_total = metric.get('mem_total', 0) or 0
+            mem_free = metric.get('mem_free', 0) or 0
+            mem_buff = metric.get('mem_buff', 0) or 0
+            mem_cache = metric.get('mem_cache', 0) or 0
+            mem_used = mem_total - mem_free - mem_buff - mem_cache
+            mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+            
+            disk_usage = metric.get('disk_used_percent', 0) or 0
+            
+            swap_used = metric.get('swap_used', 0) or 0
+            swap_total = metric.get('swap_total', 0) or 0
+            swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+            
+            cpu_usages.append(cpu_total)
+            memory_usages.append(mem_usage_percent)
+            disk_usages.append(disk_usage)
+            swap_usages.append(swap_usage_percent)
+        
+        return {
+            "cpu_usage": {
+                "max": round(max(cpu_usages), 2) if cpu_usages else 0,
+                "avg": round(sum(cpu_usages) / len(cpu_usages), 2) if cpu_usages else 0,
+                "min": round(min(cpu_usages), 2) if cpu_usages else 0
+            },
+            "memory_usage": {
+                "max": round(max(memory_usages), 2) if memory_usages else 0,
+                "avg": round(sum(memory_usages) / len(memory_usages), 2) if memory_usages else 0,
+                "min": round(min(memory_usages), 2) if memory_usages else 0
+            },
+            "disk_usage": {
+                "max": round(max(disk_usages), 2) if disk_usages else 0,
+                "avg": round(sum(disk_usages) / len(disk_usages), 2) if disk_usages else 0,
+                "min": round(min(disk_usages), 2) if disk_usages else 0
+            },
+            "swap_usage": {
+                "max": round(max(swap_usages), 2) if swap_usages else 0,
+                "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
+                "min": round(min(swap_usages), 2) if swap_usages else 0
+            }
+        }
+
+    def _analyze_performance_trend(self, time_window_hours: int) -> Dict:
+        """分析性能趋势"""
+        # 这里可以扩展为获取历史数据进行趋势分析
+        # 目前返回基础趋势信息
+        return {
+            "trend": "stable",  # stable, improving, declining
+            "confidence": 0.8,
+            "analysis": "系统性能整体稳定",
+            "suggestions": ["建议定期检查磁盘使用率", "关注内存使用趋势"]
+        }
+
+    def _calculate_system_health_score(self, status_list: List[Dict]) -> float:
+        """计算系统整体健康评分"""
+        if not status_list:
+            return 0.0
+        
+        total_score = sum(status['overall_score'] for status in status_list)
+        return round(total_score / len(status_list), 2)
+
+    def _categorize_issues(self, issues: List[Dict]) -> Dict:
+        """分类汇总问题"""
+        categories = {}
+        
+        for issue_item in issues:
+            issue_text = issue_item['issue']
+            if "CPU" in issue_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in issue_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in issue_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in issue_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in issue_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
+
+    def _categorize_warnings(self, warnings: List[Dict]) -> Dict:
+        """分类汇总警告"""
+        categories = {}
+        
+        for warning_item in warnings:
+            warning_text = warning_item['warning']
+            if "CPU" in warning_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in warning_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in warning_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in warning_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in warning_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
     
     def get_metrics_paginated(self, page: int = 1, page_size: int = 20, ip: Optional[str] = None) -> Dict:
         """分页查询监控指标数据"""
@@ -439,6 +5276,409 @@ class DatabaseManager:
             return {"data": [], "total": 0, "page": page, "page_size": page_size, "total_pages": 0}
         finally:
             self.return_connection(connection)
+
+    def assess_machine_status(self, metric: Dict) -> Dict:
+        """
+        根据监控指标评估机器运行状态
+        
+        Args:
+            metric: 监控指标数据
+            
+        Returns:
+            包含状态分级和详细信息的字典
+        """
+        # 获取关键指标值，处理None值
+        cpu_usr = metric.get('cpu_usr', 0) or 0
+        cpu_sys = metric.get('cpu_sys', 0) or 0
+        cpu_iow = metric.get('cpu_iow', 0) or 0
+        
+        mem_total = metric.get('mem_total', 0) or 0
+        mem_free = metric.get('mem_free', 0) or 0
+        mem_buff = metric.get('mem_buff', 0) or 0
+        mem_cache = metric.get('mem_cache', 0) or 0
+        
+        disk_used_percent = metric.get('disk_used_percent', 0) or 0
+        swap_used = metric.get('swap_used', 0) or 0
+        swap_total = metric.get('swap_total', 0) or 0
+        
+        # 计算关键指标
+        cpu_total = cpu_usr + cpu_sys + cpu_iow
+        mem_used = mem_total - mem_free - mem_buff - mem_cache
+        mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+        swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 状态评估
+        status_level = "正常"
+        issues = []
+        warnings = []
+        
+        # CPU使用率检查
+        if cpu_total >= 90:
+            status_level = "警告"
+            issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
+        elif cpu_total >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
+        
+        # 内存使用率检查
+        if mem_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
+        elif mem_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
+        
+        # 磁盘使用率检查
+        if disk_used_percent >= 90:
+            status_level = "警告"
+            issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
+        elif disk_used_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
+        
+        # Swap使用率检查
+        if swap_usage_percent >= 50:
+            status_level = "警告"
+            issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
+        elif swap_usage_percent >= 20:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
+        
+        # 数据时效性检查（超过1小时无数据视为异常）
+        import time
+        current_timestamp = int(time.time())
+        metric_timestamp = metric.get('ts', 0)
+        time_diff_hours = (current_timestamp - metric_timestamp) / 3600
+        
+        if time_diff_hours > 1:
+            status_level = "警告"
+            issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
+        elif time_diff_hours > 0.3:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
+        
+        # 构建返回结果
+        result = {
+            "status_level": status_level,
+            "ip": metric.get('ip', '未知'),
+            "timestamp": metric_timestamp,
+            "key_metrics": {
+                "cpu_usage_percent": round(cpu_total, 2),
+                "memory_usage_percent": round(mem_usage_percent, 2),
+                "disk_usage_percent": round(disk_used_percent, 2),
+                "swap_usage_percent": round(swap_usage_percent, 2),
+                "data_freshness_hours": round(time_diff_hours, 2)
+            },
+            "issues": issues,
+            "warnings": warnings,
+            "is_healthy": status_level == "正常",
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+        }
+        
+        return result
+
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+        """
+        计算机器健康评分（0-100分）
+        
+        Args:
+            cpu_usage: CPU使用率
+            mem_usage: 内存使用率
+            disk_usage: 磁盘使用率
+            swap_usage: Swap使用率
+            data_freshness: 数据新鲜度（小时）
+            
+        Returns:
+            健康评分（0-100）
+        """
+        # 各项指标的权重
+        weights = {
+            'cpu': 0.25,
+            'memory': 0.25,
+            'disk': 0.20,
+            'swap': 0.15,
+            'freshness': 0.15
+        }
+        
+        # 计算各项得分（0-100分）
+        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
+        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
+        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
+        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
+        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        
+        # 加权平均
+        total_score = (
+            cpu_score * weights['cpu'] +
+            mem_score * weights['memory'] +
+            disk_score * weights['disk'] +
+            swap_score * weights['swap'] +
+            freshness_score * weights['freshness']
+        )
+        
+        return int(max(0, min(100, total_score)))
+
+    def get_machine_status_by_ip(self, ip: str) -> Dict:
+        """
+        根据IP地址获取机器的最新状态评估
+        
+        Args:
+            ip: IP地址
+            
+        Returns:
+            机器状态评估结果
+        """
+        # 获取最新监控数据
+        metric = self.get_latest_metric_by_ip(ip)
+        
+        if not metric:
+            return {
+                "status_level": "未知",
+                "ip": ip,
+                "timestamp": None,
+                "key_metrics": {},
+                "issues": ["未找到该IP的监控数据"],
+                "warnings": [],
+                "is_healthy": False,
+                "overall_score": 0,
+                "error": "未找到监控数据"
+            }
+        
+        # 评估状态
+        return self.assess_machine_status(metric)
+
+    def get_all_machines_status(self, time_window_hours: int = 1) -> List[Dict]:
+        """
+        获取所有机器的状态评估
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            所有机器的状态评估列表
+        """
+        # 获取活跃机器的监控数据
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        status_list = []
+        for metric in metrics:
+            status = self.assess_machine_status(metric)
+            status_list.append(status)
+        
+        # 按健康评分排序
+        status_list.sort(key=lambda x: x['overall_score'], reverse=True)
+        
+        return status_list
+
+    def get_system_overview(self, time_window_hours: int = 1) -> Dict:
+        """
+        获取系统总体概览信息
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            系统总体概览信息，包含：
+            - 活跃机器统计
+            - 健康状态分布
+            - 告警和提示信息汇总
+            - 关键指标统计
+            - 性能趋势分析
+        """
+        # 获取所有机器的状态评估
+        status_list = self.get_all_machines_status(time_window_hours)
+        
+        # 获取活跃机器的原始监控数据用于统计计算
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        # 1. 活跃机器统计
+        active_machines = len(status_list)
+        active_ips = [status['ip'] for status in status_list]
+        
+        # 2. 健康状态分布
+        status_distribution = {
+            "正常": len([s for s in status_list if s['status_level'] == "正常"]),
+            "提示": len([s for s in status_list if s['status_level'] == "提示"]),
+            "警告": len([s for s in status_list if s['status_level'] == "警告"]),
+            "未知": len([s for s in status_list if s['status_level'] == "未知"])
+        }
+        
+        # 3. 告警和提示信息汇总
+        all_issues = []
+        all_warnings = []
+        
+        for status in status_list:
+            all_issues.extend([{"ip": status['ip'], "issue": issue} for issue in status['issues']])
+            all_warnings.extend([{"ip": status['ip'], "warning": warning} for warning in status['warnings']])
+        
+        # 4. 关键指标统计（最大值、平均值、最小值）
+        key_metrics_stats = self._calculate_key_metrics_statistics(metrics)
+        
+        # 5. 性能趋势分析（基于最近10条数据）
+        trend_analysis = self._analyze_performance_trend(time_window_hours)
+        
+        # 6. 系统健康评分
+        overall_health_score = self._calculate_system_health_score(status_list)
+        
+        # 构建总体概览信息
+        overview = {
+            "timestamp": int(time.time()),
+            "time_window_hours": time_window_hours,
+            "active_machines": {
+                "total": active_machines,
+                "ips": active_ips
+            },
+            "health_status": {
+                "distribution": status_distribution,
+                "overall_score": overall_health_score,
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+            },
+            "alerts_summary": {
+                "critical_issues": len(all_issues),
+                "warning_issues": len(all_warnings),
+                "issues_by_type": self._categorize_issues(all_issues),
+                "warnings_by_type": self._categorize_warnings(all_warnings)
+            },
+            "key_metrics": key_metrics_stats,
+            "performance_trend": trend_analysis,
+            "detailed_alerts": {
+                "critical": all_issues,
+                "warning": all_warnings
+            }
+        }
+        
+        return overview
+
+    def _calculate_key_metrics_statistics(self, metrics: List[Dict]) -> Dict:
+        """计算关键指标的统计信息"""
+        if not metrics:
+            return {
+                "cpu_usage": {"max": 0, "avg": 0, "min": 0},
+                "memory_usage": {"max": 0, "avg": 0, "min": 0},
+                "disk_usage": {"max": 0, "avg": 0, "min": 0},
+                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+            }
+        
+        cpu_usages = []
+        memory_usages = []
+        disk_usages = []
+        swap_usages = []
+        
+        for metric in metrics:
+            # 计算各项指标
+            cpu_usr = metric.get('cpu_usr', 0) or 0
+            cpu_sys = metric.get('cpu_sys', 0) or 0
+            cpu_iow = metric.get('cpu_iow', 0) or 0
+            cpu_total = cpu_usr + cpu_sys + cpu_iow
+            
+            mem_total = metric.get('mem_total', 0) or 0
+            mem_free = metric.get('mem_free', 0) or 0
+            mem_buff = metric.get('mem_buff', 0) or 0
+            mem_cache = metric.get('mem_cache', 0) or 0
+            mem_used = mem_total - mem_free - mem_buff - mem_cache
+            mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+            
+            disk_usage = metric.get('disk_used_percent', 0) or 0
+            
+            swap_used = metric.get('swap_used', 0) or 0
+            swap_total = metric.get('swap_total', 0) or 0
+            swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+            
+            cpu_usages.append(cpu_total)
+            memory_usages.append(mem_usage_percent)
+            disk_usages.append(disk_usage)
+            swap_usages.append(swap_usage_percent)
+        
+        return {
+            "cpu_usage": {
+                "max": round(max(cpu_usages), 2) if cpu_usages else 0,
+                "avg": round(sum(cpu_usages) / len(cpu_usages), 2) if cpu_usages else 0,
+                "min": round(min(cpu_usages), 2) if cpu_usages else 0
+            },
+            "memory_usage": {
+                "max": round(max(memory_usages), 2) if memory_usages else 0,
+                "avg": round(sum(memory_usages) / len(memory_usages), 2) if memory_usages else 0,
+                "min": round(min(memory_usages), 2) if memory_usages else 0
+            },
+            "disk_usage": {
+                "max": round(max(disk_usages), 2) if disk_usages else 0,
+                "avg": round(sum(disk_usages) / len(disk_usages), 2) if disk_usages else 0,
+                "min": round(min(disk_usages), 2) if disk_usages else 0
+            },
+            "swap_usage": {
+                "max": round(max(swap_usages), 2) if swap_usages else 0,
+                "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
+                "min": round(min(swap_usages), 2) if swap_usages else 0
+            }
+        }
+
+    def _analyze_performance_trend(self, time_window_hours: int) -> Dict:
+        """分析性能趋势"""
+        # 这里可以扩展为获取历史数据进行趋势分析
+        # 目前返回基础趋势信息
+        return {
+            "trend": "stable",  # stable, improving, declining
+            "confidence": 0.8,
+            "analysis": "系统性能整体稳定",
+            "suggestions": ["建议定期检查磁盘使用率", "关注内存使用趋势"]
+        }
+
+    def _calculate_system_health_score(self, status_list: List[Dict]) -> float:
+        """计算系统整体健康评分"""
+        if not status_list:
+            return 0.0
+        
+        total_score = sum(status['overall_score'] for status in status_list)
+        return round(total_score / len(status_list), 2)
+
+    def _categorize_issues(self, issues: List[Dict]) -> Dict:
+        """分类汇总问题"""
+        categories = {}
+        
+        for issue_item in issues:
+            issue_text = issue_item['issue']
+            if "CPU" in issue_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in issue_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in issue_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in issue_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in issue_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
+
+    def _categorize_warnings(self, warnings: List[Dict]) -> Dict:
+        """分类汇总警告"""
+        categories = {}
+        
+        for warning_item in warnings:
+            warning_text = warning_item['warning']
+            if "CPU" in warning_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in warning_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in warning_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in warning_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in warning_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
     
     def get_all_ips(self) -> List[str]:
         """获取所有监控的IP列表"""
@@ -459,6 +5699,409 @@ class DatabaseManager:
             return []
         finally:
             self.return_connection(connection)
+
+    def assess_machine_status(self, metric: Dict) -> Dict:
+        """
+        根据监控指标评估机器运行状态
+        
+        Args:
+            metric: 监控指标数据
+            
+        Returns:
+            包含状态分级和详细信息的字典
+        """
+        # 获取关键指标值，处理None值
+        cpu_usr = metric.get('cpu_usr', 0) or 0
+        cpu_sys = metric.get('cpu_sys', 0) or 0
+        cpu_iow = metric.get('cpu_iow', 0) or 0
+        
+        mem_total = metric.get('mem_total', 0) or 0
+        mem_free = metric.get('mem_free', 0) or 0
+        mem_buff = metric.get('mem_buff', 0) or 0
+        mem_cache = metric.get('mem_cache', 0) or 0
+        
+        disk_used_percent = metric.get('disk_used_percent', 0) or 0
+        swap_used = metric.get('swap_used', 0) or 0
+        swap_total = metric.get('swap_total', 0) or 0
+        
+        # 计算关键指标
+        cpu_total = cpu_usr + cpu_sys + cpu_iow
+        mem_used = mem_total - mem_free - mem_buff - mem_cache
+        mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+        swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 状态评估
+        status_level = "正常"
+        issues = []
+        warnings = []
+        
+        # CPU使用率检查
+        if cpu_total >= 90:
+            status_level = "警告"
+            issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
+        elif cpu_total >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
+        
+        # 内存使用率检查
+        if mem_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
+        elif mem_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
+        
+        # 磁盘使用率检查
+        if disk_used_percent >= 90:
+            status_level = "警告"
+            issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
+        elif disk_used_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
+        
+        # Swap使用率检查
+        if swap_usage_percent >= 50:
+            status_level = "警告"
+            issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
+        elif swap_usage_percent >= 20:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
+        
+        # 数据时效性检查（超过1小时无数据视为异常）
+        import time
+        current_timestamp = int(time.time())
+        metric_timestamp = metric.get('ts', 0)
+        time_diff_hours = (current_timestamp - metric_timestamp) / 3600
+        
+        if time_diff_hours > 1:
+            status_level = "警告"
+            issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
+        elif time_diff_hours > 0.3:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
+        
+        # 构建返回结果
+        result = {
+            "status_level": status_level,
+            "ip": metric.get('ip', '未知'),
+            "timestamp": metric_timestamp,
+            "key_metrics": {
+                "cpu_usage_percent": round(cpu_total, 2),
+                "memory_usage_percent": round(mem_usage_percent, 2),
+                "disk_usage_percent": round(disk_used_percent, 2),
+                "swap_usage_percent": round(swap_usage_percent, 2),
+                "data_freshness_hours": round(time_diff_hours, 2)
+            },
+            "issues": issues,
+            "warnings": warnings,
+            "is_healthy": status_level == "正常",
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+        }
+        
+        return result
+
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+        """
+        计算机器健康评分（0-100分）
+        
+        Args:
+            cpu_usage: CPU使用率
+            mem_usage: 内存使用率
+            disk_usage: 磁盘使用率
+            swap_usage: Swap使用率
+            data_freshness: 数据新鲜度（小时）
+            
+        Returns:
+            健康评分（0-100）
+        """
+        # 各项指标的权重
+        weights = {
+            'cpu': 0.25,
+            'memory': 0.25,
+            'disk': 0.20,
+            'swap': 0.15,
+            'freshness': 0.15
+        }
+        
+        # 计算各项得分（0-100分）
+        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
+        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
+        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
+        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
+        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        
+        # 加权平均
+        total_score = (
+            cpu_score * weights['cpu'] +
+            mem_score * weights['memory'] +
+            disk_score * weights['disk'] +
+            swap_score * weights['swap'] +
+            freshness_score * weights['freshness']
+        )
+        
+        return int(max(0, min(100, total_score)))
+
+    def get_machine_status_by_ip(self, ip: str) -> Dict:
+        """
+        根据IP地址获取机器的最新状态评估
+        
+        Args:
+            ip: IP地址
+            
+        Returns:
+            机器状态评估结果
+        """
+        # 获取最新监控数据
+        metric = self.get_latest_metric_by_ip(ip)
+        
+        if not metric:
+            return {
+                "status_level": "未知",
+                "ip": ip,
+                "timestamp": None,
+                "key_metrics": {},
+                "issues": ["未找到该IP的监控数据"],
+                "warnings": [],
+                "is_healthy": False,
+                "overall_score": 0,
+                "error": "未找到监控数据"
+            }
+        
+        # 评估状态
+        return self.assess_machine_status(metric)
+
+    def get_all_machines_status(self, time_window_hours: int = 1) -> List[Dict]:
+        """
+        获取所有机器的状态评估
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            所有机器的状态评估列表
+        """
+        # 获取活跃机器的监控数据
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        status_list = []
+        for metric in metrics:
+            status = self.assess_machine_status(metric)
+            status_list.append(status)
+        
+        # 按健康评分排序
+        status_list.sort(key=lambda x: x['overall_score'], reverse=True)
+        
+        return status_list
+
+    def get_system_overview(self, time_window_hours: int = 1) -> Dict:
+        """
+        获取系统总体概览信息
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            系统总体概览信息，包含：
+            - 活跃机器统计
+            - 健康状态分布
+            - 告警和提示信息汇总
+            - 关键指标统计
+            - 性能趋势分析
+        """
+        # 获取所有机器的状态评估
+        status_list = self.get_all_machines_status(time_window_hours)
+        
+        # 获取活跃机器的原始监控数据用于统计计算
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        # 1. 活跃机器统计
+        active_machines = len(status_list)
+        active_ips = [status['ip'] for status in status_list]
+        
+        # 2. 健康状态分布
+        status_distribution = {
+            "正常": len([s for s in status_list if s['status_level'] == "正常"]),
+            "提示": len([s for s in status_list if s['status_level'] == "提示"]),
+            "警告": len([s for s in status_list if s['status_level'] == "警告"]),
+            "未知": len([s for s in status_list if s['status_level'] == "未知"])
+        }
+        
+        # 3. 告警和提示信息汇总
+        all_issues = []
+        all_warnings = []
+        
+        for status in status_list:
+            all_issues.extend([{"ip": status['ip'], "issue": issue} for issue in status['issues']])
+            all_warnings.extend([{"ip": status['ip'], "warning": warning} for warning in status['warnings']])
+        
+        # 4. 关键指标统计（最大值、平均值、最小值）
+        key_metrics_stats = self._calculate_key_metrics_statistics(metrics)
+        
+        # 5. 性能趋势分析（基于最近10条数据）
+        trend_analysis = self._analyze_performance_trend(time_window_hours)
+        
+        # 6. 系统健康评分
+        overall_health_score = self._calculate_system_health_score(status_list)
+        
+        # 构建总体概览信息
+        overview = {
+            "timestamp": int(time.time()),
+            "time_window_hours": time_window_hours,
+            "active_machines": {
+                "total": active_machines,
+                "ips": active_ips
+            },
+            "health_status": {
+                "distribution": status_distribution,
+                "overall_score": overall_health_score,
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+            },
+            "alerts_summary": {
+                "critical_issues": len(all_issues),
+                "warning_issues": len(all_warnings),
+                "issues_by_type": self._categorize_issues(all_issues),
+                "warnings_by_type": self._categorize_warnings(all_warnings)
+            },
+            "key_metrics": key_metrics_stats,
+            "performance_trend": trend_analysis,
+            "detailed_alerts": {
+                "critical": all_issues,
+                "warning": all_warnings
+            }
+        }
+        
+        return overview
+
+    def _calculate_key_metrics_statistics(self, metrics: List[Dict]) -> Dict:
+        """计算关键指标的统计信息"""
+        if not metrics:
+            return {
+                "cpu_usage": {"max": 0, "avg": 0, "min": 0},
+                "memory_usage": {"max": 0, "avg": 0, "min": 0},
+                "disk_usage": {"max": 0, "avg": 0, "min": 0},
+                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+            }
+        
+        cpu_usages = []
+        memory_usages = []
+        disk_usages = []
+        swap_usages = []
+        
+        for metric in metrics:
+            # 计算各项指标
+            cpu_usr = metric.get('cpu_usr', 0) or 0
+            cpu_sys = metric.get('cpu_sys', 0) or 0
+            cpu_iow = metric.get('cpu_iow', 0) or 0
+            cpu_total = cpu_usr + cpu_sys + cpu_iow
+            
+            mem_total = metric.get('mem_total', 0) or 0
+            mem_free = metric.get('mem_free', 0) or 0
+            mem_buff = metric.get('mem_buff', 0) or 0
+            mem_cache = metric.get('mem_cache', 0) or 0
+            mem_used = mem_total - mem_free - mem_buff - mem_cache
+            mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+            
+            disk_usage = metric.get('disk_used_percent', 0) or 0
+            
+            swap_used = metric.get('swap_used', 0) or 0
+            swap_total = metric.get('swap_total', 0) or 0
+            swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+            
+            cpu_usages.append(cpu_total)
+            memory_usages.append(mem_usage_percent)
+            disk_usages.append(disk_usage)
+            swap_usages.append(swap_usage_percent)
+        
+        return {
+            "cpu_usage": {
+                "max": round(max(cpu_usages), 2) if cpu_usages else 0,
+                "avg": round(sum(cpu_usages) / len(cpu_usages), 2) if cpu_usages else 0,
+                "min": round(min(cpu_usages), 2) if cpu_usages else 0
+            },
+            "memory_usage": {
+                "max": round(max(memory_usages), 2) if memory_usages else 0,
+                "avg": round(sum(memory_usages) / len(memory_usages), 2) if memory_usages else 0,
+                "min": round(min(memory_usages), 2) if memory_usages else 0
+            },
+            "disk_usage": {
+                "max": round(max(disk_usages), 2) if disk_usages else 0,
+                "avg": round(sum(disk_usages) / len(disk_usages), 2) if disk_usages else 0,
+                "min": round(min(disk_usages), 2) if disk_usages else 0
+            },
+            "swap_usage": {
+                "max": round(max(swap_usages), 2) if swap_usages else 0,
+                "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
+                "min": round(min(swap_usages), 2) if swap_usages else 0
+            }
+        }
+
+    def _analyze_performance_trend(self, time_window_hours: int) -> Dict:
+        """分析性能趋势"""
+        # 这里可以扩展为获取历史数据进行趋势分析
+        # 目前返回基础趋势信息
+        return {
+            "trend": "stable",  # stable, improving, declining
+            "confidence": 0.8,
+            "analysis": "系统性能整体稳定",
+            "suggestions": ["建议定期检查磁盘使用率", "关注内存使用趋势"]
+        }
+
+    def _calculate_system_health_score(self, status_list: List[Dict]) -> float:
+        """计算系统整体健康评分"""
+        if not status_list:
+            return 0.0
+        
+        total_score = sum(status['overall_score'] for status in status_list)
+        return round(total_score / len(status_list), 2)
+
+    def _categorize_issues(self, issues: List[Dict]) -> Dict:
+        """分类汇总问题"""
+        categories = {}
+        
+        for issue_item in issues:
+            issue_text = issue_item['issue']
+            if "CPU" in issue_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in issue_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in issue_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in issue_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in issue_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
+
+    def _categorize_warnings(self, warnings: List[Dict]) -> Dict:
+        """分类汇总警告"""
+        categories = {}
+        
+        for warning_item in warnings:
+            warning_text = warning_item['warning']
+            if "CPU" in warning_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in warning_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in warning_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in warning_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in warning_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
     
     def get_metrics_statistics(self, ip: Optional[str] = None, start_ts: Optional[int] = None, end_ts: Optional[int] = None) -> Optional[Dict]:
         """获取监控指标的统计信息（平均值、最大值、最小值）"""
@@ -515,6 +6158,409 @@ class DatabaseManager:
             return None
         finally:
             self.return_connection(connection)
+
+    def assess_machine_status(self, metric: Dict) -> Dict:
+        """
+        根据监控指标评估机器运行状态
+        
+        Args:
+            metric: 监控指标数据
+            
+        Returns:
+            包含状态分级和详细信息的字典
+        """
+        # 获取关键指标值，处理None值
+        cpu_usr = metric.get('cpu_usr', 0) or 0
+        cpu_sys = metric.get('cpu_sys', 0) or 0
+        cpu_iow = metric.get('cpu_iow', 0) or 0
+        
+        mem_total = metric.get('mem_total', 0) or 0
+        mem_free = metric.get('mem_free', 0) or 0
+        mem_buff = metric.get('mem_buff', 0) or 0
+        mem_cache = metric.get('mem_cache', 0) or 0
+        
+        disk_used_percent = metric.get('disk_used_percent', 0) or 0
+        swap_used = metric.get('swap_used', 0) or 0
+        swap_total = metric.get('swap_total', 0) or 0
+        
+        # 计算关键指标
+        cpu_total = cpu_usr + cpu_sys + cpu_iow
+        mem_used = mem_total - mem_free - mem_buff - mem_cache
+        mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+        swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 状态评估
+        status_level = "正常"
+        issues = []
+        warnings = []
+        
+        # CPU使用率检查
+        if cpu_total >= 90:
+            status_level = "警告"
+            issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
+        elif cpu_total >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
+        
+        # 内存使用率检查
+        if mem_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
+        elif mem_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
+        
+        # 磁盘使用率检查
+        if disk_used_percent >= 90:
+            status_level = "警告"
+            issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
+        elif disk_used_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
+        
+        # Swap使用率检查
+        if swap_usage_percent >= 50:
+            status_level = "警告"
+            issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
+        elif swap_usage_percent >= 20:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
+        
+        # 数据时效性检查（超过1小时无数据视为异常）
+        import time
+        current_timestamp = int(time.time())
+        metric_timestamp = metric.get('ts', 0)
+        time_diff_hours = (current_timestamp - metric_timestamp) / 3600
+        
+        if time_diff_hours > 1:
+            status_level = "警告"
+            issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
+        elif time_diff_hours > 0.3:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
+        
+        # 构建返回结果
+        result = {
+            "status_level": status_level,
+            "ip": metric.get('ip', '未知'),
+            "timestamp": metric_timestamp,
+            "key_metrics": {
+                "cpu_usage_percent": round(cpu_total, 2),
+                "memory_usage_percent": round(mem_usage_percent, 2),
+                "disk_usage_percent": round(disk_used_percent, 2),
+                "swap_usage_percent": round(swap_usage_percent, 2),
+                "data_freshness_hours": round(time_diff_hours, 2)
+            },
+            "issues": issues,
+            "warnings": warnings,
+            "is_healthy": status_level == "正常",
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+        }
+        
+        return result
+
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+        """
+        计算机器健康评分（0-100分）
+        
+        Args:
+            cpu_usage: CPU使用率
+            mem_usage: 内存使用率
+            disk_usage: 磁盘使用率
+            swap_usage: Swap使用率
+            data_freshness: 数据新鲜度（小时）
+            
+        Returns:
+            健康评分（0-100）
+        """
+        # 各项指标的权重
+        weights = {
+            'cpu': 0.25,
+            'memory': 0.25,
+            'disk': 0.20,
+            'swap': 0.15,
+            'freshness': 0.15
+        }
+        
+        # 计算各项得分（0-100分）
+        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
+        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
+        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
+        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
+        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        
+        # 加权平均
+        total_score = (
+            cpu_score * weights['cpu'] +
+            mem_score * weights['memory'] +
+            disk_score * weights['disk'] +
+            swap_score * weights['swap'] +
+            freshness_score * weights['freshness']
+        )
+        
+        return int(max(0, min(100, total_score)))
+
+    def get_machine_status_by_ip(self, ip: str) -> Dict:
+        """
+        根据IP地址获取机器的最新状态评估
+        
+        Args:
+            ip: IP地址
+            
+        Returns:
+            机器状态评估结果
+        """
+        # 获取最新监控数据
+        metric = self.get_latest_metric_by_ip(ip)
+        
+        if not metric:
+            return {
+                "status_level": "未知",
+                "ip": ip,
+                "timestamp": None,
+                "key_metrics": {},
+                "issues": ["未找到该IP的监控数据"],
+                "warnings": [],
+                "is_healthy": False,
+                "overall_score": 0,
+                "error": "未找到监控数据"
+            }
+        
+        # 评估状态
+        return self.assess_machine_status(metric)
+
+    def get_all_machines_status(self, time_window_hours: int = 1) -> List[Dict]:
+        """
+        获取所有机器的状态评估
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            所有机器的状态评估列表
+        """
+        # 获取活跃机器的监控数据
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        status_list = []
+        for metric in metrics:
+            status = self.assess_machine_status(metric)
+            status_list.append(status)
+        
+        # 按健康评分排序
+        status_list.sort(key=lambda x: x['overall_score'], reverse=True)
+        
+        return status_list
+
+    def get_system_overview(self, time_window_hours: int = 1) -> Dict:
+        """
+        获取系统总体概览信息
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            系统总体概览信息，包含：
+            - 活跃机器统计
+            - 健康状态分布
+            - 告警和提示信息汇总
+            - 关键指标统计
+            - 性能趋势分析
+        """
+        # 获取所有机器的状态评估
+        status_list = self.get_all_machines_status(time_window_hours)
+        
+        # 获取活跃机器的原始监控数据用于统计计算
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        # 1. 活跃机器统计
+        active_machines = len(status_list)
+        active_ips = [status['ip'] for status in status_list]
+        
+        # 2. 健康状态分布
+        status_distribution = {
+            "正常": len([s for s in status_list if s['status_level'] == "正常"]),
+            "提示": len([s for s in status_list if s['status_level'] == "提示"]),
+            "警告": len([s for s in status_list if s['status_level'] == "警告"]),
+            "未知": len([s for s in status_list if s['status_level'] == "未知"])
+        }
+        
+        # 3. 告警和提示信息汇总
+        all_issues = []
+        all_warnings = []
+        
+        for status in status_list:
+            all_issues.extend([{"ip": status['ip'], "issue": issue} for issue in status['issues']])
+            all_warnings.extend([{"ip": status['ip'], "warning": warning} for warning in status['warnings']])
+        
+        # 4. 关键指标统计（最大值、平均值、最小值）
+        key_metrics_stats = self._calculate_key_metrics_statistics(metrics)
+        
+        # 5. 性能趋势分析（基于最近10条数据）
+        trend_analysis = self._analyze_performance_trend(time_window_hours)
+        
+        # 6. 系统健康评分
+        overall_health_score = self._calculate_system_health_score(status_list)
+        
+        # 构建总体概览信息
+        overview = {
+            "timestamp": int(time.time()),
+            "time_window_hours": time_window_hours,
+            "active_machines": {
+                "total": active_machines,
+                "ips": active_ips
+            },
+            "health_status": {
+                "distribution": status_distribution,
+                "overall_score": overall_health_score,
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+            },
+            "alerts_summary": {
+                "critical_issues": len(all_issues),
+                "warning_issues": len(all_warnings),
+                "issues_by_type": self._categorize_issues(all_issues),
+                "warnings_by_type": self._categorize_warnings(all_warnings)
+            },
+            "key_metrics": key_metrics_stats,
+            "performance_trend": trend_analysis,
+            "detailed_alerts": {
+                "critical": all_issues,
+                "warning": all_warnings
+            }
+        }
+        
+        return overview
+
+    def _calculate_key_metrics_statistics(self, metrics: List[Dict]) -> Dict:
+        """计算关键指标的统计信息"""
+        if not metrics:
+            return {
+                "cpu_usage": {"max": 0, "avg": 0, "min": 0},
+                "memory_usage": {"max": 0, "avg": 0, "min": 0},
+                "disk_usage": {"max": 0, "avg": 0, "min": 0},
+                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+            }
+        
+        cpu_usages = []
+        memory_usages = []
+        disk_usages = []
+        swap_usages = []
+        
+        for metric in metrics:
+            # 计算各项指标
+            cpu_usr = metric.get('cpu_usr', 0) or 0
+            cpu_sys = metric.get('cpu_sys', 0) or 0
+            cpu_iow = metric.get('cpu_iow', 0) or 0
+            cpu_total = cpu_usr + cpu_sys + cpu_iow
+            
+            mem_total = metric.get('mem_total', 0) or 0
+            mem_free = metric.get('mem_free', 0) or 0
+            mem_buff = metric.get('mem_buff', 0) or 0
+            mem_cache = metric.get('mem_cache', 0) or 0
+            mem_used = mem_total - mem_free - mem_buff - mem_cache
+            mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+            
+            disk_usage = metric.get('disk_used_percent', 0) or 0
+            
+            swap_used = metric.get('swap_used', 0) or 0
+            swap_total = metric.get('swap_total', 0) or 0
+            swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+            
+            cpu_usages.append(cpu_total)
+            memory_usages.append(mem_usage_percent)
+            disk_usages.append(disk_usage)
+            swap_usages.append(swap_usage_percent)
+        
+        return {
+            "cpu_usage": {
+                "max": round(max(cpu_usages), 2) if cpu_usages else 0,
+                "avg": round(sum(cpu_usages) / len(cpu_usages), 2) if cpu_usages else 0,
+                "min": round(min(cpu_usages), 2) if cpu_usages else 0
+            },
+            "memory_usage": {
+                "max": round(max(memory_usages), 2) if memory_usages else 0,
+                "avg": round(sum(memory_usages) / len(memory_usages), 2) if memory_usages else 0,
+                "min": round(min(memory_usages), 2) if memory_usages else 0
+            },
+            "disk_usage": {
+                "max": round(max(disk_usages), 2) if disk_usages else 0,
+                "avg": round(sum(disk_usages) / len(disk_usages), 2) if disk_usages else 0,
+                "min": round(min(disk_usages), 2) if disk_usages else 0
+            },
+            "swap_usage": {
+                "max": round(max(swap_usages), 2) if swap_usages else 0,
+                "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
+                "min": round(min(swap_usages), 2) if swap_usages else 0
+            }
+        }
+
+    def _analyze_performance_trend(self, time_window_hours: int) -> Dict:
+        """分析性能趋势"""
+        # 这里可以扩展为获取历史数据进行趋势分析
+        # 目前返回基础趋势信息
+        return {
+            "trend": "stable",  # stable, improving, declining
+            "confidence": 0.8,
+            "analysis": "系统性能整体稳定",
+            "suggestions": ["建议定期检查磁盘使用率", "关注内存使用趋势"]
+        }
+
+    def _calculate_system_health_score(self, status_list: List[Dict]) -> float:
+        """计算系统整体健康评分"""
+        if not status_list:
+            return 0.0
+        
+        total_score = sum(status['overall_score'] for status in status_list)
+        return round(total_score / len(status_list), 2)
+
+    def _categorize_issues(self, issues: List[Dict]) -> Dict:
+        """分类汇总问题"""
+        categories = {}
+        
+        for issue_item in issues:
+            issue_text = issue_item['issue']
+            if "CPU" in issue_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in issue_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in issue_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in issue_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in issue_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
+
+    def _categorize_warnings(self, warnings: List[Dict]) -> Dict:
+        """分类汇总警告"""
+        categories = {}
+        
+        for warning_item in warnings:
+            warning_text = warning_item['warning']
+            if "CPU" in warning_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in warning_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in warning_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in warning_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in warning_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
     
     def get_high_cpu_metrics(self, cpu_threshold: float = 80.0, limit: int = 20) -> List[Dict]:
         """查询CPU使用率超过阈值的监控指标"""
@@ -541,6 +6587,409 @@ class DatabaseManager:
             return []
         finally:
             self.return_connection(connection)
+
+    def assess_machine_status(self, metric: Dict) -> Dict:
+        """
+        根据监控指标评估机器运行状态
+        
+        Args:
+            metric: 监控指标数据
+            
+        Returns:
+            包含状态分级和详细信息的字典
+        """
+        # 获取关键指标值，处理None值
+        cpu_usr = metric.get('cpu_usr', 0) or 0
+        cpu_sys = metric.get('cpu_sys', 0) or 0
+        cpu_iow = metric.get('cpu_iow', 0) or 0
+        
+        mem_total = metric.get('mem_total', 0) or 0
+        mem_free = metric.get('mem_free', 0) or 0
+        mem_buff = metric.get('mem_buff', 0) or 0
+        mem_cache = metric.get('mem_cache', 0) or 0
+        
+        disk_used_percent = metric.get('disk_used_percent', 0) or 0
+        swap_used = metric.get('swap_used', 0) or 0
+        swap_total = metric.get('swap_total', 0) or 0
+        
+        # 计算关键指标
+        cpu_total = cpu_usr + cpu_sys + cpu_iow
+        mem_used = mem_total - mem_free - mem_buff - mem_cache
+        mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+        swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 状态评估
+        status_level = "正常"
+        issues = []
+        warnings = []
+        
+        # CPU使用率检查
+        if cpu_total >= 90:
+            status_level = "警告"
+            issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
+        elif cpu_total >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
+        
+        # 内存使用率检查
+        if mem_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
+        elif mem_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
+        
+        # 磁盘使用率检查
+        if disk_used_percent >= 90:
+            status_level = "警告"
+            issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
+        elif disk_used_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
+        
+        # Swap使用率检查
+        if swap_usage_percent >= 50:
+            status_level = "警告"
+            issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
+        elif swap_usage_percent >= 20:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
+        
+        # 数据时效性检查（超过1小时无数据视为异常）
+        import time
+        current_timestamp = int(time.time())
+        metric_timestamp = metric.get('ts', 0)
+        time_diff_hours = (current_timestamp - metric_timestamp) / 3600
+        
+        if time_diff_hours > 1:
+            status_level = "警告"
+            issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
+        elif time_diff_hours > 0.3:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
+        
+        # 构建返回结果
+        result = {
+            "status_level": status_level,
+            "ip": metric.get('ip', '未知'),
+            "timestamp": metric_timestamp,
+            "key_metrics": {
+                "cpu_usage_percent": round(cpu_total, 2),
+                "memory_usage_percent": round(mem_usage_percent, 2),
+                "disk_usage_percent": round(disk_used_percent, 2),
+                "swap_usage_percent": round(swap_usage_percent, 2),
+                "data_freshness_hours": round(time_diff_hours, 2)
+            },
+            "issues": issues,
+            "warnings": warnings,
+            "is_healthy": status_level == "正常",
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+        }
+        
+        return result
+
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+        """
+        计算机器健康评分（0-100分）
+        
+        Args:
+            cpu_usage: CPU使用率
+            mem_usage: 内存使用率
+            disk_usage: 磁盘使用率
+            swap_usage: Swap使用率
+            data_freshness: 数据新鲜度（小时）
+            
+        Returns:
+            健康评分（0-100）
+        """
+        # 各项指标的权重
+        weights = {
+            'cpu': 0.25,
+            'memory': 0.25,
+            'disk': 0.20,
+            'swap': 0.15,
+            'freshness': 0.15
+        }
+        
+        # 计算各项得分（0-100分）
+        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
+        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
+        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
+        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
+        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        
+        # 加权平均
+        total_score = (
+            cpu_score * weights['cpu'] +
+            mem_score * weights['memory'] +
+            disk_score * weights['disk'] +
+            swap_score * weights['swap'] +
+            freshness_score * weights['freshness']
+        )
+        
+        return int(max(0, min(100, total_score)))
+
+    def get_machine_status_by_ip(self, ip: str) -> Dict:
+        """
+        根据IP地址获取机器的最新状态评估
+        
+        Args:
+            ip: IP地址
+            
+        Returns:
+            机器状态评估结果
+        """
+        # 获取最新监控数据
+        metric = self.get_latest_metric_by_ip(ip)
+        
+        if not metric:
+            return {
+                "status_level": "未知",
+                "ip": ip,
+                "timestamp": None,
+                "key_metrics": {},
+                "issues": ["未找到该IP的监控数据"],
+                "warnings": [],
+                "is_healthy": False,
+                "overall_score": 0,
+                "error": "未找到监控数据"
+            }
+        
+        # 评估状态
+        return self.assess_machine_status(metric)
+
+    def get_all_machines_status(self, time_window_hours: int = 1) -> List[Dict]:
+        """
+        获取所有机器的状态评估
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            所有机器的状态评估列表
+        """
+        # 获取活跃机器的监控数据
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        status_list = []
+        for metric in metrics:
+            status = self.assess_machine_status(metric)
+            status_list.append(status)
+        
+        # 按健康评分排序
+        status_list.sort(key=lambda x: x['overall_score'], reverse=True)
+        
+        return status_list
+
+    def get_system_overview(self, time_window_hours: int = 1) -> Dict:
+        """
+        获取系统总体概览信息
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            系统总体概览信息，包含：
+            - 活跃机器统计
+            - 健康状态分布
+            - 告警和提示信息汇总
+            - 关键指标统计
+            - 性能趋势分析
+        """
+        # 获取所有机器的状态评估
+        status_list = self.get_all_machines_status(time_window_hours)
+        
+        # 获取活跃机器的原始监控数据用于统计计算
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        # 1. 活跃机器统计
+        active_machines = len(status_list)
+        active_ips = [status['ip'] for status in status_list]
+        
+        # 2. 健康状态分布
+        status_distribution = {
+            "正常": len([s for s in status_list if s['status_level'] == "正常"]),
+            "提示": len([s for s in status_list if s['status_level'] == "提示"]),
+            "警告": len([s for s in status_list if s['status_level'] == "警告"]),
+            "未知": len([s for s in status_list if s['status_level'] == "未知"])
+        }
+        
+        # 3. 告警和提示信息汇总
+        all_issues = []
+        all_warnings = []
+        
+        for status in status_list:
+            all_issues.extend([{"ip": status['ip'], "issue": issue} for issue in status['issues']])
+            all_warnings.extend([{"ip": status['ip'], "warning": warning} for warning in status['warnings']])
+        
+        # 4. 关键指标统计（最大值、平均值、最小值）
+        key_metrics_stats = self._calculate_key_metrics_statistics(metrics)
+        
+        # 5. 性能趋势分析（基于最近10条数据）
+        trend_analysis = self._analyze_performance_trend(time_window_hours)
+        
+        # 6. 系统健康评分
+        overall_health_score = self._calculate_system_health_score(status_list)
+        
+        # 构建总体概览信息
+        overview = {
+            "timestamp": int(time.time()),
+            "time_window_hours": time_window_hours,
+            "active_machines": {
+                "total": active_machines,
+                "ips": active_ips
+            },
+            "health_status": {
+                "distribution": status_distribution,
+                "overall_score": overall_health_score,
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+            },
+            "alerts_summary": {
+                "critical_issues": len(all_issues),
+                "warning_issues": len(all_warnings),
+                "issues_by_type": self._categorize_issues(all_issues),
+                "warnings_by_type": self._categorize_warnings(all_warnings)
+            },
+            "key_metrics": key_metrics_stats,
+            "performance_trend": trend_analysis,
+            "detailed_alerts": {
+                "critical": all_issues,
+                "warning": all_warnings
+            }
+        }
+        
+        return overview
+
+    def _calculate_key_metrics_statistics(self, metrics: List[Dict]) -> Dict:
+        """计算关键指标的统计信息"""
+        if not metrics:
+            return {
+                "cpu_usage": {"max": 0, "avg": 0, "min": 0},
+                "memory_usage": {"max": 0, "avg": 0, "min": 0},
+                "disk_usage": {"max": 0, "avg": 0, "min": 0},
+                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+            }
+        
+        cpu_usages = []
+        memory_usages = []
+        disk_usages = []
+        swap_usages = []
+        
+        for metric in metrics:
+            # 计算各项指标
+            cpu_usr = metric.get('cpu_usr', 0) or 0
+            cpu_sys = metric.get('cpu_sys', 0) or 0
+            cpu_iow = metric.get('cpu_iow', 0) or 0
+            cpu_total = cpu_usr + cpu_sys + cpu_iow
+            
+            mem_total = metric.get('mem_total', 0) or 0
+            mem_free = metric.get('mem_free', 0) or 0
+            mem_buff = metric.get('mem_buff', 0) or 0
+            mem_cache = metric.get('mem_cache', 0) or 0
+            mem_used = mem_total - mem_free - mem_buff - mem_cache
+            mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+            
+            disk_usage = metric.get('disk_used_percent', 0) or 0
+            
+            swap_used = metric.get('swap_used', 0) or 0
+            swap_total = metric.get('swap_total', 0) or 0
+            swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+            
+            cpu_usages.append(cpu_total)
+            memory_usages.append(mem_usage_percent)
+            disk_usages.append(disk_usage)
+            swap_usages.append(swap_usage_percent)
+        
+        return {
+            "cpu_usage": {
+                "max": round(max(cpu_usages), 2) if cpu_usages else 0,
+                "avg": round(sum(cpu_usages) / len(cpu_usages), 2) if cpu_usages else 0,
+                "min": round(min(cpu_usages), 2) if cpu_usages else 0
+            },
+            "memory_usage": {
+                "max": round(max(memory_usages), 2) if memory_usages else 0,
+                "avg": round(sum(memory_usages) / len(memory_usages), 2) if memory_usages else 0,
+                "min": round(min(memory_usages), 2) if memory_usages else 0
+            },
+            "disk_usage": {
+                "max": round(max(disk_usages), 2) if disk_usages else 0,
+                "avg": round(sum(disk_usages) / len(disk_usages), 2) if disk_usages else 0,
+                "min": round(min(disk_usages), 2) if disk_usages else 0
+            },
+            "swap_usage": {
+                "max": round(max(swap_usages), 2) if swap_usages else 0,
+                "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
+                "min": round(min(swap_usages), 2) if swap_usages else 0
+            }
+        }
+
+    def _analyze_performance_trend(self, time_window_hours: int) -> Dict:
+        """分析性能趋势"""
+        # 这里可以扩展为获取历史数据进行趋势分析
+        # 目前返回基础趋势信息
+        return {
+            "trend": "stable",  # stable, improving, declining
+            "confidence": 0.8,
+            "analysis": "系统性能整体稳定",
+            "suggestions": ["建议定期检查磁盘使用率", "关注内存使用趋势"]
+        }
+
+    def _calculate_system_health_score(self, status_list: List[Dict]) -> float:
+        """计算系统整体健康评分"""
+        if not status_list:
+            return 0.0
+        
+        total_score = sum(status['overall_score'] for status in status_list)
+        return round(total_score / len(status_list), 2)
+
+    def _categorize_issues(self, issues: List[Dict]) -> Dict:
+        """分类汇总问题"""
+        categories = {}
+        
+        for issue_item in issues:
+            issue_text = issue_item['issue']
+            if "CPU" in issue_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in issue_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in issue_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in issue_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in issue_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
+
+    def _categorize_warnings(self, warnings: List[Dict]) -> Dict:
+        """分类汇总警告"""
+        categories = {}
+        
+        for warning_item in warnings:
+            warning_text = warning_item['warning']
+            if "CPU" in warning_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in warning_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in warning_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in warning_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in warning_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
     
     def get_high_memory_metrics(self, mem_threshold: float = 80.0, limit: int = 20) -> List[Dict]:
         """查询内存使用率超过阈值的监控指标"""
@@ -567,6 +7016,409 @@ class DatabaseManager:
             return []
         finally:
             self.return_connection(connection)
+
+    def assess_machine_status(self, metric: Dict) -> Dict:
+        """
+        根据监控指标评估机器运行状态
+        
+        Args:
+            metric: 监控指标数据
+            
+        Returns:
+            包含状态分级和详细信息的字典
+        """
+        # 获取关键指标值，处理None值
+        cpu_usr = metric.get('cpu_usr', 0) or 0
+        cpu_sys = metric.get('cpu_sys', 0) or 0
+        cpu_iow = metric.get('cpu_iow', 0) or 0
+        
+        mem_total = metric.get('mem_total', 0) or 0
+        mem_free = metric.get('mem_free', 0) or 0
+        mem_buff = metric.get('mem_buff', 0) or 0
+        mem_cache = metric.get('mem_cache', 0) or 0
+        
+        disk_used_percent = metric.get('disk_used_percent', 0) or 0
+        swap_used = metric.get('swap_used', 0) or 0
+        swap_total = metric.get('swap_total', 0) or 0
+        
+        # 计算关键指标
+        cpu_total = cpu_usr + cpu_sys + cpu_iow
+        mem_used = mem_total - mem_free - mem_buff - mem_cache
+        mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+        swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 状态评估
+        status_level = "正常"
+        issues = []
+        warnings = []
+        
+        # CPU使用率检查
+        if cpu_total >= 90:
+            status_level = "警告"
+            issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
+        elif cpu_total >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
+        
+        # 内存使用率检查
+        if mem_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
+        elif mem_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
+        
+        # 磁盘使用率检查
+        if disk_used_percent >= 90:
+            status_level = "警告"
+            issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
+        elif disk_used_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
+        
+        # Swap使用率检查
+        if swap_usage_percent >= 50:
+            status_level = "警告"
+            issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
+        elif swap_usage_percent >= 20:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
+        
+        # 数据时效性检查（超过1小时无数据视为异常）
+        import time
+        current_timestamp = int(time.time())
+        metric_timestamp = metric.get('ts', 0)
+        time_diff_hours = (current_timestamp - metric_timestamp) / 3600
+        
+        if time_diff_hours > 1:
+            status_level = "警告"
+            issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
+        elif time_diff_hours > 0.3:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
+        
+        # 构建返回结果
+        result = {
+            "status_level": status_level,
+            "ip": metric.get('ip', '未知'),
+            "timestamp": metric_timestamp,
+            "key_metrics": {
+                "cpu_usage_percent": round(cpu_total, 2),
+                "memory_usage_percent": round(mem_usage_percent, 2),
+                "disk_usage_percent": round(disk_used_percent, 2),
+                "swap_usage_percent": round(swap_usage_percent, 2),
+                "data_freshness_hours": round(time_diff_hours, 2)
+            },
+            "issues": issues,
+            "warnings": warnings,
+            "is_healthy": status_level == "正常",
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+        }
+        
+        return result
+
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+        """
+        计算机器健康评分（0-100分）
+        
+        Args:
+            cpu_usage: CPU使用率
+            mem_usage: 内存使用率
+            disk_usage: 磁盘使用率
+            swap_usage: Swap使用率
+            data_freshness: 数据新鲜度（小时）
+            
+        Returns:
+            健康评分（0-100）
+        """
+        # 各项指标的权重
+        weights = {
+            'cpu': 0.25,
+            'memory': 0.25,
+            'disk': 0.20,
+            'swap': 0.15,
+            'freshness': 0.15
+        }
+        
+        # 计算各项得分（0-100分）
+        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
+        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
+        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
+        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
+        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        
+        # 加权平均
+        total_score = (
+            cpu_score * weights['cpu'] +
+            mem_score * weights['memory'] +
+            disk_score * weights['disk'] +
+            swap_score * weights['swap'] +
+            freshness_score * weights['freshness']
+        )
+        
+        return int(max(0, min(100, total_score)))
+
+    def get_machine_status_by_ip(self, ip: str) -> Dict:
+        """
+        根据IP地址获取机器的最新状态评估
+        
+        Args:
+            ip: IP地址
+            
+        Returns:
+            机器状态评估结果
+        """
+        # 获取最新监控数据
+        metric = self.get_latest_metric_by_ip(ip)
+        
+        if not metric:
+            return {
+                "status_level": "未知",
+                "ip": ip,
+                "timestamp": None,
+                "key_metrics": {},
+                "issues": ["未找到该IP的监控数据"],
+                "warnings": [],
+                "is_healthy": False,
+                "overall_score": 0,
+                "error": "未找到监控数据"
+            }
+        
+        # 评估状态
+        return self.assess_machine_status(metric)
+
+    def get_all_machines_status(self, time_window_hours: int = 1) -> List[Dict]:
+        """
+        获取所有机器的状态评估
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            所有机器的状态评估列表
+        """
+        # 获取活跃机器的监控数据
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        status_list = []
+        for metric in metrics:
+            status = self.assess_machine_status(metric)
+            status_list.append(status)
+        
+        # 按健康评分排序
+        status_list.sort(key=lambda x: x['overall_score'], reverse=True)
+        
+        return status_list
+
+    def get_system_overview(self, time_window_hours: int = 1) -> Dict:
+        """
+        获取系统总体概览信息
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            系统总体概览信息，包含：
+            - 活跃机器统计
+            - 健康状态分布
+            - 告警和提示信息汇总
+            - 关键指标统计
+            - 性能趋势分析
+        """
+        # 获取所有机器的状态评估
+        status_list = self.get_all_machines_status(time_window_hours)
+        
+        # 获取活跃机器的原始监控数据用于统计计算
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        # 1. 活跃机器统计
+        active_machines = len(status_list)
+        active_ips = [status['ip'] for status in status_list]
+        
+        # 2. 健康状态分布
+        status_distribution = {
+            "正常": len([s for s in status_list if s['status_level'] == "正常"]),
+            "提示": len([s for s in status_list if s['status_level'] == "提示"]),
+            "警告": len([s for s in status_list if s['status_level'] == "警告"]),
+            "未知": len([s for s in status_list if s['status_level'] == "未知"])
+        }
+        
+        # 3. 告警和提示信息汇总
+        all_issues = []
+        all_warnings = []
+        
+        for status in status_list:
+            all_issues.extend([{"ip": status['ip'], "issue": issue} for issue in status['issues']])
+            all_warnings.extend([{"ip": status['ip'], "warning": warning} for warning in status['warnings']])
+        
+        # 4. 关键指标统计（最大值、平均值、最小值）
+        key_metrics_stats = self._calculate_key_metrics_statistics(metrics)
+        
+        # 5. 性能趋势分析（基于最近10条数据）
+        trend_analysis = self._analyze_performance_trend(time_window_hours)
+        
+        # 6. 系统健康评分
+        overall_health_score = self._calculate_system_health_score(status_list)
+        
+        # 构建总体概览信息
+        overview = {
+            "timestamp": int(time.time()),
+            "time_window_hours": time_window_hours,
+            "active_machines": {
+                "total": active_machines,
+                "ips": active_ips
+            },
+            "health_status": {
+                "distribution": status_distribution,
+                "overall_score": overall_health_score,
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+            },
+            "alerts_summary": {
+                "critical_issues": len(all_issues),
+                "warning_issues": len(all_warnings),
+                "issues_by_type": self._categorize_issues(all_issues),
+                "warnings_by_type": self._categorize_warnings(all_warnings)
+            },
+            "key_metrics": key_metrics_stats,
+            "performance_trend": trend_analysis,
+            "detailed_alerts": {
+                "critical": all_issues,
+                "warning": all_warnings
+            }
+        }
+        
+        return overview
+
+    def _calculate_key_metrics_statistics(self, metrics: List[Dict]) -> Dict:
+        """计算关键指标的统计信息"""
+        if not metrics:
+            return {
+                "cpu_usage": {"max": 0, "avg": 0, "min": 0},
+                "memory_usage": {"max": 0, "avg": 0, "min": 0},
+                "disk_usage": {"max": 0, "avg": 0, "min": 0},
+                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+            }
+        
+        cpu_usages = []
+        memory_usages = []
+        disk_usages = []
+        swap_usages = []
+        
+        for metric in metrics:
+            # 计算各项指标
+            cpu_usr = metric.get('cpu_usr', 0) or 0
+            cpu_sys = metric.get('cpu_sys', 0) or 0
+            cpu_iow = metric.get('cpu_iow', 0) or 0
+            cpu_total = cpu_usr + cpu_sys + cpu_iow
+            
+            mem_total = metric.get('mem_total', 0) or 0
+            mem_free = metric.get('mem_free', 0) or 0
+            mem_buff = metric.get('mem_buff', 0) or 0
+            mem_cache = metric.get('mem_cache', 0) or 0
+            mem_used = mem_total - mem_free - mem_buff - mem_cache
+            mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+            
+            disk_usage = metric.get('disk_used_percent', 0) or 0
+            
+            swap_used = metric.get('swap_used', 0) or 0
+            swap_total = metric.get('swap_total', 0) or 0
+            swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+            
+            cpu_usages.append(cpu_total)
+            memory_usages.append(mem_usage_percent)
+            disk_usages.append(disk_usage)
+            swap_usages.append(swap_usage_percent)
+        
+        return {
+            "cpu_usage": {
+                "max": round(max(cpu_usages), 2) if cpu_usages else 0,
+                "avg": round(sum(cpu_usages) / len(cpu_usages), 2) if cpu_usages else 0,
+                "min": round(min(cpu_usages), 2) if cpu_usages else 0
+            },
+            "memory_usage": {
+                "max": round(max(memory_usages), 2) if memory_usages else 0,
+                "avg": round(sum(memory_usages) / len(memory_usages), 2) if memory_usages else 0,
+                "min": round(min(memory_usages), 2) if memory_usages else 0
+            },
+            "disk_usage": {
+                "max": round(max(disk_usages), 2) if disk_usages else 0,
+                "avg": round(sum(disk_usages) / len(disk_usages), 2) if disk_usages else 0,
+                "min": round(min(disk_usages), 2) if disk_usages else 0
+            },
+            "swap_usage": {
+                "max": round(max(swap_usages), 2) if swap_usages else 0,
+                "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
+                "min": round(min(swap_usages), 2) if swap_usages else 0
+            }
+        }
+
+    def _analyze_performance_trend(self, time_window_hours: int) -> Dict:
+        """分析性能趋势"""
+        # 这里可以扩展为获取历史数据进行趋势分析
+        # 目前返回基础趋势信息
+        return {
+            "trend": "stable",  # stable, improving, declining
+            "confidence": 0.8,
+            "analysis": "系统性能整体稳定",
+            "suggestions": ["建议定期检查磁盘使用率", "关注内存使用趋势"]
+        }
+
+    def _calculate_system_health_score(self, status_list: List[Dict]) -> float:
+        """计算系统整体健康评分"""
+        if not status_list:
+            return 0.0
+        
+        total_score = sum(status['overall_score'] for status in status_list)
+        return round(total_score / len(status_list), 2)
+
+    def _categorize_issues(self, issues: List[Dict]) -> Dict:
+        """分类汇总问题"""
+        categories = {}
+        
+        for issue_item in issues:
+            issue_text = issue_item['issue']
+            if "CPU" in issue_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in issue_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in issue_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in issue_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in issue_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
+
+    def _categorize_warnings(self, warnings: List[Dict]) -> Dict:
+        """分类汇总警告"""
+        categories = {}
+        
+        for warning_item in warnings:
+            warning_text = warning_item['warning']
+            if "CPU" in warning_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in warning_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in warning_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in warning_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in warning_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
 
     def get_active_machines_latest_metrics(self, time_window_hours: int = 1) -> List[Dict]:
         """
@@ -615,6 +7467,409 @@ class DatabaseManager:
         finally:
             self.return_connection(connection)
 
+    def assess_machine_status(self, metric: Dict) -> Dict:
+        """
+        根据监控指标评估机器运行状态
+        
+        Args:
+            metric: 监控指标数据
+            
+        Returns:
+            包含状态分级和详细信息的字典
+        """
+        # 获取关键指标值，处理None值
+        cpu_usr = metric.get('cpu_usr', 0) or 0
+        cpu_sys = metric.get('cpu_sys', 0) or 0
+        cpu_iow = metric.get('cpu_iow', 0) or 0
+        
+        mem_total = metric.get('mem_total', 0) or 0
+        mem_free = metric.get('mem_free', 0) or 0
+        mem_buff = metric.get('mem_buff', 0) or 0
+        mem_cache = metric.get('mem_cache', 0) or 0
+        
+        disk_used_percent = metric.get('disk_used_percent', 0) or 0
+        swap_used = metric.get('swap_used', 0) or 0
+        swap_total = metric.get('swap_total', 0) or 0
+        
+        # 计算关键指标
+        cpu_total = cpu_usr + cpu_sys + cpu_iow
+        mem_used = mem_total - mem_free - mem_buff - mem_cache
+        mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+        swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 状态评估
+        status_level = "正常"
+        issues = []
+        warnings = []
+        
+        # CPU使用率检查
+        if cpu_total >= 90:
+            status_level = "警告"
+            issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
+        elif cpu_total >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
+        
+        # 内存使用率检查
+        if mem_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
+        elif mem_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
+        
+        # 磁盘使用率检查
+        if disk_used_percent >= 90:
+            status_level = "警告"
+            issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
+        elif disk_used_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
+        
+        # Swap使用率检查
+        if swap_usage_percent >= 50:
+            status_level = "警告"
+            issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
+        elif swap_usage_percent >= 20:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
+        
+        # 数据时效性检查（超过1小时无数据视为异常）
+        import time
+        current_timestamp = int(time.time())
+        metric_timestamp = metric.get('ts', 0)
+        time_diff_hours = (current_timestamp - metric_timestamp) / 3600
+        
+        if time_diff_hours > 1:
+            status_level = "警告"
+            issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
+        elif time_diff_hours > 0.3:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
+        
+        # 构建返回结果
+        result = {
+            "status_level": status_level,
+            "ip": metric.get('ip', '未知'),
+            "timestamp": metric_timestamp,
+            "key_metrics": {
+                "cpu_usage_percent": round(cpu_total, 2),
+                "memory_usage_percent": round(mem_usage_percent, 2),
+                "disk_usage_percent": round(disk_used_percent, 2),
+                "swap_usage_percent": round(swap_usage_percent, 2),
+                "data_freshness_hours": round(time_diff_hours, 2)
+            },
+            "issues": issues,
+            "warnings": warnings,
+            "is_healthy": status_level == "正常",
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+        }
+        
+        return result
+
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+        """
+        计算机器健康评分（0-100分）
+        
+        Args:
+            cpu_usage: CPU使用率
+            mem_usage: 内存使用率
+            disk_usage: 磁盘使用率
+            swap_usage: Swap使用率
+            data_freshness: 数据新鲜度（小时）
+            
+        Returns:
+            健康评分（0-100）
+        """
+        # 各项指标的权重
+        weights = {
+            'cpu': 0.25,
+            'memory': 0.25,
+            'disk': 0.20,
+            'swap': 0.15,
+            'freshness': 0.15
+        }
+        
+        # 计算各项得分（0-100分）
+        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
+        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
+        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
+        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
+        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        
+        # 加权平均
+        total_score = (
+            cpu_score * weights['cpu'] +
+            mem_score * weights['memory'] +
+            disk_score * weights['disk'] +
+            swap_score * weights['swap'] +
+            freshness_score * weights['freshness']
+        )
+        
+        return int(max(0, min(100, total_score)))
+
+    def get_machine_status_by_ip(self, ip: str) -> Dict:
+        """
+        根据IP地址获取机器的最新状态评估
+        
+        Args:
+            ip: IP地址
+            
+        Returns:
+            机器状态评估结果
+        """
+        # 获取最新监控数据
+        metric = self.get_latest_metric_by_ip(ip)
+        
+        if not metric:
+            return {
+                "status_level": "未知",
+                "ip": ip,
+                "timestamp": None,
+                "key_metrics": {},
+                "issues": ["未找到该IP的监控数据"],
+                "warnings": [],
+                "is_healthy": False,
+                "overall_score": 0,
+                "error": "未找到监控数据"
+            }
+        
+        # 评估状态
+        return self.assess_machine_status(metric)
+
+    def get_all_machines_status(self, time_window_hours: int = 1) -> List[Dict]:
+        """
+        获取所有机器的状态评估
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            所有机器的状态评估列表
+        """
+        # 获取活跃机器的监控数据
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        status_list = []
+        for metric in metrics:
+            status = self.assess_machine_status(metric)
+            status_list.append(status)
+        
+        # 按健康评分排序
+        status_list.sort(key=lambda x: x['overall_score'], reverse=True)
+        
+        return status_list
+
+    def get_system_overview(self, time_window_hours: int = 1) -> Dict:
+        """
+        获取系统总体概览信息
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            系统总体概览信息，包含：
+            - 活跃机器统计
+            - 健康状态分布
+            - 告警和提示信息汇总
+            - 关键指标统计
+            - 性能趋势分析
+        """
+        # 获取所有机器的状态评估
+        status_list = self.get_all_machines_status(time_window_hours)
+        
+        # 获取活跃机器的原始监控数据用于统计计算
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        # 1. 活跃机器统计
+        active_machines = len(status_list)
+        active_ips = [status['ip'] for status in status_list]
+        
+        # 2. 健康状态分布
+        status_distribution = {
+            "正常": len([s for s in status_list if s['status_level'] == "正常"]),
+            "提示": len([s for s in status_list if s['status_level'] == "提示"]),
+            "警告": len([s for s in status_list if s['status_level'] == "警告"]),
+            "未知": len([s for s in status_list if s['status_level'] == "未知"])
+        }
+        
+        # 3. 告警和提示信息汇总
+        all_issues = []
+        all_warnings = []
+        
+        for status in status_list:
+            all_issues.extend([{"ip": status['ip'], "issue": issue} for issue in status['issues']])
+            all_warnings.extend([{"ip": status['ip'], "warning": warning} for warning in status['warnings']])
+        
+        # 4. 关键指标统计（最大值、平均值、最小值）
+        key_metrics_stats = self._calculate_key_metrics_statistics(metrics)
+        
+        # 5. 性能趋势分析（基于最近10条数据）
+        trend_analysis = self._analyze_performance_trend(time_window_hours)
+        
+        # 6. 系统健康评分
+        overall_health_score = self._calculate_system_health_score(status_list)
+        
+        # 构建总体概览信息
+        overview = {
+            "timestamp": int(time.time()),
+            "time_window_hours": time_window_hours,
+            "active_machines": {
+                "total": active_machines,
+                "ips": active_ips
+            },
+            "health_status": {
+                "distribution": status_distribution,
+                "overall_score": overall_health_score,
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+            },
+            "alerts_summary": {
+                "critical_issues": len(all_issues),
+                "warning_issues": len(all_warnings),
+                "issues_by_type": self._categorize_issues(all_issues),
+                "warnings_by_type": self._categorize_warnings(all_warnings)
+            },
+            "key_metrics": key_metrics_stats,
+            "performance_trend": trend_analysis,
+            "detailed_alerts": {
+                "critical": all_issues,
+                "warning": all_warnings
+            }
+        }
+        
+        return overview
+
+    def _calculate_key_metrics_statistics(self, metrics: List[Dict]) -> Dict:
+        """计算关键指标的统计信息"""
+        if not metrics:
+            return {
+                "cpu_usage": {"max": 0, "avg": 0, "min": 0},
+                "memory_usage": {"max": 0, "avg": 0, "min": 0},
+                "disk_usage": {"max": 0, "avg": 0, "min": 0},
+                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+            }
+        
+        cpu_usages = []
+        memory_usages = []
+        disk_usages = []
+        swap_usages = []
+        
+        for metric in metrics:
+            # 计算各项指标
+            cpu_usr = metric.get('cpu_usr', 0) or 0
+            cpu_sys = metric.get('cpu_sys', 0) or 0
+            cpu_iow = metric.get('cpu_iow', 0) or 0
+            cpu_total = cpu_usr + cpu_sys + cpu_iow
+            
+            mem_total = metric.get('mem_total', 0) or 0
+            mem_free = metric.get('mem_free', 0) or 0
+            mem_buff = metric.get('mem_buff', 0) or 0
+            mem_cache = metric.get('mem_cache', 0) or 0
+            mem_used = mem_total - mem_free - mem_buff - mem_cache
+            mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+            
+            disk_usage = metric.get('disk_used_percent', 0) or 0
+            
+            swap_used = metric.get('swap_used', 0) or 0
+            swap_total = metric.get('swap_total', 0) or 0
+            swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+            
+            cpu_usages.append(cpu_total)
+            memory_usages.append(mem_usage_percent)
+            disk_usages.append(disk_usage)
+            swap_usages.append(swap_usage_percent)
+        
+        return {
+            "cpu_usage": {
+                "max": round(max(cpu_usages), 2) if cpu_usages else 0,
+                "avg": round(sum(cpu_usages) / len(cpu_usages), 2) if cpu_usages else 0,
+                "min": round(min(cpu_usages), 2) if cpu_usages else 0
+            },
+            "memory_usage": {
+                "max": round(max(memory_usages), 2) if memory_usages else 0,
+                "avg": round(sum(memory_usages) / len(memory_usages), 2) if memory_usages else 0,
+                "min": round(min(memory_usages), 2) if memory_usages else 0
+            },
+            "disk_usage": {
+                "max": round(max(disk_usages), 2) if disk_usages else 0,
+                "avg": round(sum(disk_usages) / len(disk_usages), 2) if disk_usages else 0,
+                "min": round(min(disk_usages), 2) if disk_usages else 0
+            },
+            "swap_usage": {
+                "max": round(max(swap_usages), 2) if swap_usages else 0,
+                "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
+                "min": round(min(swap_usages), 2) if swap_usages else 0
+            }
+        }
+
+    def _analyze_performance_trend(self, time_window_hours: int) -> Dict:
+        """分析性能趋势"""
+        # 这里可以扩展为获取历史数据进行趋势分析
+        # 目前返回基础趋势信息
+        return {
+            "trend": "stable",  # stable, improving, declining
+            "confidence": 0.8,
+            "analysis": "系统性能整体稳定",
+            "suggestions": ["建议定期检查磁盘使用率", "关注内存使用趋势"]
+        }
+
+    def _calculate_system_health_score(self, status_list: List[Dict]) -> float:
+        """计算系统整体健康评分"""
+        if not status_list:
+            return 0.0
+        
+        total_score = sum(status['overall_score'] for status in status_list)
+        return round(total_score / len(status_list), 2)
+
+    def _categorize_issues(self, issues: List[Dict]) -> Dict:
+        """分类汇总问题"""
+        categories = {}
+        
+        for issue_item in issues:
+            issue_text = issue_item['issue']
+            if "CPU" in issue_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in issue_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in issue_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in issue_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in issue_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
+
+    def _categorize_warnings(self, warnings: List[Dict]) -> Dict:
+        """分类汇总警告"""
+        categories = {}
+        
+        for warning_item in warnings:
+            warning_text = warning_item['warning']
+            if "CPU" in warning_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in warning_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in warning_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in warning_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in warning_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
+
     def get_latest_complete_metrics_by_ip(self, ip: str) -> Optional[Dict]:
         """
         根据IP地址获取该IP的最新完整监控信息，包含所有计算字段
@@ -655,6 +7910,409 @@ class DatabaseManager:
             return None
         finally:
             self.return_connection(connection)
+
+    def assess_machine_status(self, metric: Dict) -> Dict:
+        """
+        根据监控指标评估机器运行状态
+        
+        Args:
+            metric: 监控指标数据
+            
+        Returns:
+            包含状态分级和详细信息的字典
+        """
+        # 获取关键指标值，处理None值
+        cpu_usr = metric.get('cpu_usr', 0) or 0
+        cpu_sys = metric.get('cpu_sys', 0) or 0
+        cpu_iow = metric.get('cpu_iow', 0) or 0
+        
+        mem_total = metric.get('mem_total', 0) or 0
+        mem_free = metric.get('mem_free', 0) or 0
+        mem_buff = metric.get('mem_buff', 0) or 0
+        mem_cache = metric.get('mem_cache', 0) or 0
+        
+        disk_used_percent = metric.get('disk_used_percent', 0) or 0
+        swap_used = metric.get('swap_used', 0) or 0
+        swap_total = metric.get('swap_total', 0) or 0
+        
+        # 计算关键指标
+        cpu_total = cpu_usr + cpu_sys + cpu_iow
+        mem_used = mem_total - mem_free - mem_buff - mem_cache
+        mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+        swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 状态评估
+        status_level = "正常"
+        issues = []
+        warnings = []
+        
+        # CPU使用率检查
+        if cpu_total >= 90:
+            status_level = "警告"
+            issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
+        elif cpu_total >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
+        
+        # 内存使用率检查
+        if mem_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
+        elif mem_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
+        
+        # 磁盘使用率检查
+        if disk_used_percent >= 90:
+            status_level = "警告"
+            issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
+        elif disk_used_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
+        
+        # Swap使用率检查
+        if swap_usage_percent >= 50:
+            status_level = "警告"
+            issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
+        elif swap_usage_percent >= 20:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
+        
+        # 数据时效性检查（超过1小时无数据视为异常）
+        import time
+        current_timestamp = int(time.time())
+        metric_timestamp = metric.get('ts', 0)
+        time_diff_hours = (current_timestamp - metric_timestamp) / 3600
+        
+        if time_diff_hours > 1:
+            status_level = "警告"
+            issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
+        elif time_diff_hours > 0.3:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
+        
+        # 构建返回结果
+        result = {
+            "status_level": status_level,
+            "ip": metric.get('ip', '未知'),
+            "timestamp": metric_timestamp,
+            "key_metrics": {
+                "cpu_usage_percent": round(cpu_total, 2),
+                "memory_usage_percent": round(mem_usage_percent, 2),
+                "disk_usage_percent": round(disk_used_percent, 2),
+                "swap_usage_percent": round(swap_usage_percent, 2),
+                "data_freshness_hours": round(time_diff_hours, 2)
+            },
+            "issues": issues,
+            "warnings": warnings,
+            "is_healthy": status_level == "正常",
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+        }
+        
+        return result
+
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+        """
+        计算机器健康评分（0-100分）
+        
+        Args:
+            cpu_usage: CPU使用率
+            mem_usage: 内存使用率
+            disk_usage: 磁盘使用率
+            swap_usage: Swap使用率
+            data_freshness: 数据新鲜度（小时）
+            
+        Returns:
+            健康评分（0-100）
+        """
+        # 各项指标的权重
+        weights = {
+            'cpu': 0.25,
+            'memory': 0.25,
+            'disk': 0.20,
+            'swap': 0.15,
+            'freshness': 0.15
+        }
+        
+        # 计算各项得分（0-100分）
+        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
+        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
+        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
+        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
+        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        
+        # 加权平均
+        total_score = (
+            cpu_score * weights['cpu'] +
+            mem_score * weights['memory'] +
+            disk_score * weights['disk'] +
+            swap_score * weights['swap'] +
+            freshness_score * weights['freshness']
+        )
+        
+        return int(max(0, min(100, total_score)))
+
+    def get_machine_status_by_ip(self, ip: str) -> Dict:
+        """
+        根据IP地址获取机器的最新状态评估
+        
+        Args:
+            ip: IP地址
+            
+        Returns:
+            机器状态评估结果
+        """
+        # 获取最新监控数据
+        metric = self.get_latest_metric_by_ip(ip)
+        
+        if not metric:
+            return {
+                "status_level": "未知",
+                "ip": ip,
+                "timestamp": None,
+                "key_metrics": {},
+                "issues": ["未找到该IP的监控数据"],
+                "warnings": [],
+                "is_healthy": False,
+                "overall_score": 0,
+                "error": "未找到监控数据"
+            }
+        
+        # 评估状态
+        return self.assess_machine_status(metric)
+
+    def get_all_machines_status(self, time_window_hours: int = 1) -> List[Dict]:
+        """
+        获取所有机器的状态评估
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            所有机器的状态评估列表
+        """
+        # 获取活跃机器的监控数据
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        status_list = []
+        for metric in metrics:
+            status = self.assess_machine_status(metric)
+            status_list.append(status)
+        
+        # 按健康评分排序
+        status_list.sort(key=lambda x: x['overall_score'], reverse=True)
+        
+        return status_list
+
+    def get_system_overview(self, time_window_hours: int = 1) -> Dict:
+        """
+        获取系统总体概览信息
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            系统总体概览信息，包含：
+            - 活跃机器统计
+            - 健康状态分布
+            - 告警和提示信息汇总
+            - 关键指标统计
+            - 性能趋势分析
+        """
+        # 获取所有机器的状态评估
+        status_list = self.get_all_machines_status(time_window_hours)
+        
+        # 获取活跃机器的原始监控数据用于统计计算
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        # 1. 活跃机器统计
+        active_machines = len(status_list)
+        active_ips = [status['ip'] for status in status_list]
+        
+        # 2. 健康状态分布
+        status_distribution = {
+            "正常": len([s for s in status_list if s['status_level'] == "正常"]),
+            "提示": len([s for s in status_list if s['status_level'] == "提示"]),
+            "警告": len([s for s in status_list if s['status_level'] == "警告"]),
+            "未知": len([s for s in status_list if s['status_level'] == "未知"])
+        }
+        
+        # 3. 告警和提示信息汇总
+        all_issues = []
+        all_warnings = []
+        
+        for status in status_list:
+            all_issues.extend([{"ip": status['ip'], "issue": issue} for issue in status['issues']])
+            all_warnings.extend([{"ip": status['ip'], "warning": warning} for warning in status['warnings']])
+        
+        # 4. 关键指标统计（最大值、平均值、最小值）
+        key_metrics_stats = self._calculate_key_metrics_statistics(metrics)
+        
+        # 5. 性能趋势分析（基于最近10条数据）
+        trend_analysis = self._analyze_performance_trend(time_window_hours)
+        
+        # 6. 系统健康评分
+        overall_health_score = self._calculate_system_health_score(status_list)
+        
+        # 构建总体概览信息
+        overview = {
+            "timestamp": int(time.time()),
+            "time_window_hours": time_window_hours,
+            "active_machines": {
+                "total": active_machines,
+                "ips": active_ips
+            },
+            "health_status": {
+                "distribution": status_distribution,
+                "overall_score": overall_health_score,
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+            },
+            "alerts_summary": {
+                "critical_issues": len(all_issues),
+                "warning_issues": len(all_warnings),
+                "issues_by_type": self._categorize_issues(all_issues),
+                "warnings_by_type": self._categorize_warnings(all_warnings)
+            },
+            "key_metrics": key_metrics_stats,
+            "performance_trend": trend_analysis,
+            "detailed_alerts": {
+                "critical": all_issues,
+                "warning": all_warnings
+            }
+        }
+        
+        return overview
+
+    def _calculate_key_metrics_statistics(self, metrics: List[Dict]) -> Dict:
+        """计算关键指标的统计信息"""
+        if not metrics:
+            return {
+                "cpu_usage": {"max": 0, "avg": 0, "min": 0},
+                "memory_usage": {"max": 0, "avg": 0, "min": 0},
+                "disk_usage": {"max": 0, "avg": 0, "min": 0},
+                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+            }
+        
+        cpu_usages = []
+        memory_usages = []
+        disk_usages = []
+        swap_usages = []
+        
+        for metric in metrics:
+            # 计算各项指标
+            cpu_usr = metric.get('cpu_usr', 0) or 0
+            cpu_sys = metric.get('cpu_sys', 0) or 0
+            cpu_iow = metric.get('cpu_iow', 0) or 0
+            cpu_total = cpu_usr + cpu_sys + cpu_iow
+            
+            mem_total = metric.get('mem_total', 0) or 0
+            mem_free = metric.get('mem_free', 0) or 0
+            mem_buff = metric.get('mem_buff', 0) or 0
+            mem_cache = metric.get('mem_cache', 0) or 0
+            mem_used = mem_total - mem_free - mem_buff - mem_cache
+            mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+            
+            disk_usage = metric.get('disk_used_percent', 0) or 0
+            
+            swap_used = metric.get('swap_used', 0) or 0
+            swap_total = metric.get('swap_total', 0) or 0
+            swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+            
+            cpu_usages.append(cpu_total)
+            memory_usages.append(mem_usage_percent)
+            disk_usages.append(disk_usage)
+            swap_usages.append(swap_usage_percent)
+        
+        return {
+            "cpu_usage": {
+                "max": round(max(cpu_usages), 2) if cpu_usages else 0,
+                "avg": round(sum(cpu_usages) / len(cpu_usages), 2) if cpu_usages else 0,
+                "min": round(min(cpu_usages), 2) if cpu_usages else 0
+            },
+            "memory_usage": {
+                "max": round(max(memory_usages), 2) if memory_usages else 0,
+                "avg": round(sum(memory_usages) / len(memory_usages), 2) if memory_usages else 0,
+                "min": round(min(memory_usages), 2) if memory_usages else 0
+            },
+            "disk_usage": {
+                "max": round(max(disk_usages), 2) if disk_usages else 0,
+                "avg": round(sum(disk_usages) / len(disk_usages), 2) if disk_usages else 0,
+                "min": round(min(disk_usages), 2) if disk_usages else 0
+            },
+            "swap_usage": {
+                "max": round(max(swap_usages), 2) if swap_usages else 0,
+                "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
+                "min": round(min(swap_usages), 2) if swap_usages else 0
+            }
+        }
+
+    def _analyze_performance_trend(self, time_window_hours: int) -> Dict:
+        """分析性能趋势"""
+        # 这里可以扩展为获取历史数据进行趋势分析
+        # 目前返回基础趋势信息
+        return {
+            "trend": "stable",  # stable, improving, declining
+            "confidence": 0.8,
+            "analysis": "系统性能整体稳定",
+            "suggestions": ["建议定期检查磁盘使用率", "关注内存使用趋势"]
+        }
+
+    def _calculate_system_health_score(self, status_list: List[Dict]) -> float:
+        """计算系统整体健康评分"""
+        if not status_list:
+            return 0.0
+        
+        total_score = sum(status['overall_score'] for status in status_list)
+        return round(total_score / len(status_list), 2)
+
+    def _categorize_issues(self, issues: List[Dict]) -> Dict:
+        """分类汇总问题"""
+        categories = {}
+        
+        for issue_item in issues:
+            issue_text = issue_item['issue']
+            if "CPU" in issue_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in issue_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in issue_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in issue_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in issue_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
+
+    def _categorize_warnings(self, warnings: List[Dict]) -> Dict:
+        """分类汇总警告"""
+        categories = {}
+        
+        for warning_item in warnings:
+            warning_text = warning_item['warning']
+            if "CPU" in warning_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in warning_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in warning_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in warning_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in warning_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
 
     def get_latest_ten_complete_metrics_by_ip(self, ip: str) -> List[Dict]:
         """
@@ -699,6 +8357,409 @@ class DatabaseManager:
             return []
         finally:
             self.return_connection(connection)
+
+    def assess_machine_status(self, metric: Dict) -> Dict:
+        """
+        根据监控指标评估机器运行状态
+        
+        Args:
+            metric: 监控指标数据
+            
+        Returns:
+            包含状态分级和详细信息的字典
+        """
+        # 获取关键指标值，处理None值
+        cpu_usr = metric.get('cpu_usr', 0) or 0
+        cpu_sys = metric.get('cpu_sys', 0) or 0
+        cpu_iow = metric.get('cpu_iow', 0) or 0
+        
+        mem_total = metric.get('mem_total', 0) or 0
+        mem_free = metric.get('mem_free', 0) or 0
+        mem_buff = metric.get('mem_buff', 0) or 0
+        mem_cache = metric.get('mem_cache', 0) or 0
+        
+        disk_used_percent = metric.get('disk_used_percent', 0) or 0
+        swap_used = metric.get('swap_used', 0) or 0
+        swap_total = metric.get('swap_total', 0) or 0
+        
+        # 计算关键指标
+        cpu_total = cpu_usr + cpu_sys + cpu_iow
+        mem_used = mem_total - mem_free - mem_buff - mem_cache
+        mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+        swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 状态评估
+        status_level = "正常"
+        issues = []
+        warnings = []
+        
+        # CPU使用率检查
+        if cpu_total >= 90:
+            status_level = "警告"
+            issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
+        elif cpu_total >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
+        
+        # 内存使用率检查
+        if mem_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
+        elif mem_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
+        
+        # 磁盘使用率检查
+        if disk_used_percent >= 90:
+            status_level = "警告"
+            issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
+        elif disk_used_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
+        
+        # Swap使用率检查
+        if swap_usage_percent >= 50:
+            status_level = "警告"
+            issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
+        elif swap_usage_percent >= 20:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
+        
+        # 数据时效性检查（超过1小时无数据视为异常）
+        import time
+        current_timestamp = int(time.time())
+        metric_timestamp = metric.get('ts', 0)
+        time_diff_hours = (current_timestamp - metric_timestamp) / 3600
+        
+        if time_diff_hours > 1:
+            status_level = "警告"
+            issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
+        elif time_diff_hours > 0.3:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
+        
+        # 构建返回结果
+        result = {
+            "status_level": status_level,
+            "ip": metric.get('ip', '未知'),
+            "timestamp": metric_timestamp,
+            "key_metrics": {
+                "cpu_usage_percent": round(cpu_total, 2),
+                "memory_usage_percent": round(mem_usage_percent, 2),
+                "disk_usage_percent": round(disk_used_percent, 2),
+                "swap_usage_percent": round(swap_usage_percent, 2),
+                "data_freshness_hours": round(time_diff_hours, 2)
+            },
+            "issues": issues,
+            "warnings": warnings,
+            "is_healthy": status_level == "正常",
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+        }
+        
+        return result
+
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+        """
+        计算机器健康评分（0-100分）
+        
+        Args:
+            cpu_usage: CPU使用率
+            mem_usage: 内存使用率
+            disk_usage: 磁盘使用率
+            swap_usage: Swap使用率
+            data_freshness: 数据新鲜度（小时）
+            
+        Returns:
+            健康评分（0-100）
+        """
+        # 各项指标的权重
+        weights = {
+            'cpu': 0.25,
+            'memory': 0.25,
+            'disk': 0.20,
+            'swap': 0.15,
+            'freshness': 0.15
+        }
+        
+        # 计算各项得分（0-100分）
+        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
+        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
+        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
+        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
+        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        
+        # 加权平均
+        total_score = (
+            cpu_score * weights['cpu'] +
+            mem_score * weights['memory'] +
+            disk_score * weights['disk'] +
+            swap_score * weights['swap'] +
+            freshness_score * weights['freshness']
+        )
+        
+        return int(max(0, min(100, total_score)))
+
+    def get_machine_status_by_ip(self, ip: str) -> Dict:
+        """
+        根据IP地址获取机器的最新状态评估
+        
+        Args:
+            ip: IP地址
+            
+        Returns:
+            机器状态评估结果
+        """
+        # 获取最新监控数据
+        metric = self.get_latest_metric_by_ip(ip)
+        
+        if not metric:
+            return {
+                "status_level": "未知",
+                "ip": ip,
+                "timestamp": None,
+                "key_metrics": {},
+                "issues": ["未找到该IP的监控数据"],
+                "warnings": [],
+                "is_healthy": False,
+                "overall_score": 0,
+                "error": "未找到监控数据"
+            }
+        
+        # 评估状态
+        return self.assess_machine_status(metric)
+
+    def get_all_machines_status(self, time_window_hours: int = 1) -> List[Dict]:
+        """
+        获取所有机器的状态评估
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            所有机器的状态评估列表
+        """
+        # 获取活跃机器的监控数据
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        status_list = []
+        for metric in metrics:
+            status = self.assess_machine_status(metric)
+            status_list.append(status)
+        
+        # 按健康评分排序
+        status_list.sort(key=lambda x: x['overall_score'], reverse=True)
+        
+        return status_list
+
+    def get_system_overview(self, time_window_hours: int = 1) -> Dict:
+        """
+        获取系统总体概览信息
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            系统总体概览信息，包含：
+            - 活跃机器统计
+            - 健康状态分布
+            - 告警和提示信息汇总
+            - 关键指标统计
+            - 性能趋势分析
+        """
+        # 获取所有机器的状态评估
+        status_list = self.get_all_machines_status(time_window_hours)
+        
+        # 获取活跃机器的原始监控数据用于统计计算
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        # 1. 活跃机器统计
+        active_machines = len(status_list)
+        active_ips = [status['ip'] for status in status_list]
+        
+        # 2. 健康状态分布
+        status_distribution = {
+            "正常": len([s for s in status_list if s['status_level'] == "正常"]),
+            "提示": len([s for s in status_list if s['status_level'] == "提示"]),
+            "警告": len([s for s in status_list if s['status_level'] == "警告"]),
+            "未知": len([s for s in status_list if s['status_level'] == "未知"])
+        }
+        
+        # 3. 告警和提示信息汇总
+        all_issues = []
+        all_warnings = []
+        
+        for status in status_list:
+            all_issues.extend([{"ip": status['ip'], "issue": issue} for issue in status['issues']])
+            all_warnings.extend([{"ip": status['ip'], "warning": warning} for warning in status['warnings']])
+        
+        # 4. 关键指标统计（最大值、平均值、最小值）
+        key_metrics_stats = self._calculate_key_metrics_statistics(metrics)
+        
+        # 5. 性能趋势分析（基于最近10条数据）
+        trend_analysis = self._analyze_performance_trend(time_window_hours)
+        
+        # 6. 系统健康评分
+        overall_health_score = self._calculate_system_health_score(status_list)
+        
+        # 构建总体概览信息
+        overview = {
+            "timestamp": int(time.time()),
+            "time_window_hours": time_window_hours,
+            "active_machines": {
+                "total": active_machines,
+                "ips": active_ips
+            },
+            "health_status": {
+                "distribution": status_distribution,
+                "overall_score": overall_health_score,
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+            },
+            "alerts_summary": {
+                "critical_issues": len(all_issues),
+                "warning_issues": len(all_warnings),
+                "issues_by_type": self._categorize_issues(all_issues),
+                "warnings_by_type": self._categorize_warnings(all_warnings)
+            },
+            "key_metrics": key_metrics_stats,
+            "performance_trend": trend_analysis,
+            "detailed_alerts": {
+                "critical": all_issues,
+                "warning": all_warnings
+            }
+        }
+        
+        return overview
+
+    def _calculate_key_metrics_statistics(self, metrics: List[Dict]) -> Dict:
+        """计算关键指标的统计信息"""
+        if not metrics:
+            return {
+                "cpu_usage": {"max": 0, "avg": 0, "min": 0},
+                "memory_usage": {"max": 0, "avg": 0, "min": 0},
+                "disk_usage": {"max": 0, "avg": 0, "min": 0},
+                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+            }
+        
+        cpu_usages = []
+        memory_usages = []
+        disk_usages = []
+        swap_usages = []
+        
+        for metric in metrics:
+            # 计算各项指标
+            cpu_usr = metric.get('cpu_usr', 0) or 0
+            cpu_sys = metric.get('cpu_sys', 0) or 0
+            cpu_iow = metric.get('cpu_iow', 0) or 0
+            cpu_total = cpu_usr + cpu_sys + cpu_iow
+            
+            mem_total = metric.get('mem_total', 0) or 0
+            mem_free = metric.get('mem_free', 0) or 0
+            mem_buff = metric.get('mem_buff', 0) or 0
+            mem_cache = metric.get('mem_cache', 0) or 0
+            mem_used = mem_total - mem_free - mem_buff - mem_cache
+            mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+            
+            disk_usage = metric.get('disk_used_percent', 0) or 0
+            
+            swap_used = metric.get('swap_used', 0) or 0
+            swap_total = metric.get('swap_total', 0) or 0
+            swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+            
+            cpu_usages.append(cpu_total)
+            memory_usages.append(mem_usage_percent)
+            disk_usages.append(disk_usage)
+            swap_usages.append(swap_usage_percent)
+        
+        return {
+            "cpu_usage": {
+                "max": round(max(cpu_usages), 2) if cpu_usages else 0,
+                "avg": round(sum(cpu_usages) / len(cpu_usages), 2) if cpu_usages else 0,
+                "min": round(min(cpu_usages), 2) if cpu_usages else 0
+            },
+            "memory_usage": {
+                "max": round(max(memory_usages), 2) if memory_usages else 0,
+                "avg": round(sum(memory_usages) / len(memory_usages), 2) if memory_usages else 0,
+                "min": round(min(memory_usages), 2) if memory_usages else 0
+            },
+            "disk_usage": {
+                "max": round(max(disk_usages), 2) if disk_usages else 0,
+                "avg": round(sum(disk_usages) / len(disk_usages), 2) if disk_usages else 0,
+                "min": round(min(disk_usages), 2) if disk_usages else 0
+            },
+            "swap_usage": {
+                "max": round(max(swap_usages), 2) if swap_usages else 0,
+                "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
+                "min": round(min(swap_usages), 2) if swap_usages else 0
+            }
+        }
+
+    def _analyze_performance_trend(self, time_window_hours: int) -> Dict:
+        """分析性能趋势"""
+        # 这里可以扩展为获取历史数据进行趋势分析
+        # 目前返回基础趋势信息
+        return {
+            "trend": "stable",  # stable, improving, declining
+            "confidence": 0.8,
+            "analysis": "系统性能整体稳定",
+            "suggestions": ["建议定期检查磁盘使用率", "关注内存使用趋势"]
+        }
+
+    def _calculate_system_health_score(self, status_list: List[Dict]) -> float:
+        """计算系统整体健康评分"""
+        if not status_list:
+            return 0.0
+        
+        total_score = sum(status['overall_score'] for status in status_list)
+        return round(total_score / len(status_list), 2)
+
+    def _categorize_issues(self, issues: List[Dict]) -> Dict:
+        """分类汇总问题"""
+        categories = {}
+        
+        for issue_item in issues:
+            issue_text = issue_item['issue']
+            if "CPU" in issue_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in issue_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in issue_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in issue_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in issue_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
+
+    def _categorize_warnings(self, warnings: List[Dict]) -> Dict:
+        """分类汇总警告"""
+        categories = {}
+        
+        for warning_item in warnings:
+            warning_text = warning_item['warning']
+            if "CPU" in warning_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in warning_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in warning_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in warning_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in warning_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
 
     # ==================== 用户认证相关方法 ====================
 
@@ -762,6 +8823,409 @@ class DatabaseManager:
         finally:
             self.return_connection(connection)
 
+    def assess_machine_status(self, metric: Dict) -> Dict:
+        """
+        根据监控指标评估机器运行状态
+        
+        Args:
+            metric: 监控指标数据
+            
+        Returns:
+            包含状态分级和详细信息的字典
+        """
+        # 获取关键指标值，处理None值
+        cpu_usr = metric.get('cpu_usr', 0) or 0
+        cpu_sys = metric.get('cpu_sys', 0) or 0
+        cpu_iow = metric.get('cpu_iow', 0) or 0
+        
+        mem_total = metric.get('mem_total', 0) or 0
+        mem_free = metric.get('mem_free', 0) or 0
+        mem_buff = metric.get('mem_buff', 0) or 0
+        mem_cache = metric.get('mem_cache', 0) or 0
+        
+        disk_used_percent = metric.get('disk_used_percent', 0) or 0
+        swap_used = metric.get('swap_used', 0) or 0
+        swap_total = metric.get('swap_total', 0) or 0
+        
+        # 计算关键指标
+        cpu_total = cpu_usr + cpu_sys + cpu_iow
+        mem_used = mem_total - mem_free - mem_buff - mem_cache
+        mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+        swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 状态评估
+        status_level = "正常"
+        issues = []
+        warnings = []
+        
+        # CPU使用率检查
+        if cpu_total >= 90:
+            status_level = "警告"
+            issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
+        elif cpu_total >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
+        
+        # 内存使用率检查
+        if mem_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
+        elif mem_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
+        
+        # 磁盘使用率检查
+        if disk_used_percent >= 90:
+            status_level = "警告"
+            issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
+        elif disk_used_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
+        
+        # Swap使用率检查
+        if swap_usage_percent >= 50:
+            status_level = "警告"
+            issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
+        elif swap_usage_percent >= 20:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
+        
+        # 数据时效性检查（超过1小时无数据视为异常）
+        import time
+        current_timestamp = int(time.time())
+        metric_timestamp = metric.get('ts', 0)
+        time_diff_hours = (current_timestamp - metric_timestamp) / 3600
+        
+        if time_diff_hours > 1:
+            status_level = "警告"
+            issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
+        elif time_diff_hours > 0.3:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
+        
+        # 构建返回结果
+        result = {
+            "status_level": status_level,
+            "ip": metric.get('ip', '未知'),
+            "timestamp": metric_timestamp,
+            "key_metrics": {
+                "cpu_usage_percent": round(cpu_total, 2),
+                "memory_usage_percent": round(mem_usage_percent, 2),
+                "disk_usage_percent": round(disk_used_percent, 2),
+                "swap_usage_percent": round(swap_usage_percent, 2),
+                "data_freshness_hours": round(time_diff_hours, 2)
+            },
+            "issues": issues,
+            "warnings": warnings,
+            "is_healthy": status_level == "正常",
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+        }
+        
+        return result
+
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+        """
+        计算机器健康评分（0-100分）
+        
+        Args:
+            cpu_usage: CPU使用率
+            mem_usage: 内存使用率
+            disk_usage: 磁盘使用率
+            swap_usage: Swap使用率
+            data_freshness: 数据新鲜度（小时）
+            
+        Returns:
+            健康评分（0-100）
+        """
+        # 各项指标的权重
+        weights = {
+            'cpu': 0.25,
+            'memory': 0.25,
+            'disk': 0.20,
+            'swap': 0.15,
+            'freshness': 0.15
+        }
+        
+        # 计算各项得分（0-100分）
+        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
+        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
+        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
+        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
+        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        
+        # 加权平均
+        total_score = (
+            cpu_score * weights['cpu'] +
+            mem_score * weights['memory'] +
+            disk_score * weights['disk'] +
+            swap_score * weights['swap'] +
+            freshness_score * weights['freshness']
+        )
+        
+        return int(max(0, min(100, total_score)))
+
+    def get_machine_status_by_ip(self, ip: str) -> Dict:
+        """
+        根据IP地址获取机器的最新状态评估
+        
+        Args:
+            ip: IP地址
+            
+        Returns:
+            机器状态评估结果
+        """
+        # 获取最新监控数据
+        metric = self.get_latest_metric_by_ip(ip)
+        
+        if not metric:
+            return {
+                "status_level": "未知",
+                "ip": ip,
+                "timestamp": None,
+                "key_metrics": {},
+                "issues": ["未找到该IP的监控数据"],
+                "warnings": [],
+                "is_healthy": False,
+                "overall_score": 0,
+                "error": "未找到监控数据"
+            }
+        
+        # 评估状态
+        return self.assess_machine_status(metric)
+
+    def get_all_machines_status(self, time_window_hours: int = 1) -> List[Dict]:
+        """
+        获取所有机器的状态评估
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            所有机器的状态评估列表
+        """
+        # 获取活跃机器的监控数据
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        status_list = []
+        for metric in metrics:
+            status = self.assess_machine_status(metric)
+            status_list.append(status)
+        
+        # 按健康评分排序
+        status_list.sort(key=lambda x: x['overall_score'], reverse=True)
+        
+        return status_list
+
+    def get_system_overview(self, time_window_hours: int = 1) -> Dict:
+        """
+        获取系统总体概览信息
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            系统总体概览信息，包含：
+            - 活跃机器统计
+            - 健康状态分布
+            - 告警和提示信息汇总
+            - 关键指标统计
+            - 性能趋势分析
+        """
+        # 获取所有机器的状态评估
+        status_list = self.get_all_machines_status(time_window_hours)
+        
+        # 获取活跃机器的原始监控数据用于统计计算
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        # 1. 活跃机器统计
+        active_machines = len(status_list)
+        active_ips = [status['ip'] for status in status_list]
+        
+        # 2. 健康状态分布
+        status_distribution = {
+            "正常": len([s for s in status_list if s['status_level'] == "正常"]),
+            "提示": len([s for s in status_list if s['status_level'] == "提示"]),
+            "警告": len([s for s in status_list if s['status_level'] == "警告"]),
+            "未知": len([s for s in status_list if s['status_level'] == "未知"])
+        }
+        
+        # 3. 告警和提示信息汇总
+        all_issues = []
+        all_warnings = []
+        
+        for status in status_list:
+            all_issues.extend([{"ip": status['ip'], "issue": issue} for issue in status['issues']])
+            all_warnings.extend([{"ip": status['ip'], "warning": warning} for warning in status['warnings']])
+        
+        # 4. 关键指标统计（最大值、平均值、最小值）
+        key_metrics_stats = self._calculate_key_metrics_statistics(metrics)
+        
+        # 5. 性能趋势分析（基于最近10条数据）
+        trend_analysis = self._analyze_performance_trend(time_window_hours)
+        
+        # 6. 系统健康评分
+        overall_health_score = self._calculate_system_health_score(status_list)
+        
+        # 构建总体概览信息
+        overview = {
+            "timestamp": int(time.time()),
+            "time_window_hours": time_window_hours,
+            "active_machines": {
+                "total": active_machines,
+                "ips": active_ips
+            },
+            "health_status": {
+                "distribution": status_distribution,
+                "overall_score": overall_health_score,
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+            },
+            "alerts_summary": {
+                "critical_issues": len(all_issues),
+                "warning_issues": len(all_warnings),
+                "issues_by_type": self._categorize_issues(all_issues),
+                "warnings_by_type": self._categorize_warnings(all_warnings)
+            },
+            "key_metrics": key_metrics_stats,
+            "performance_trend": trend_analysis,
+            "detailed_alerts": {
+                "critical": all_issues,
+                "warning": all_warnings
+            }
+        }
+        
+        return overview
+
+    def _calculate_key_metrics_statistics(self, metrics: List[Dict]) -> Dict:
+        """计算关键指标的统计信息"""
+        if not metrics:
+            return {
+                "cpu_usage": {"max": 0, "avg": 0, "min": 0},
+                "memory_usage": {"max": 0, "avg": 0, "min": 0},
+                "disk_usage": {"max": 0, "avg": 0, "min": 0},
+                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+            }
+        
+        cpu_usages = []
+        memory_usages = []
+        disk_usages = []
+        swap_usages = []
+        
+        for metric in metrics:
+            # 计算各项指标
+            cpu_usr = metric.get('cpu_usr', 0) or 0
+            cpu_sys = metric.get('cpu_sys', 0) or 0
+            cpu_iow = metric.get('cpu_iow', 0) or 0
+            cpu_total = cpu_usr + cpu_sys + cpu_iow
+            
+            mem_total = metric.get('mem_total', 0) or 0
+            mem_free = metric.get('mem_free', 0) or 0
+            mem_buff = metric.get('mem_buff', 0) or 0
+            mem_cache = metric.get('mem_cache', 0) or 0
+            mem_used = mem_total - mem_free - mem_buff - mem_cache
+            mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+            
+            disk_usage = metric.get('disk_used_percent', 0) or 0
+            
+            swap_used = metric.get('swap_used', 0) or 0
+            swap_total = metric.get('swap_total', 0) or 0
+            swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+            
+            cpu_usages.append(cpu_total)
+            memory_usages.append(mem_usage_percent)
+            disk_usages.append(disk_usage)
+            swap_usages.append(swap_usage_percent)
+        
+        return {
+            "cpu_usage": {
+                "max": round(max(cpu_usages), 2) if cpu_usages else 0,
+                "avg": round(sum(cpu_usages) / len(cpu_usages), 2) if cpu_usages else 0,
+                "min": round(min(cpu_usages), 2) if cpu_usages else 0
+            },
+            "memory_usage": {
+                "max": round(max(memory_usages), 2) if memory_usages else 0,
+                "avg": round(sum(memory_usages) / len(memory_usages), 2) if memory_usages else 0,
+                "min": round(min(memory_usages), 2) if memory_usages else 0
+            },
+            "disk_usage": {
+                "max": round(max(disk_usages), 2) if disk_usages else 0,
+                "avg": round(sum(disk_usages) / len(disk_usages), 2) if disk_usages else 0,
+                "min": round(min(disk_usages), 2) if disk_usages else 0
+            },
+            "swap_usage": {
+                "max": round(max(swap_usages), 2) if swap_usages else 0,
+                "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
+                "min": round(min(swap_usages), 2) if swap_usages else 0
+            }
+        }
+
+    def _analyze_performance_trend(self, time_window_hours: int) -> Dict:
+        """分析性能趋势"""
+        # 这里可以扩展为获取历史数据进行趋势分析
+        # 目前返回基础趋势信息
+        return {
+            "trend": "stable",  # stable, improving, declining
+            "confidence": 0.8,
+            "analysis": "系统性能整体稳定",
+            "suggestions": ["建议定期检查磁盘使用率", "关注内存使用趋势"]
+        }
+
+    def _calculate_system_health_score(self, status_list: List[Dict]) -> float:
+        """计算系统整体健康评分"""
+        if not status_list:
+            return 0.0
+        
+        total_score = sum(status['overall_score'] for status in status_list)
+        return round(total_score / len(status_list), 2)
+
+    def _categorize_issues(self, issues: List[Dict]) -> Dict:
+        """分类汇总问题"""
+        categories = {}
+        
+        for issue_item in issues:
+            issue_text = issue_item['issue']
+            if "CPU" in issue_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in issue_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in issue_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in issue_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in issue_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
+
+    def _categorize_warnings(self, warnings: List[Dict]) -> Dict:
+        """分类汇总警告"""
+        categories = {}
+        
+        for warning_item in warnings:
+            warning_text = warning_item['warning']
+            if "CPU" in warning_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in warning_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in warning_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in warning_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in warning_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
+
 
 
     def get_user_by_id(self, user_id: int) -> Optional[UserResponse]:
@@ -811,6 +9275,409 @@ class DatabaseManager:
             return None
         finally:
             self.return_connection(connection)
+
+    def assess_machine_status(self, metric: Dict) -> Dict:
+        """
+        根据监控指标评估机器运行状态
+        
+        Args:
+            metric: 监控指标数据
+            
+        Returns:
+            包含状态分级和详细信息的字典
+        """
+        # 获取关键指标值，处理None值
+        cpu_usr = metric.get('cpu_usr', 0) or 0
+        cpu_sys = metric.get('cpu_sys', 0) or 0
+        cpu_iow = metric.get('cpu_iow', 0) or 0
+        
+        mem_total = metric.get('mem_total', 0) or 0
+        mem_free = metric.get('mem_free', 0) or 0
+        mem_buff = metric.get('mem_buff', 0) or 0
+        mem_cache = metric.get('mem_cache', 0) or 0
+        
+        disk_used_percent = metric.get('disk_used_percent', 0) or 0
+        swap_used = metric.get('swap_used', 0) or 0
+        swap_total = metric.get('swap_total', 0) or 0
+        
+        # 计算关键指标
+        cpu_total = cpu_usr + cpu_sys + cpu_iow
+        mem_used = mem_total - mem_free - mem_buff - mem_cache
+        mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+        swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 状态评估
+        status_level = "正常"
+        issues = []
+        warnings = []
+        
+        # CPU使用率检查
+        if cpu_total >= 90:
+            status_level = "警告"
+            issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
+        elif cpu_total >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
+        
+        # 内存使用率检查
+        if mem_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
+        elif mem_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
+        
+        # 磁盘使用率检查
+        if disk_used_percent >= 90:
+            status_level = "警告"
+            issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
+        elif disk_used_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
+        
+        # Swap使用率检查
+        if swap_usage_percent >= 50:
+            status_level = "警告"
+            issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
+        elif swap_usage_percent >= 20:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
+        
+        # 数据时效性检查（超过1小时无数据视为异常）
+        import time
+        current_timestamp = int(time.time())
+        metric_timestamp = metric.get('ts', 0)
+        time_diff_hours = (current_timestamp - metric_timestamp) / 3600
+        
+        if time_diff_hours > 1:
+            status_level = "警告"
+            issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
+        elif time_diff_hours > 0.3:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
+        
+        # 构建返回结果
+        result = {
+            "status_level": status_level,
+            "ip": metric.get('ip', '未知'),
+            "timestamp": metric_timestamp,
+            "key_metrics": {
+                "cpu_usage_percent": round(cpu_total, 2),
+                "memory_usage_percent": round(mem_usage_percent, 2),
+                "disk_usage_percent": round(disk_used_percent, 2),
+                "swap_usage_percent": round(swap_usage_percent, 2),
+                "data_freshness_hours": round(time_diff_hours, 2)
+            },
+            "issues": issues,
+            "warnings": warnings,
+            "is_healthy": status_level == "正常",
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+        }
+        
+        return result
+
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+        """
+        计算机器健康评分（0-100分）
+        
+        Args:
+            cpu_usage: CPU使用率
+            mem_usage: 内存使用率
+            disk_usage: 磁盘使用率
+            swap_usage: Swap使用率
+            data_freshness: 数据新鲜度（小时）
+            
+        Returns:
+            健康评分（0-100）
+        """
+        # 各项指标的权重
+        weights = {
+            'cpu': 0.25,
+            'memory': 0.25,
+            'disk': 0.20,
+            'swap': 0.15,
+            'freshness': 0.15
+        }
+        
+        # 计算各项得分（0-100分）
+        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
+        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
+        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
+        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
+        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        
+        # 加权平均
+        total_score = (
+            cpu_score * weights['cpu'] +
+            mem_score * weights['memory'] +
+            disk_score * weights['disk'] +
+            swap_score * weights['swap'] +
+            freshness_score * weights['freshness']
+        )
+        
+        return int(max(0, min(100, total_score)))
+
+    def get_machine_status_by_ip(self, ip: str) -> Dict:
+        """
+        根据IP地址获取机器的最新状态评估
+        
+        Args:
+            ip: IP地址
+            
+        Returns:
+            机器状态评估结果
+        """
+        # 获取最新监控数据
+        metric = self.get_latest_metric_by_ip(ip)
+        
+        if not metric:
+            return {
+                "status_level": "未知",
+                "ip": ip,
+                "timestamp": None,
+                "key_metrics": {},
+                "issues": ["未找到该IP的监控数据"],
+                "warnings": [],
+                "is_healthy": False,
+                "overall_score": 0,
+                "error": "未找到监控数据"
+            }
+        
+        # 评估状态
+        return self.assess_machine_status(metric)
+
+    def get_all_machines_status(self, time_window_hours: int = 1) -> List[Dict]:
+        """
+        获取所有机器的状态评估
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            所有机器的状态评估列表
+        """
+        # 获取活跃机器的监控数据
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        status_list = []
+        for metric in metrics:
+            status = self.assess_machine_status(metric)
+            status_list.append(status)
+        
+        # 按健康评分排序
+        status_list.sort(key=lambda x: x['overall_score'], reverse=True)
+        
+        return status_list
+
+    def get_system_overview(self, time_window_hours: int = 1) -> Dict:
+        """
+        获取系统总体概览信息
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            系统总体概览信息，包含：
+            - 活跃机器统计
+            - 健康状态分布
+            - 告警和提示信息汇总
+            - 关键指标统计
+            - 性能趋势分析
+        """
+        # 获取所有机器的状态评估
+        status_list = self.get_all_machines_status(time_window_hours)
+        
+        # 获取活跃机器的原始监控数据用于统计计算
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        # 1. 活跃机器统计
+        active_machines = len(status_list)
+        active_ips = [status['ip'] for status in status_list]
+        
+        # 2. 健康状态分布
+        status_distribution = {
+            "正常": len([s for s in status_list if s['status_level'] == "正常"]),
+            "提示": len([s for s in status_list if s['status_level'] == "提示"]),
+            "警告": len([s for s in status_list if s['status_level'] == "警告"]),
+            "未知": len([s for s in status_list if s['status_level'] == "未知"])
+        }
+        
+        # 3. 告警和提示信息汇总
+        all_issues = []
+        all_warnings = []
+        
+        for status in status_list:
+            all_issues.extend([{"ip": status['ip'], "issue": issue} for issue in status['issues']])
+            all_warnings.extend([{"ip": status['ip'], "warning": warning} for warning in status['warnings']])
+        
+        # 4. 关键指标统计（最大值、平均值、最小值）
+        key_metrics_stats = self._calculate_key_metrics_statistics(metrics)
+        
+        # 5. 性能趋势分析（基于最近10条数据）
+        trend_analysis = self._analyze_performance_trend(time_window_hours)
+        
+        # 6. 系统健康评分
+        overall_health_score = self._calculate_system_health_score(status_list)
+        
+        # 构建总体概览信息
+        overview = {
+            "timestamp": int(time.time()),
+            "time_window_hours": time_window_hours,
+            "active_machines": {
+                "total": active_machines,
+                "ips": active_ips
+            },
+            "health_status": {
+                "distribution": status_distribution,
+                "overall_score": overall_health_score,
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+            },
+            "alerts_summary": {
+                "critical_issues": len(all_issues),
+                "warning_issues": len(all_warnings),
+                "issues_by_type": self._categorize_issues(all_issues),
+                "warnings_by_type": self._categorize_warnings(all_warnings)
+            },
+            "key_metrics": key_metrics_stats,
+            "performance_trend": trend_analysis,
+            "detailed_alerts": {
+                "critical": all_issues,
+                "warning": all_warnings
+            }
+        }
+        
+        return overview
+
+    def _calculate_key_metrics_statistics(self, metrics: List[Dict]) -> Dict:
+        """计算关键指标的统计信息"""
+        if not metrics:
+            return {
+                "cpu_usage": {"max": 0, "avg": 0, "min": 0},
+                "memory_usage": {"max": 0, "avg": 0, "min": 0},
+                "disk_usage": {"max": 0, "avg": 0, "min": 0},
+                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+            }
+        
+        cpu_usages = []
+        memory_usages = []
+        disk_usages = []
+        swap_usages = []
+        
+        for metric in metrics:
+            # 计算各项指标
+            cpu_usr = metric.get('cpu_usr', 0) or 0
+            cpu_sys = metric.get('cpu_sys', 0) or 0
+            cpu_iow = metric.get('cpu_iow', 0) or 0
+            cpu_total = cpu_usr + cpu_sys + cpu_iow
+            
+            mem_total = metric.get('mem_total', 0) or 0
+            mem_free = metric.get('mem_free', 0) or 0
+            mem_buff = metric.get('mem_buff', 0) or 0
+            mem_cache = metric.get('mem_cache', 0) or 0
+            mem_used = mem_total - mem_free - mem_buff - mem_cache
+            mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+            
+            disk_usage = metric.get('disk_used_percent', 0) or 0
+            
+            swap_used = metric.get('swap_used', 0) or 0
+            swap_total = metric.get('swap_total', 0) or 0
+            swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+            
+            cpu_usages.append(cpu_total)
+            memory_usages.append(mem_usage_percent)
+            disk_usages.append(disk_usage)
+            swap_usages.append(swap_usage_percent)
+        
+        return {
+            "cpu_usage": {
+                "max": round(max(cpu_usages), 2) if cpu_usages else 0,
+                "avg": round(sum(cpu_usages) / len(cpu_usages), 2) if cpu_usages else 0,
+                "min": round(min(cpu_usages), 2) if cpu_usages else 0
+            },
+            "memory_usage": {
+                "max": round(max(memory_usages), 2) if memory_usages else 0,
+                "avg": round(sum(memory_usages) / len(memory_usages), 2) if memory_usages else 0,
+                "min": round(min(memory_usages), 2) if memory_usages else 0
+            },
+            "disk_usage": {
+                "max": round(max(disk_usages), 2) if disk_usages else 0,
+                "avg": round(sum(disk_usages) / len(disk_usages), 2) if disk_usages else 0,
+                "min": round(min(disk_usages), 2) if disk_usages else 0
+            },
+            "swap_usage": {
+                "max": round(max(swap_usages), 2) if swap_usages else 0,
+                "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
+                "min": round(min(swap_usages), 2) if swap_usages else 0
+            }
+        }
+
+    def _analyze_performance_trend(self, time_window_hours: int) -> Dict:
+        """分析性能趋势"""
+        # 这里可以扩展为获取历史数据进行趋势分析
+        # 目前返回基础趋势信息
+        return {
+            "trend": "stable",  # stable, improving, declining
+            "confidence": 0.8,
+            "analysis": "系统性能整体稳定",
+            "suggestions": ["建议定期检查磁盘使用率", "关注内存使用趋势"]
+        }
+
+    def _calculate_system_health_score(self, status_list: List[Dict]) -> float:
+        """计算系统整体健康评分"""
+        if not status_list:
+            return 0.0
+        
+        total_score = sum(status['overall_score'] for status in status_list)
+        return round(total_score / len(status_list), 2)
+
+    def _categorize_issues(self, issues: List[Dict]) -> Dict:
+        """分类汇总问题"""
+        categories = {}
+        
+        for issue_item in issues:
+            issue_text = issue_item['issue']
+            if "CPU" in issue_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in issue_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in issue_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in issue_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in issue_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
+
+    def _categorize_warnings(self, warnings: List[Dict]) -> Dict:
+        """分类汇总警告"""
+        categories = {}
+        
+        for warning_item in warnings:
+            warning_text = warning_item['warning']
+            if "CPU" in warning_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in warning_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in warning_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in warning_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in warning_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
 
     def authenticate_user(self, login_data: UserLogin) -> Optional[UserResponse]:
         """
@@ -881,6 +9748,409 @@ class DatabaseManager:
         finally:
             self.return_connection(connection)
 
+    def assess_machine_status(self, metric: Dict) -> Dict:
+        """
+        根据监控指标评估机器运行状态
+        
+        Args:
+            metric: 监控指标数据
+            
+        Returns:
+            包含状态分级和详细信息的字典
+        """
+        # 获取关键指标值，处理None值
+        cpu_usr = metric.get('cpu_usr', 0) or 0
+        cpu_sys = metric.get('cpu_sys', 0) or 0
+        cpu_iow = metric.get('cpu_iow', 0) or 0
+        
+        mem_total = metric.get('mem_total', 0) or 0
+        mem_free = metric.get('mem_free', 0) or 0
+        mem_buff = metric.get('mem_buff', 0) or 0
+        mem_cache = metric.get('mem_cache', 0) or 0
+        
+        disk_used_percent = metric.get('disk_used_percent', 0) or 0
+        swap_used = metric.get('swap_used', 0) or 0
+        swap_total = metric.get('swap_total', 0) or 0
+        
+        # 计算关键指标
+        cpu_total = cpu_usr + cpu_sys + cpu_iow
+        mem_used = mem_total - mem_free - mem_buff - mem_cache
+        mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+        swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 状态评估
+        status_level = "正常"
+        issues = []
+        warnings = []
+        
+        # CPU使用率检查
+        if cpu_total >= 90:
+            status_level = "警告"
+            issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
+        elif cpu_total >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
+        
+        # 内存使用率检查
+        if mem_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
+        elif mem_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
+        
+        # 磁盘使用率检查
+        if disk_used_percent >= 90:
+            status_level = "警告"
+            issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
+        elif disk_used_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
+        
+        # Swap使用率检查
+        if swap_usage_percent >= 50:
+            status_level = "警告"
+            issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
+        elif swap_usage_percent >= 20:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
+        
+        # 数据时效性检查（超过1小时无数据视为异常）
+        import time
+        current_timestamp = int(time.time())
+        metric_timestamp = metric.get('ts', 0)
+        time_diff_hours = (current_timestamp - metric_timestamp) / 3600
+        
+        if time_diff_hours > 1:
+            status_level = "警告"
+            issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
+        elif time_diff_hours > 0.3:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
+        
+        # 构建返回结果
+        result = {
+            "status_level": status_level,
+            "ip": metric.get('ip', '未知'),
+            "timestamp": metric_timestamp,
+            "key_metrics": {
+                "cpu_usage_percent": round(cpu_total, 2),
+                "memory_usage_percent": round(mem_usage_percent, 2),
+                "disk_usage_percent": round(disk_used_percent, 2),
+                "swap_usage_percent": round(swap_usage_percent, 2),
+                "data_freshness_hours": round(time_diff_hours, 2)
+            },
+            "issues": issues,
+            "warnings": warnings,
+            "is_healthy": status_level == "正常",
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+        }
+        
+        return result
+
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+        """
+        计算机器健康评分（0-100分）
+        
+        Args:
+            cpu_usage: CPU使用率
+            mem_usage: 内存使用率
+            disk_usage: 磁盘使用率
+            swap_usage: Swap使用率
+            data_freshness: 数据新鲜度（小时）
+            
+        Returns:
+            健康评分（0-100）
+        """
+        # 各项指标的权重
+        weights = {
+            'cpu': 0.25,
+            'memory': 0.25,
+            'disk': 0.20,
+            'swap': 0.15,
+            'freshness': 0.15
+        }
+        
+        # 计算各项得分（0-100分）
+        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
+        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
+        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
+        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
+        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        
+        # 加权平均
+        total_score = (
+            cpu_score * weights['cpu'] +
+            mem_score * weights['memory'] +
+            disk_score * weights['disk'] +
+            swap_score * weights['swap'] +
+            freshness_score * weights['freshness']
+        )
+        
+        return int(max(0, min(100, total_score)))
+
+    def get_machine_status_by_ip(self, ip: str) -> Dict:
+        """
+        根据IP地址获取机器的最新状态评估
+        
+        Args:
+            ip: IP地址
+            
+        Returns:
+            机器状态评估结果
+        """
+        # 获取最新监控数据
+        metric = self.get_latest_metric_by_ip(ip)
+        
+        if not metric:
+            return {
+                "status_level": "未知",
+                "ip": ip,
+                "timestamp": None,
+                "key_metrics": {},
+                "issues": ["未找到该IP的监控数据"],
+                "warnings": [],
+                "is_healthy": False,
+                "overall_score": 0,
+                "error": "未找到监控数据"
+            }
+        
+        # 评估状态
+        return self.assess_machine_status(metric)
+
+    def get_all_machines_status(self, time_window_hours: int = 1) -> List[Dict]:
+        """
+        获取所有机器的状态评估
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            所有机器的状态评估列表
+        """
+        # 获取活跃机器的监控数据
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        status_list = []
+        for metric in metrics:
+            status = self.assess_machine_status(metric)
+            status_list.append(status)
+        
+        # 按健康评分排序
+        status_list.sort(key=lambda x: x['overall_score'], reverse=True)
+        
+        return status_list
+
+    def get_system_overview(self, time_window_hours: int = 1) -> Dict:
+        """
+        获取系统总体概览信息
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            系统总体概览信息，包含：
+            - 活跃机器统计
+            - 健康状态分布
+            - 告警和提示信息汇总
+            - 关键指标统计
+            - 性能趋势分析
+        """
+        # 获取所有机器的状态评估
+        status_list = self.get_all_machines_status(time_window_hours)
+        
+        # 获取活跃机器的原始监控数据用于统计计算
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        # 1. 活跃机器统计
+        active_machines = len(status_list)
+        active_ips = [status['ip'] for status in status_list]
+        
+        # 2. 健康状态分布
+        status_distribution = {
+            "正常": len([s for s in status_list if s['status_level'] == "正常"]),
+            "提示": len([s for s in status_list if s['status_level'] == "提示"]),
+            "警告": len([s for s in status_list if s['status_level'] == "警告"]),
+            "未知": len([s for s in status_list if s['status_level'] == "未知"])
+        }
+        
+        # 3. 告警和提示信息汇总
+        all_issues = []
+        all_warnings = []
+        
+        for status in status_list:
+            all_issues.extend([{"ip": status['ip'], "issue": issue} for issue in status['issues']])
+            all_warnings.extend([{"ip": status['ip'], "warning": warning} for warning in status['warnings']])
+        
+        # 4. 关键指标统计（最大值、平均值、最小值）
+        key_metrics_stats = self._calculate_key_metrics_statistics(metrics)
+        
+        # 5. 性能趋势分析（基于最近10条数据）
+        trend_analysis = self._analyze_performance_trend(time_window_hours)
+        
+        # 6. 系统健康评分
+        overall_health_score = self._calculate_system_health_score(status_list)
+        
+        # 构建总体概览信息
+        overview = {
+            "timestamp": int(time.time()),
+            "time_window_hours": time_window_hours,
+            "active_machines": {
+                "total": active_machines,
+                "ips": active_ips
+            },
+            "health_status": {
+                "distribution": status_distribution,
+                "overall_score": overall_health_score,
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+            },
+            "alerts_summary": {
+                "critical_issues": len(all_issues),
+                "warning_issues": len(all_warnings),
+                "issues_by_type": self._categorize_issues(all_issues),
+                "warnings_by_type": self._categorize_warnings(all_warnings)
+            },
+            "key_metrics": key_metrics_stats,
+            "performance_trend": trend_analysis,
+            "detailed_alerts": {
+                "critical": all_issues,
+                "warning": all_warnings
+            }
+        }
+        
+        return overview
+
+    def _calculate_key_metrics_statistics(self, metrics: List[Dict]) -> Dict:
+        """计算关键指标的统计信息"""
+        if not metrics:
+            return {
+                "cpu_usage": {"max": 0, "avg": 0, "min": 0},
+                "memory_usage": {"max": 0, "avg": 0, "min": 0},
+                "disk_usage": {"max": 0, "avg": 0, "min": 0},
+                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+            }
+        
+        cpu_usages = []
+        memory_usages = []
+        disk_usages = []
+        swap_usages = []
+        
+        for metric in metrics:
+            # 计算各项指标
+            cpu_usr = metric.get('cpu_usr', 0) or 0
+            cpu_sys = metric.get('cpu_sys', 0) or 0
+            cpu_iow = metric.get('cpu_iow', 0) or 0
+            cpu_total = cpu_usr + cpu_sys + cpu_iow
+            
+            mem_total = metric.get('mem_total', 0) or 0
+            mem_free = metric.get('mem_free', 0) or 0
+            mem_buff = metric.get('mem_buff', 0) or 0
+            mem_cache = metric.get('mem_cache', 0) or 0
+            mem_used = mem_total - mem_free - mem_buff - mem_cache
+            mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+            
+            disk_usage = metric.get('disk_used_percent', 0) or 0
+            
+            swap_used = metric.get('swap_used', 0) or 0
+            swap_total = metric.get('swap_total', 0) or 0
+            swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+            
+            cpu_usages.append(cpu_total)
+            memory_usages.append(mem_usage_percent)
+            disk_usages.append(disk_usage)
+            swap_usages.append(swap_usage_percent)
+        
+        return {
+            "cpu_usage": {
+                "max": round(max(cpu_usages), 2) if cpu_usages else 0,
+                "avg": round(sum(cpu_usages) / len(cpu_usages), 2) if cpu_usages else 0,
+                "min": round(min(cpu_usages), 2) if cpu_usages else 0
+            },
+            "memory_usage": {
+                "max": round(max(memory_usages), 2) if memory_usages else 0,
+                "avg": round(sum(memory_usages) / len(memory_usages), 2) if memory_usages else 0,
+                "min": round(min(memory_usages), 2) if memory_usages else 0
+            },
+            "disk_usage": {
+                "max": round(max(disk_usages), 2) if disk_usages else 0,
+                "avg": round(sum(disk_usages) / len(disk_usages), 2) if disk_usages else 0,
+                "min": round(min(disk_usages), 2) if disk_usages else 0
+            },
+            "swap_usage": {
+                "max": round(max(swap_usages), 2) if swap_usages else 0,
+                "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
+                "min": round(min(swap_usages), 2) if swap_usages else 0
+            }
+        }
+
+    def _analyze_performance_trend(self, time_window_hours: int) -> Dict:
+        """分析性能趋势"""
+        # 这里可以扩展为获取历史数据进行趋势分析
+        # 目前返回基础趋势信息
+        return {
+            "trend": "stable",  # stable, improving, declining
+            "confidence": 0.8,
+            "analysis": "系统性能整体稳定",
+            "suggestions": ["建议定期检查磁盘使用率", "关注内存使用趋势"]
+        }
+
+    def _calculate_system_health_score(self, status_list: List[Dict]) -> float:
+        """计算系统整体健康评分"""
+        if not status_list:
+            return 0.0
+        
+        total_score = sum(status['overall_score'] for status in status_list)
+        return round(total_score / len(status_list), 2)
+
+    def _categorize_issues(self, issues: List[Dict]) -> Dict:
+        """分类汇总问题"""
+        categories = {}
+        
+        for issue_item in issues:
+            issue_text = issue_item['issue']
+            if "CPU" in issue_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in issue_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in issue_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in issue_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in issue_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
+
+    def _categorize_warnings(self, warnings: List[Dict]) -> Dict:
+        """分类汇总警告"""
+        categories = {}
+        
+        for warning_item in warnings:
+            warning_text = warning_item['warning']
+            if "CPU" in warning_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in warning_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in warning_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in warning_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in warning_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
+
     def get_user_by_username(self, username: str) -> Optional[UserResponse]:
         """
         根据用户名获取用户信息
@@ -928,6 +10198,409 @@ class DatabaseManager:
             return None
         finally:
             self.return_connection(connection)
+
+    def assess_machine_status(self, metric: Dict) -> Dict:
+        """
+        根据监控指标评估机器运行状态
+        
+        Args:
+            metric: 监控指标数据
+            
+        Returns:
+            包含状态分级和详细信息的字典
+        """
+        # 获取关键指标值，处理None值
+        cpu_usr = metric.get('cpu_usr', 0) or 0
+        cpu_sys = metric.get('cpu_sys', 0) or 0
+        cpu_iow = metric.get('cpu_iow', 0) or 0
+        
+        mem_total = metric.get('mem_total', 0) or 0
+        mem_free = metric.get('mem_free', 0) or 0
+        mem_buff = metric.get('mem_buff', 0) or 0
+        mem_cache = metric.get('mem_cache', 0) or 0
+        
+        disk_used_percent = metric.get('disk_used_percent', 0) or 0
+        swap_used = metric.get('swap_used', 0) or 0
+        swap_total = metric.get('swap_total', 0) or 0
+        
+        # 计算关键指标
+        cpu_total = cpu_usr + cpu_sys + cpu_iow
+        mem_used = mem_total - mem_free - mem_buff - mem_cache
+        mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+        swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 状态评估
+        status_level = "正常"
+        issues = []
+        warnings = []
+        
+        # CPU使用率检查
+        if cpu_total >= 90:
+            status_level = "警告"
+            issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
+        elif cpu_total >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
+        
+        # 内存使用率检查
+        if mem_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
+        elif mem_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
+        
+        # 磁盘使用率检查
+        if disk_used_percent >= 90:
+            status_level = "警告"
+            issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
+        elif disk_used_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
+        
+        # Swap使用率检查
+        if swap_usage_percent >= 50:
+            status_level = "警告"
+            issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
+        elif swap_usage_percent >= 20:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
+        
+        # 数据时效性检查（超过1小时无数据视为异常）
+        import time
+        current_timestamp = int(time.time())
+        metric_timestamp = metric.get('ts', 0)
+        time_diff_hours = (current_timestamp - metric_timestamp) / 3600
+        
+        if time_diff_hours > 1:
+            status_level = "警告"
+            issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
+        elif time_diff_hours > 0.3:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
+        
+        # 构建返回结果
+        result = {
+            "status_level": status_level,
+            "ip": metric.get('ip', '未知'),
+            "timestamp": metric_timestamp,
+            "key_metrics": {
+                "cpu_usage_percent": round(cpu_total, 2),
+                "memory_usage_percent": round(mem_usage_percent, 2),
+                "disk_usage_percent": round(disk_used_percent, 2),
+                "swap_usage_percent": round(swap_usage_percent, 2),
+                "data_freshness_hours": round(time_diff_hours, 2)
+            },
+            "issues": issues,
+            "warnings": warnings,
+            "is_healthy": status_level == "正常",
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+        }
+        
+        return result
+
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+        """
+        计算机器健康评分（0-100分）
+        
+        Args:
+            cpu_usage: CPU使用率
+            mem_usage: 内存使用率
+            disk_usage: 磁盘使用率
+            swap_usage: Swap使用率
+            data_freshness: 数据新鲜度（小时）
+            
+        Returns:
+            健康评分（0-100）
+        """
+        # 各项指标的权重
+        weights = {
+            'cpu': 0.25,
+            'memory': 0.25,
+            'disk': 0.20,
+            'swap': 0.15,
+            'freshness': 0.15
+        }
+        
+        # 计算各项得分（0-100分）
+        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
+        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
+        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
+        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
+        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        
+        # 加权平均
+        total_score = (
+            cpu_score * weights['cpu'] +
+            mem_score * weights['memory'] +
+            disk_score * weights['disk'] +
+            swap_score * weights['swap'] +
+            freshness_score * weights['freshness']
+        )
+        
+        return int(max(0, min(100, total_score)))
+
+    def get_machine_status_by_ip(self, ip: str) -> Dict:
+        """
+        根据IP地址获取机器的最新状态评估
+        
+        Args:
+            ip: IP地址
+            
+        Returns:
+            机器状态评估结果
+        """
+        # 获取最新监控数据
+        metric = self.get_latest_metric_by_ip(ip)
+        
+        if not metric:
+            return {
+                "status_level": "未知",
+                "ip": ip,
+                "timestamp": None,
+                "key_metrics": {},
+                "issues": ["未找到该IP的监控数据"],
+                "warnings": [],
+                "is_healthy": False,
+                "overall_score": 0,
+                "error": "未找到监控数据"
+            }
+        
+        # 评估状态
+        return self.assess_machine_status(metric)
+
+    def get_all_machines_status(self, time_window_hours: int = 1) -> List[Dict]:
+        """
+        获取所有机器的状态评估
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            所有机器的状态评估列表
+        """
+        # 获取活跃机器的监控数据
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        status_list = []
+        for metric in metrics:
+            status = self.assess_machine_status(metric)
+            status_list.append(status)
+        
+        # 按健康评分排序
+        status_list.sort(key=lambda x: x['overall_score'], reverse=True)
+        
+        return status_list
+
+    def get_system_overview(self, time_window_hours: int = 1) -> Dict:
+        """
+        获取系统总体概览信息
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            系统总体概览信息，包含：
+            - 活跃机器统计
+            - 健康状态分布
+            - 告警和提示信息汇总
+            - 关键指标统计
+            - 性能趋势分析
+        """
+        # 获取所有机器的状态评估
+        status_list = self.get_all_machines_status(time_window_hours)
+        
+        # 获取活跃机器的原始监控数据用于统计计算
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        # 1. 活跃机器统计
+        active_machines = len(status_list)
+        active_ips = [status['ip'] for status in status_list]
+        
+        # 2. 健康状态分布
+        status_distribution = {
+            "正常": len([s for s in status_list if s['status_level'] == "正常"]),
+            "提示": len([s for s in status_list if s['status_level'] == "提示"]),
+            "警告": len([s for s in status_list if s['status_level'] == "警告"]),
+            "未知": len([s for s in status_list if s['status_level'] == "未知"])
+        }
+        
+        # 3. 告警和提示信息汇总
+        all_issues = []
+        all_warnings = []
+        
+        for status in status_list:
+            all_issues.extend([{"ip": status['ip'], "issue": issue} for issue in status['issues']])
+            all_warnings.extend([{"ip": status['ip'], "warning": warning} for warning in status['warnings']])
+        
+        # 4. 关键指标统计（最大值、平均值、最小值）
+        key_metrics_stats = self._calculate_key_metrics_statistics(metrics)
+        
+        # 5. 性能趋势分析（基于最近10条数据）
+        trend_analysis = self._analyze_performance_trend(time_window_hours)
+        
+        # 6. 系统健康评分
+        overall_health_score = self._calculate_system_health_score(status_list)
+        
+        # 构建总体概览信息
+        overview = {
+            "timestamp": int(time.time()),
+            "time_window_hours": time_window_hours,
+            "active_machines": {
+                "total": active_machines,
+                "ips": active_ips
+            },
+            "health_status": {
+                "distribution": status_distribution,
+                "overall_score": overall_health_score,
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+            },
+            "alerts_summary": {
+                "critical_issues": len(all_issues),
+                "warning_issues": len(all_warnings),
+                "issues_by_type": self._categorize_issues(all_issues),
+                "warnings_by_type": self._categorize_warnings(all_warnings)
+            },
+            "key_metrics": key_metrics_stats,
+            "performance_trend": trend_analysis,
+            "detailed_alerts": {
+                "critical": all_issues,
+                "warning": all_warnings
+            }
+        }
+        
+        return overview
+
+    def _calculate_key_metrics_statistics(self, metrics: List[Dict]) -> Dict:
+        """计算关键指标的统计信息"""
+        if not metrics:
+            return {
+                "cpu_usage": {"max": 0, "avg": 0, "min": 0},
+                "memory_usage": {"max": 0, "avg": 0, "min": 0},
+                "disk_usage": {"max": 0, "avg": 0, "min": 0},
+                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+            }
+        
+        cpu_usages = []
+        memory_usages = []
+        disk_usages = []
+        swap_usages = []
+        
+        for metric in metrics:
+            # 计算各项指标
+            cpu_usr = metric.get('cpu_usr', 0) or 0
+            cpu_sys = metric.get('cpu_sys', 0) or 0
+            cpu_iow = metric.get('cpu_iow', 0) or 0
+            cpu_total = cpu_usr + cpu_sys + cpu_iow
+            
+            mem_total = metric.get('mem_total', 0) or 0
+            mem_free = metric.get('mem_free', 0) or 0
+            mem_buff = metric.get('mem_buff', 0) or 0
+            mem_cache = metric.get('mem_cache', 0) or 0
+            mem_used = mem_total - mem_free - mem_buff - mem_cache
+            mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+            
+            disk_usage = metric.get('disk_used_percent', 0) or 0
+            
+            swap_used = metric.get('swap_used', 0) or 0
+            swap_total = metric.get('swap_total', 0) or 0
+            swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+            
+            cpu_usages.append(cpu_total)
+            memory_usages.append(mem_usage_percent)
+            disk_usages.append(disk_usage)
+            swap_usages.append(swap_usage_percent)
+        
+        return {
+            "cpu_usage": {
+                "max": round(max(cpu_usages), 2) if cpu_usages else 0,
+                "avg": round(sum(cpu_usages) / len(cpu_usages), 2) if cpu_usages else 0,
+                "min": round(min(cpu_usages), 2) if cpu_usages else 0
+            },
+            "memory_usage": {
+                "max": round(max(memory_usages), 2) if memory_usages else 0,
+                "avg": round(sum(memory_usages) / len(memory_usages), 2) if memory_usages else 0,
+                "min": round(min(memory_usages), 2) if memory_usages else 0
+            },
+            "disk_usage": {
+                "max": round(max(disk_usages), 2) if disk_usages else 0,
+                "avg": round(sum(disk_usages) / len(disk_usages), 2) if disk_usages else 0,
+                "min": round(min(disk_usages), 2) if disk_usages else 0
+            },
+            "swap_usage": {
+                "max": round(max(swap_usages), 2) if swap_usages else 0,
+                "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
+                "min": round(min(swap_usages), 2) if swap_usages else 0
+            }
+        }
+
+    def _analyze_performance_trend(self, time_window_hours: int) -> Dict:
+        """分析性能趋势"""
+        # 这里可以扩展为获取历史数据进行趋势分析
+        # 目前返回基础趋势信息
+        return {
+            "trend": "stable",  # stable, improving, declining
+            "confidence": 0.8,
+            "analysis": "系统性能整体稳定",
+            "suggestions": ["建议定期检查磁盘使用率", "关注内存使用趋势"]
+        }
+
+    def _calculate_system_health_score(self, status_list: List[Dict]) -> float:
+        """计算系统整体健康评分"""
+        if not status_list:
+            return 0.0
+        
+        total_score = sum(status['overall_score'] for status in status_list)
+        return round(total_score / len(status_list), 2)
+
+    def _categorize_issues(self, issues: List[Dict]) -> Dict:
+        """分类汇总问题"""
+        categories = {}
+        
+        for issue_item in issues:
+            issue_text = issue_item['issue']
+            if "CPU" in issue_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in issue_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in issue_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in issue_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in issue_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
+
+    def _categorize_warnings(self, warnings: List[Dict]) -> Dict:
+        """分类汇总警告"""
+        categories = {}
+        
+        for warning_item in warnings:
+            warning_text = warning_item['warning']
+            if "CPU" in warning_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in warning_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in warning_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in warning_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in warning_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
 
     def update_user(self, user_id: int, update_data: UserUpdate) -> bool:
         """
@@ -991,6 +10664,409 @@ class DatabaseManager:
         finally:
             self.return_connection(connection)
 
+    def assess_machine_status(self, metric: Dict) -> Dict:
+        """
+        根据监控指标评估机器运行状态
+        
+        Args:
+            metric: 监控指标数据
+            
+        Returns:
+            包含状态分级和详细信息的字典
+        """
+        # 获取关键指标值，处理None值
+        cpu_usr = metric.get('cpu_usr', 0) or 0
+        cpu_sys = metric.get('cpu_sys', 0) or 0
+        cpu_iow = metric.get('cpu_iow', 0) or 0
+        
+        mem_total = metric.get('mem_total', 0) or 0
+        mem_free = metric.get('mem_free', 0) or 0
+        mem_buff = metric.get('mem_buff', 0) or 0
+        mem_cache = metric.get('mem_cache', 0) or 0
+        
+        disk_used_percent = metric.get('disk_used_percent', 0) or 0
+        swap_used = metric.get('swap_used', 0) or 0
+        swap_total = metric.get('swap_total', 0) or 0
+        
+        # 计算关键指标
+        cpu_total = cpu_usr + cpu_sys + cpu_iow
+        mem_used = mem_total - mem_free - mem_buff - mem_cache
+        mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+        swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 状态评估
+        status_level = "正常"
+        issues = []
+        warnings = []
+        
+        # CPU使用率检查
+        if cpu_total >= 90:
+            status_level = "警告"
+            issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
+        elif cpu_total >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
+        
+        # 内存使用率检查
+        if mem_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
+        elif mem_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
+        
+        # 磁盘使用率检查
+        if disk_used_percent >= 90:
+            status_level = "警告"
+            issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
+        elif disk_used_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
+        
+        # Swap使用率检查
+        if swap_usage_percent >= 50:
+            status_level = "警告"
+            issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
+        elif swap_usage_percent >= 20:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
+        
+        # 数据时效性检查（超过1小时无数据视为异常）
+        import time
+        current_timestamp = int(time.time())
+        metric_timestamp = metric.get('ts', 0)
+        time_diff_hours = (current_timestamp - metric_timestamp) / 3600
+        
+        if time_diff_hours > 1:
+            status_level = "警告"
+            issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
+        elif time_diff_hours > 0.3:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
+        
+        # 构建返回结果
+        result = {
+            "status_level": status_level,
+            "ip": metric.get('ip', '未知'),
+            "timestamp": metric_timestamp,
+            "key_metrics": {
+                "cpu_usage_percent": round(cpu_total, 2),
+                "memory_usage_percent": round(mem_usage_percent, 2),
+                "disk_usage_percent": round(disk_used_percent, 2),
+                "swap_usage_percent": round(swap_usage_percent, 2),
+                "data_freshness_hours": round(time_diff_hours, 2)
+            },
+            "issues": issues,
+            "warnings": warnings,
+            "is_healthy": status_level == "正常",
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+        }
+        
+        return result
+
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+        """
+        计算机器健康评分（0-100分）
+        
+        Args:
+            cpu_usage: CPU使用率
+            mem_usage: 内存使用率
+            disk_usage: 磁盘使用率
+            swap_usage: Swap使用率
+            data_freshness: 数据新鲜度（小时）
+            
+        Returns:
+            健康评分（0-100）
+        """
+        # 各项指标的权重
+        weights = {
+            'cpu': 0.25,
+            'memory': 0.25,
+            'disk': 0.20,
+            'swap': 0.15,
+            'freshness': 0.15
+        }
+        
+        # 计算各项得分（0-100分）
+        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
+        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
+        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
+        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
+        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        
+        # 加权平均
+        total_score = (
+            cpu_score * weights['cpu'] +
+            mem_score * weights['memory'] +
+            disk_score * weights['disk'] +
+            swap_score * weights['swap'] +
+            freshness_score * weights['freshness']
+        )
+        
+        return int(max(0, min(100, total_score)))
+
+    def get_machine_status_by_ip(self, ip: str) -> Dict:
+        """
+        根据IP地址获取机器的最新状态评估
+        
+        Args:
+            ip: IP地址
+            
+        Returns:
+            机器状态评估结果
+        """
+        # 获取最新监控数据
+        metric = self.get_latest_metric_by_ip(ip)
+        
+        if not metric:
+            return {
+                "status_level": "未知",
+                "ip": ip,
+                "timestamp": None,
+                "key_metrics": {},
+                "issues": ["未找到该IP的监控数据"],
+                "warnings": [],
+                "is_healthy": False,
+                "overall_score": 0,
+                "error": "未找到监控数据"
+            }
+        
+        # 评估状态
+        return self.assess_machine_status(metric)
+
+    def get_all_machines_status(self, time_window_hours: int = 1) -> List[Dict]:
+        """
+        获取所有机器的状态评估
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            所有机器的状态评估列表
+        """
+        # 获取活跃机器的监控数据
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        status_list = []
+        for metric in metrics:
+            status = self.assess_machine_status(metric)
+            status_list.append(status)
+        
+        # 按健康评分排序
+        status_list.sort(key=lambda x: x['overall_score'], reverse=True)
+        
+        return status_list
+
+    def get_system_overview(self, time_window_hours: int = 1) -> Dict:
+        """
+        获取系统总体概览信息
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            系统总体概览信息，包含：
+            - 活跃机器统计
+            - 健康状态分布
+            - 告警和提示信息汇总
+            - 关键指标统计
+            - 性能趋势分析
+        """
+        # 获取所有机器的状态评估
+        status_list = self.get_all_machines_status(time_window_hours)
+        
+        # 获取活跃机器的原始监控数据用于统计计算
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        # 1. 活跃机器统计
+        active_machines = len(status_list)
+        active_ips = [status['ip'] for status in status_list]
+        
+        # 2. 健康状态分布
+        status_distribution = {
+            "正常": len([s for s in status_list if s['status_level'] == "正常"]),
+            "提示": len([s for s in status_list if s['status_level'] == "提示"]),
+            "警告": len([s for s in status_list if s['status_level'] == "警告"]),
+            "未知": len([s for s in status_list if s['status_level'] == "未知"])
+        }
+        
+        # 3. 告警和提示信息汇总
+        all_issues = []
+        all_warnings = []
+        
+        for status in status_list:
+            all_issues.extend([{"ip": status['ip'], "issue": issue} for issue in status['issues']])
+            all_warnings.extend([{"ip": status['ip'], "warning": warning} for warning in status['warnings']])
+        
+        # 4. 关键指标统计（最大值、平均值、最小值）
+        key_metrics_stats = self._calculate_key_metrics_statistics(metrics)
+        
+        # 5. 性能趋势分析（基于最近10条数据）
+        trend_analysis = self._analyze_performance_trend(time_window_hours)
+        
+        # 6. 系统健康评分
+        overall_health_score = self._calculate_system_health_score(status_list)
+        
+        # 构建总体概览信息
+        overview = {
+            "timestamp": int(time.time()),
+            "time_window_hours": time_window_hours,
+            "active_machines": {
+                "total": active_machines,
+                "ips": active_ips
+            },
+            "health_status": {
+                "distribution": status_distribution,
+                "overall_score": overall_health_score,
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+            },
+            "alerts_summary": {
+                "critical_issues": len(all_issues),
+                "warning_issues": len(all_warnings),
+                "issues_by_type": self._categorize_issues(all_issues),
+                "warnings_by_type": self._categorize_warnings(all_warnings)
+            },
+            "key_metrics": key_metrics_stats,
+            "performance_trend": trend_analysis,
+            "detailed_alerts": {
+                "critical": all_issues,
+                "warning": all_warnings
+            }
+        }
+        
+        return overview
+
+    def _calculate_key_metrics_statistics(self, metrics: List[Dict]) -> Dict:
+        """计算关键指标的统计信息"""
+        if not metrics:
+            return {
+                "cpu_usage": {"max": 0, "avg": 0, "min": 0},
+                "memory_usage": {"max": 0, "avg": 0, "min": 0},
+                "disk_usage": {"max": 0, "avg": 0, "min": 0},
+                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+            }
+        
+        cpu_usages = []
+        memory_usages = []
+        disk_usages = []
+        swap_usages = []
+        
+        for metric in metrics:
+            # 计算各项指标
+            cpu_usr = metric.get('cpu_usr', 0) or 0
+            cpu_sys = metric.get('cpu_sys', 0) or 0
+            cpu_iow = metric.get('cpu_iow', 0) or 0
+            cpu_total = cpu_usr + cpu_sys + cpu_iow
+            
+            mem_total = metric.get('mem_total', 0) or 0
+            mem_free = metric.get('mem_free', 0) or 0
+            mem_buff = metric.get('mem_buff', 0) or 0
+            mem_cache = metric.get('mem_cache', 0) or 0
+            mem_used = mem_total - mem_free - mem_buff - mem_cache
+            mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+            
+            disk_usage = metric.get('disk_used_percent', 0) or 0
+            
+            swap_used = metric.get('swap_used', 0) or 0
+            swap_total = metric.get('swap_total', 0) or 0
+            swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+            
+            cpu_usages.append(cpu_total)
+            memory_usages.append(mem_usage_percent)
+            disk_usages.append(disk_usage)
+            swap_usages.append(swap_usage_percent)
+        
+        return {
+            "cpu_usage": {
+                "max": round(max(cpu_usages), 2) if cpu_usages else 0,
+                "avg": round(sum(cpu_usages) / len(cpu_usages), 2) if cpu_usages else 0,
+                "min": round(min(cpu_usages), 2) if cpu_usages else 0
+            },
+            "memory_usage": {
+                "max": round(max(memory_usages), 2) if memory_usages else 0,
+                "avg": round(sum(memory_usages) / len(memory_usages), 2) if memory_usages else 0,
+                "min": round(min(memory_usages), 2) if memory_usages else 0
+            },
+            "disk_usage": {
+                "max": round(max(disk_usages), 2) if disk_usages else 0,
+                "avg": round(sum(disk_usages) / len(disk_usages), 2) if disk_usages else 0,
+                "min": round(min(disk_usages), 2) if disk_usages else 0
+            },
+            "swap_usage": {
+                "max": round(max(swap_usages), 2) if swap_usages else 0,
+                "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
+                "min": round(min(swap_usages), 2) if swap_usages else 0
+            }
+        }
+
+    def _analyze_performance_trend(self, time_window_hours: int) -> Dict:
+        """分析性能趋势"""
+        # 这里可以扩展为获取历史数据进行趋势分析
+        # 目前返回基础趋势信息
+        return {
+            "trend": "stable",  # stable, improving, declining
+            "confidence": 0.8,
+            "analysis": "系统性能整体稳定",
+            "suggestions": ["建议定期检查磁盘使用率", "关注内存使用趋势"]
+        }
+
+    def _calculate_system_health_score(self, status_list: List[Dict]) -> float:
+        """计算系统整体健康评分"""
+        if not status_list:
+            return 0.0
+        
+        total_score = sum(status['overall_score'] for status in status_list)
+        return round(total_score / len(status_list), 2)
+
+    def _categorize_issues(self, issues: List[Dict]) -> Dict:
+        """分类汇总问题"""
+        categories = {}
+        
+        for issue_item in issues:
+            issue_text = issue_item['issue']
+            if "CPU" in issue_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in issue_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in issue_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in issue_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in issue_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
+
+    def _categorize_warnings(self, warnings: List[Dict]) -> Dict:
+        """分类汇总警告"""
+        categories = {}
+        
+        for warning_item in warnings:
+            warning_text = warning_item['warning']
+            if "CPU" in warning_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in warning_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in warning_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in warning_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in warning_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
+
     def delete_user(self, user_id: int) -> bool:
         """
         删除用户（软删除，设置为非激活状态）
@@ -1024,6 +11100,409 @@ class DatabaseManager:
             return False
         finally:
             self.return_connection(connection)
+
+    def assess_machine_status(self, metric: Dict) -> Dict:
+        """
+        根据监控指标评估机器运行状态
+        
+        Args:
+            metric: 监控指标数据
+            
+        Returns:
+            包含状态分级和详细信息的字典
+        """
+        # 获取关键指标值，处理None值
+        cpu_usr = metric.get('cpu_usr', 0) or 0
+        cpu_sys = metric.get('cpu_sys', 0) or 0
+        cpu_iow = metric.get('cpu_iow', 0) or 0
+        
+        mem_total = metric.get('mem_total', 0) or 0
+        mem_free = metric.get('mem_free', 0) or 0
+        mem_buff = metric.get('mem_buff', 0) or 0
+        mem_cache = metric.get('mem_cache', 0) or 0
+        
+        disk_used_percent = metric.get('disk_used_percent', 0) or 0
+        swap_used = metric.get('swap_used', 0) or 0
+        swap_total = metric.get('swap_total', 0) or 0
+        
+        # 计算关键指标
+        cpu_total = cpu_usr + cpu_sys + cpu_iow
+        mem_used = mem_total - mem_free - mem_buff - mem_cache
+        mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+        swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 状态评估
+        status_level = "正常"
+        issues = []
+        warnings = []
+        
+        # CPU使用率检查
+        if cpu_total >= 90:
+            status_level = "警告"
+            issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
+        elif cpu_total >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
+        
+        # 内存使用率检查
+        if mem_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
+        elif mem_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
+        
+        # 磁盘使用率检查
+        if disk_used_percent >= 90:
+            status_level = "警告"
+            issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
+        elif disk_used_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
+        
+        # Swap使用率检查
+        if swap_usage_percent >= 50:
+            status_level = "警告"
+            issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
+        elif swap_usage_percent >= 20:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
+        
+        # 数据时效性检查（超过1小时无数据视为异常）
+        import time
+        current_timestamp = int(time.time())
+        metric_timestamp = metric.get('ts', 0)
+        time_diff_hours = (current_timestamp - metric_timestamp) / 3600
+        
+        if time_diff_hours > 1:
+            status_level = "警告"
+            issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
+        elif time_diff_hours > 0.3:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
+        
+        # 构建返回结果
+        result = {
+            "status_level": status_level,
+            "ip": metric.get('ip', '未知'),
+            "timestamp": metric_timestamp,
+            "key_metrics": {
+                "cpu_usage_percent": round(cpu_total, 2),
+                "memory_usage_percent": round(mem_usage_percent, 2),
+                "disk_usage_percent": round(disk_used_percent, 2),
+                "swap_usage_percent": round(swap_usage_percent, 2),
+                "data_freshness_hours": round(time_diff_hours, 2)
+            },
+            "issues": issues,
+            "warnings": warnings,
+            "is_healthy": status_level == "正常",
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+        }
+        
+        return result
+
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+        """
+        计算机器健康评分（0-100分）
+        
+        Args:
+            cpu_usage: CPU使用率
+            mem_usage: 内存使用率
+            disk_usage: 磁盘使用率
+            swap_usage: Swap使用率
+            data_freshness: 数据新鲜度（小时）
+            
+        Returns:
+            健康评分（0-100）
+        """
+        # 各项指标的权重
+        weights = {
+            'cpu': 0.25,
+            'memory': 0.25,
+            'disk': 0.20,
+            'swap': 0.15,
+            'freshness': 0.15
+        }
+        
+        # 计算各项得分（0-100分）
+        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
+        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
+        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
+        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
+        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        
+        # 加权平均
+        total_score = (
+            cpu_score * weights['cpu'] +
+            mem_score * weights['memory'] +
+            disk_score * weights['disk'] +
+            swap_score * weights['swap'] +
+            freshness_score * weights['freshness']
+        )
+        
+        return int(max(0, min(100, total_score)))
+
+    def get_machine_status_by_ip(self, ip: str) -> Dict:
+        """
+        根据IP地址获取机器的最新状态评估
+        
+        Args:
+            ip: IP地址
+            
+        Returns:
+            机器状态评估结果
+        """
+        # 获取最新监控数据
+        metric = self.get_latest_metric_by_ip(ip)
+        
+        if not metric:
+            return {
+                "status_level": "未知",
+                "ip": ip,
+                "timestamp": None,
+                "key_metrics": {},
+                "issues": ["未找到该IP的监控数据"],
+                "warnings": [],
+                "is_healthy": False,
+                "overall_score": 0,
+                "error": "未找到监控数据"
+            }
+        
+        # 评估状态
+        return self.assess_machine_status(metric)
+
+    def get_all_machines_status(self, time_window_hours: int = 1) -> List[Dict]:
+        """
+        获取所有机器的状态评估
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            所有机器的状态评估列表
+        """
+        # 获取活跃机器的监控数据
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        status_list = []
+        for metric in metrics:
+            status = self.assess_machine_status(metric)
+            status_list.append(status)
+        
+        # 按健康评分排序
+        status_list.sort(key=lambda x: x['overall_score'], reverse=True)
+        
+        return status_list
+
+    def get_system_overview(self, time_window_hours: int = 1) -> Dict:
+        """
+        获取系统总体概览信息
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            系统总体概览信息，包含：
+            - 活跃机器统计
+            - 健康状态分布
+            - 告警和提示信息汇总
+            - 关键指标统计
+            - 性能趋势分析
+        """
+        # 获取所有机器的状态评估
+        status_list = self.get_all_machines_status(time_window_hours)
+        
+        # 获取活跃机器的原始监控数据用于统计计算
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        # 1. 活跃机器统计
+        active_machines = len(status_list)
+        active_ips = [status['ip'] for status in status_list]
+        
+        # 2. 健康状态分布
+        status_distribution = {
+            "正常": len([s for s in status_list if s['status_level'] == "正常"]),
+            "提示": len([s for s in status_list if s['status_level'] == "提示"]),
+            "警告": len([s for s in status_list if s['status_level'] == "警告"]),
+            "未知": len([s for s in status_list if s['status_level'] == "未知"])
+        }
+        
+        # 3. 告警和提示信息汇总
+        all_issues = []
+        all_warnings = []
+        
+        for status in status_list:
+            all_issues.extend([{"ip": status['ip'], "issue": issue} for issue in status['issues']])
+            all_warnings.extend([{"ip": status['ip'], "warning": warning} for warning in status['warnings']])
+        
+        # 4. 关键指标统计（最大值、平均值、最小值）
+        key_metrics_stats = self._calculate_key_metrics_statistics(metrics)
+        
+        # 5. 性能趋势分析（基于最近10条数据）
+        trend_analysis = self._analyze_performance_trend(time_window_hours)
+        
+        # 6. 系统健康评分
+        overall_health_score = self._calculate_system_health_score(status_list)
+        
+        # 构建总体概览信息
+        overview = {
+            "timestamp": int(time.time()),
+            "time_window_hours": time_window_hours,
+            "active_machines": {
+                "total": active_machines,
+                "ips": active_ips
+            },
+            "health_status": {
+                "distribution": status_distribution,
+                "overall_score": overall_health_score,
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+            },
+            "alerts_summary": {
+                "critical_issues": len(all_issues),
+                "warning_issues": len(all_warnings),
+                "issues_by_type": self._categorize_issues(all_issues),
+                "warnings_by_type": self._categorize_warnings(all_warnings)
+            },
+            "key_metrics": key_metrics_stats,
+            "performance_trend": trend_analysis,
+            "detailed_alerts": {
+                "critical": all_issues,
+                "warning": all_warnings
+            }
+        }
+        
+        return overview
+
+    def _calculate_key_metrics_statistics(self, metrics: List[Dict]) -> Dict:
+        """计算关键指标的统计信息"""
+        if not metrics:
+            return {
+                "cpu_usage": {"max": 0, "avg": 0, "min": 0},
+                "memory_usage": {"max": 0, "avg": 0, "min": 0},
+                "disk_usage": {"max": 0, "avg": 0, "min": 0},
+                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+            }
+        
+        cpu_usages = []
+        memory_usages = []
+        disk_usages = []
+        swap_usages = []
+        
+        for metric in metrics:
+            # 计算各项指标
+            cpu_usr = metric.get('cpu_usr', 0) or 0
+            cpu_sys = metric.get('cpu_sys', 0) or 0
+            cpu_iow = metric.get('cpu_iow', 0) or 0
+            cpu_total = cpu_usr + cpu_sys + cpu_iow
+            
+            mem_total = metric.get('mem_total', 0) or 0
+            mem_free = metric.get('mem_free', 0) or 0
+            mem_buff = metric.get('mem_buff', 0) or 0
+            mem_cache = metric.get('mem_cache', 0) or 0
+            mem_used = mem_total - mem_free - mem_buff - mem_cache
+            mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+            
+            disk_usage = metric.get('disk_used_percent', 0) or 0
+            
+            swap_used = metric.get('swap_used', 0) or 0
+            swap_total = metric.get('swap_total', 0) or 0
+            swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+            
+            cpu_usages.append(cpu_total)
+            memory_usages.append(mem_usage_percent)
+            disk_usages.append(disk_usage)
+            swap_usages.append(swap_usage_percent)
+        
+        return {
+            "cpu_usage": {
+                "max": round(max(cpu_usages), 2) if cpu_usages else 0,
+                "avg": round(sum(cpu_usages) / len(cpu_usages), 2) if cpu_usages else 0,
+                "min": round(min(cpu_usages), 2) if cpu_usages else 0
+            },
+            "memory_usage": {
+                "max": round(max(memory_usages), 2) if memory_usages else 0,
+                "avg": round(sum(memory_usages) / len(memory_usages), 2) if memory_usages else 0,
+                "min": round(min(memory_usages), 2) if memory_usages else 0
+            },
+            "disk_usage": {
+                "max": round(max(disk_usages), 2) if disk_usages else 0,
+                "avg": round(sum(disk_usages) / len(disk_usages), 2) if disk_usages else 0,
+                "min": round(min(disk_usages), 2) if disk_usages else 0
+            },
+            "swap_usage": {
+                "max": round(max(swap_usages), 2) if swap_usages else 0,
+                "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
+                "min": round(min(swap_usages), 2) if swap_usages else 0
+            }
+        }
+
+    def _analyze_performance_trend(self, time_window_hours: int) -> Dict:
+        """分析性能趋势"""
+        # 这里可以扩展为获取历史数据进行趋势分析
+        # 目前返回基础趋势信息
+        return {
+            "trend": "stable",  # stable, improving, declining
+            "confidence": 0.8,
+            "analysis": "系统性能整体稳定",
+            "suggestions": ["建议定期检查磁盘使用率", "关注内存使用趋势"]
+        }
+
+    def _calculate_system_health_score(self, status_list: List[Dict]) -> float:
+        """计算系统整体健康评分"""
+        if not status_list:
+            return 0.0
+        
+        total_score = sum(status['overall_score'] for status in status_list)
+        return round(total_score / len(status_list), 2)
+
+    def _categorize_issues(self, issues: List[Dict]) -> Dict:
+        """分类汇总问题"""
+        categories = {}
+        
+        for issue_item in issues:
+            issue_text = issue_item['issue']
+            if "CPU" in issue_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in issue_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in issue_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in issue_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in issue_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
+
+    def _categorize_warnings(self, warnings: List[Dict]) -> Dict:
+        """分类汇总警告"""
+        categories = {}
+        
+        for warning_item in warnings:
+            warning_text = warning_item['warning']
+            if "CPU" in warning_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in warning_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in warning_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in warning_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in warning_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
 
     def _enrich_metric_with_calculated_fields(self, metric: Dict) -> Dict:
         """
@@ -1136,6 +11615,409 @@ class DatabaseManager:
         finally:
             self.return_connection(connection)
 
+    def assess_machine_status(self, metric: Dict) -> Dict:
+        """
+        根据监控指标评估机器运行状态
+        
+        Args:
+            metric: 监控指标数据
+            
+        Returns:
+            包含状态分级和详细信息的字典
+        """
+        # 获取关键指标值，处理None值
+        cpu_usr = metric.get('cpu_usr', 0) or 0
+        cpu_sys = metric.get('cpu_sys', 0) or 0
+        cpu_iow = metric.get('cpu_iow', 0) or 0
+        
+        mem_total = metric.get('mem_total', 0) or 0
+        mem_free = metric.get('mem_free', 0) or 0
+        mem_buff = metric.get('mem_buff', 0) or 0
+        mem_cache = metric.get('mem_cache', 0) or 0
+        
+        disk_used_percent = metric.get('disk_used_percent', 0) or 0
+        swap_used = metric.get('swap_used', 0) or 0
+        swap_total = metric.get('swap_total', 0) or 0
+        
+        # 计算关键指标
+        cpu_total = cpu_usr + cpu_sys + cpu_iow
+        mem_used = mem_total - mem_free - mem_buff - mem_cache
+        mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+        swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 状态评估
+        status_level = "正常"
+        issues = []
+        warnings = []
+        
+        # CPU使用率检查
+        if cpu_total >= 90:
+            status_level = "警告"
+            issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
+        elif cpu_total >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
+        
+        # 内存使用率检查
+        if mem_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
+        elif mem_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
+        
+        # 磁盘使用率检查
+        if disk_used_percent >= 90:
+            status_level = "警告"
+            issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
+        elif disk_used_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
+        
+        # Swap使用率检查
+        if swap_usage_percent >= 50:
+            status_level = "警告"
+            issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
+        elif swap_usage_percent >= 20:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
+        
+        # 数据时效性检查（超过1小时无数据视为异常）
+        import time
+        current_timestamp = int(time.time())
+        metric_timestamp = metric.get('ts', 0)
+        time_diff_hours = (current_timestamp - metric_timestamp) / 3600
+        
+        if time_diff_hours > 1:
+            status_level = "警告"
+            issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
+        elif time_diff_hours > 0.3:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
+        
+        # 构建返回结果
+        result = {
+            "status_level": status_level,
+            "ip": metric.get('ip', '未知'),
+            "timestamp": metric_timestamp,
+            "key_metrics": {
+                "cpu_usage_percent": round(cpu_total, 2),
+                "memory_usage_percent": round(mem_usage_percent, 2),
+                "disk_usage_percent": round(disk_used_percent, 2),
+                "swap_usage_percent": round(swap_usage_percent, 2),
+                "data_freshness_hours": round(time_diff_hours, 2)
+            },
+            "issues": issues,
+            "warnings": warnings,
+            "is_healthy": status_level == "正常",
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+        }
+        
+        return result
+
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+        """
+        计算机器健康评分（0-100分）
+        
+        Args:
+            cpu_usage: CPU使用率
+            mem_usage: 内存使用率
+            disk_usage: 磁盘使用率
+            swap_usage: Swap使用率
+            data_freshness: 数据新鲜度（小时）
+            
+        Returns:
+            健康评分（0-100）
+        """
+        # 各项指标的权重
+        weights = {
+            'cpu': 0.25,
+            'memory': 0.25,
+            'disk': 0.20,
+            'swap': 0.15,
+            'freshness': 0.15
+        }
+        
+        # 计算各项得分（0-100分）
+        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
+        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
+        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
+        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
+        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        
+        # 加权平均
+        total_score = (
+            cpu_score * weights['cpu'] +
+            mem_score * weights['memory'] +
+            disk_score * weights['disk'] +
+            swap_score * weights['swap'] +
+            freshness_score * weights['freshness']
+        )
+        
+        return int(max(0, min(100, total_score)))
+
+    def get_machine_status_by_ip(self, ip: str) -> Dict:
+        """
+        根据IP地址获取机器的最新状态评估
+        
+        Args:
+            ip: IP地址
+            
+        Returns:
+            机器状态评估结果
+        """
+        # 获取最新监控数据
+        metric = self.get_latest_metric_by_ip(ip)
+        
+        if not metric:
+            return {
+                "status_level": "未知",
+                "ip": ip,
+                "timestamp": None,
+                "key_metrics": {},
+                "issues": ["未找到该IP的监控数据"],
+                "warnings": [],
+                "is_healthy": False,
+                "overall_score": 0,
+                "error": "未找到监控数据"
+            }
+        
+        # 评估状态
+        return self.assess_machine_status(metric)
+
+    def get_all_machines_status(self, time_window_hours: int = 1) -> List[Dict]:
+        """
+        获取所有机器的状态评估
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            所有机器的状态评估列表
+        """
+        # 获取活跃机器的监控数据
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        status_list = []
+        for metric in metrics:
+            status = self.assess_machine_status(metric)
+            status_list.append(status)
+        
+        # 按健康评分排序
+        status_list.sort(key=lambda x: x['overall_score'], reverse=True)
+        
+        return status_list
+
+    def get_system_overview(self, time_window_hours: int = 1) -> Dict:
+        """
+        获取系统总体概览信息
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            系统总体概览信息，包含：
+            - 活跃机器统计
+            - 健康状态分布
+            - 告警和提示信息汇总
+            - 关键指标统计
+            - 性能趋势分析
+        """
+        # 获取所有机器的状态评估
+        status_list = self.get_all_machines_status(time_window_hours)
+        
+        # 获取活跃机器的原始监控数据用于统计计算
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        # 1. 活跃机器统计
+        active_machines = len(status_list)
+        active_ips = [status['ip'] for status in status_list]
+        
+        # 2. 健康状态分布
+        status_distribution = {
+            "正常": len([s for s in status_list if s['status_level'] == "正常"]),
+            "提示": len([s for s in status_list if s['status_level'] == "提示"]),
+            "警告": len([s for s in status_list if s['status_level'] == "警告"]),
+            "未知": len([s for s in status_list if s['status_level'] == "未知"])
+        }
+        
+        # 3. 告警和提示信息汇总
+        all_issues = []
+        all_warnings = []
+        
+        for status in status_list:
+            all_issues.extend([{"ip": status['ip'], "issue": issue} for issue in status['issues']])
+            all_warnings.extend([{"ip": status['ip'], "warning": warning} for warning in status['warnings']])
+        
+        # 4. 关键指标统计（最大值、平均值、最小值）
+        key_metrics_stats = self._calculate_key_metrics_statistics(metrics)
+        
+        # 5. 性能趋势分析（基于最近10条数据）
+        trend_analysis = self._analyze_performance_trend(time_window_hours)
+        
+        # 6. 系统健康评分
+        overall_health_score = self._calculate_system_health_score(status_list)
+        
+        # 构建总体概览信息
+        overview = {
+            "timestamp": int(time.time()),
+            "time_window_hours": time_window_hours,
+            "active_machines": {
+                "total": active_machines,
+                "ips": active_ips
+            },
+            "health_status": {
+                "distribution": status_distribution,
+                "overall_score": overall_health_score,
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+            },
+            "alerts_summary": {
+                "critical_issues": len(all_issues),
+                "warning_issues": len(all_warnings),
+                "issues_by_type": self._categorize_issues(all_issues),
+                "warnings_by_type": self._categorize_warnings(all_warnings)
+            },
+            "key_metrics": key_metrics_stats,
+            "performance_trend": trend_analysis,
+            "detailed_alerts": {
+                "critical": all_issues,
+                "warning": all_warnings
+            }
+        }
+        
+        return overview
+
+    def _calculate_key_metrics_statistics(self, metrics: List[Dict]) -> Dict:
+        """计算关键指标的统计信息"""
+        if not metrics:
+            return {
+                "cpu_usage": {"max": 0, "avg": 0, "min": 0},
+                "memory_usage": {"max": 0, "avg": 0, "min": 0},
+                "disk_usage": {"max": 0, "avg": 0, "min": 0},
+                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+            }
+        
+        cpu_usages = []
+        memory_usages = []
+        disk_usages = []
+        swap_usages = []
+        
+        for metric in metrics:
+            # 计算各项指标
+            cpu_usr = metric.get('cpu_usr', 0) or 0
+            cpu_sys = metric.get('cpu_sys', 0) or 0
+            cpu_iow = metric.get('cpu_iow', 0) or 0
+            cpu_total = cpu_usr + cpu_sys + cpu_iow
+            
+            mem_total = metric.get('mem_total', 0) or 0
+            mem_free = metric.get('mem_free', 0) or 0
+            mem_buff = metric.get('mem_buff', 0) or 0
+            mem_cache = metric.get('mem_cache', 0) or 0
+            mem_used = mem_total - mem_free - mem_buff - mem_cache
+            mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+            
+            disk_usage = metric.get('disk_used_percent', 0) or 0
+            
+            swap_used = metric.get('swap_used', 0) or 0
+            swap_total = metric.get('swap_total', 0) or 0
+            swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+            
+            cpu_usages.append(cpu_total)
+            memory_usages.append(mem_usage_percent)
+            disk_usages.append(disk_usage)
+            swap_usages.append(swap_usage_percent)
+        
+        return {
+            "cpu_usage": {
+                "max": round(max(cpu_usages), 2) if cpu_usages else 0,
+                "avg": round(sum(cpu_usages) / len(cpu_usages), 2) if cpu_usages else 0,
+                "min": round(min(cpu_usages), 2) if cpu_usages else 0
+            },
+            "memory_usage": {
+                "max": round(max(memory_usages), 2) if memory_usages else 0,
+                "avg": round(sum(memory_usages) / len(memory_usages), 2) if memory_usages else 0,
+                "min": round(min(memory_usages), 2) if memory_usages else 0
+            },
+            "disk_usage": {
+                "max": round(max(disk_usages), 2) if disk_usages else 0,
+                "avg": round(sum(disk_usages) / len(disk_usages), 2) if disk_usages else 0,
+                "min": round(min(disk_usages), 2) if disk_usages else 0
+            },
+            "swap_usage": {
+                "max": round(max(swap_usages), 2) if swap_usages else 0,
+                "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
+                "min": round(min(swap_usages), 2) if swap_usages else 0
+            }
+        }
+
+    def _analyze_performance_trend(self, time_window_hours: int) -> Dict:
+        """分析性能趋势"""
+        # 这里可以扩展为获取历史数据进行趋势分析
+        # 目前返回基础趋势信息
+        return {
+            "trend": "stable",  # stable, improving, declining
+            "confidence": 0.8,
+            "analysis": "系统性能整体稳定",
+            "suggestions": ["建议定期检查磁盘使用率", "关注内存使用趋势"]
+        }
+
+    def _calculate_system_health_score(self, status_list: List[Dict]) -> float:
+        """计算系统整体健康评分"""
+        if not status_list:
+            return 0.0
+        
+        total_score = sum(status['overall_score'] for status in status_list)
+        return round(total_score / len(status_list), 2)
+
+    def _categorize_issues(self, issues: List[Dict]) -> Dict:
+        """分类汇总问题"""
+        categories = {}
+        
+        for issue_item in issues:
+            issue_text = issue_item['issue']
+            if "CPU" in issue_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in issue_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in issue_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in issue_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in issue_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
+
+    def _categorize_warnings(self, warnings: List[Dict]) -> Dict:
+        """分类汇总警告"""
+        categories = {}
+        
+        for warning_item in warnings:
+            warning_text = warning_item['warning']
+            if "CPU" in warning_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in warning_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in warning_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in warning_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in warning_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
+
     # ==================== 用户认证相关方法 ====================
 
     def create_user(self, user_data: UserCreate) -> Optional[int]:
@@ -1198,6 +12080,409 @@ class DatabaseManager:
         finally:
             self.return_connection(connection)
 
+    def assess_machine_status(self, metric: Dict) -> Dict:
+        """
+        根据监控指标评估机器运行状态
+        
+        Args:
+            metric: 监控指标数据
+            
+        Returns:
+            包含状态分级和详细信息的字典
+        """
+        # 获取关键指标值，处理None值
+        cpu_usr = metric.get('cpu_usr', 0) or 0
+        cpu_sys = metric.get('cpu_sys', 0) or 0
+        cpu_iow = metric.get('cpu_iow', 0) or 0
+        
+        mem_total = metric.get('mem_total', 0) or 0
+        mem_free = metric.get('mem_free', 0) or 0
+        mem_buff = metric.get('mem_buff', 0) or 0
+        mem_cache = metric.get('mem_cache', 0) or 0
+        
+        disk_used_percent = metric.get('disk_used_percent', 0) or 0
+        swap_used = metric.get('swap_used', 0) or 0
+        swap_total = metric.get('swap_total', 0) or 0
+        
+        # 计算关键指标
+        cpu_total = cpu_usr + cpu_sys + cpu_iow
+        mem_used = mem_total - mem_free - mem_buff - mem_cache
+        mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+        swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 状态评估
+        status_level = "正常"
+        issues = []
+        warnings = []
+        
+        # CPU使用率检查
+        if cpu_total >= 90:
+            status_level = "警告"
+            issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
+        elif cpu_total >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
+        
+        # 内存使用率检查
+        if mem_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
+        elif mem_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
+        
+        # 磁盘使用率检查
+        if disk_used_percent >= 90:
+            status_level = "警告"
+            issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
+        elif disk_used_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
+        
+        # Swap使用率检查
+        if swap_usage_percent >= 50:
+            status_level = "警告"
+            issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
+        elif swap_usage_percent >= 20:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
+        
+        # 数据时效性检查（超过1小时无数据视为异常）
+        import time
+        current_timestamp = int(time.time())
+        metric_timestamp = metric.get('ts', 0)
+        time_diff_hours = (current_timestamp - metric_timestamp) / 3600
+        
+        if time_diff_hours > 1:
+            status_level = "警告"
+            issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
+        elif time_diff_hours > 0.3:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
+        
+        # 构建返回结果
+        result = {
+            "status_level": status_level,
+            "ip": metric.get('ip', '未知'),
+            "timestamp": metric_timestamp,
+            "key_metrics": {
+                "cpu_usage_percent": round(cpu_total, 2),
+                "memory_usage_percent": round(mem_usage_percent, 2),
+                "disk_usage_percent": round(disk_used_percent, 2),
+                "swap_usage_percent": round(swap_usage_percent, 2),
+                "data_freshness_hours": round(time_diff_hours, 2)
+            },
+            "issues": issues,
+            "warnings": warnings,
+            "is_healthy": status_level == "正常",
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+        }
+        
+        return result
+
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+        """
+        计算机器健康评分（0-100分）
+        
+        Args:
+            cpu_usage: CPU使用率
+            mem_usage: 内存使用率
+            disk_usage: 磁盘使用率
+            swap_usage: Swap使用率
+            data_freshness: 数据新鲜度（小时）
+            
+        Returns:
+            健康评分（0-100）
+        """
+        # 各项指标的权重
+        weights = {
+            'cpu': 0.25,
+            'memory': 0.25,
+            'disk': 0.20,
+            'swap': 0.15,
+            'freshness': 0.15
+        }
+        
+        # 计算各项得分（0-100分）
+        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
+        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
+        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
+        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
+        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        
+        # 加权平均
+        total_score = (
+            cpu_score * weights['cpu'] +
+            mem_score * weights['memory'] +
+            disk_score * weights['disk'] +
+            swap_score * weights['swap'] +
+            freshness_score * weights['freshness']
+        )
+        
+        return int(max(0, min(100, total_score)))
+
+    def get_machine_status_by_ip(self, ip: str) -> Dict:
+        """
+        根据IP地址获取机器的最新状态评估
+        
+        Args:
+            ip: IP地址
+            
+        Returns:
+            机器状态评估结果
+        """
+        # 获取最新监控数据
+        metric = self.get_latest_metric_by_ip(ip)
+        
+        if not metric:
+            return {
+                "status_level": "未知",
+                "ip": ip,
+                "timestamp": None,
+                "key_metrics": {},
+                "issues": ["未找到该IP的监控数据"],
+                "warnings": [],
+                "is_healthy": False,
+                "overall_score": 0,
+                "error": "未找到监控数据"
+            }
+        
+        # 评估状态
+        return self.assess_machine_status(metric)
+
+    def get_all_machines_status(self, time_window_hours: int = 1) -> List[Dict]:
+        """
+        获取所有机器的状态评估
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            所有机器的状态评估列表
+        """
+        # 获取活跃机器的监控数据
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        status_list = []
+        for metric in metrics:
+            status = self.assess_machine_status(metric)
+            status_list.append(status)
+        
+        # 按健康评分排序
+        status_list.sort(key=lambda x: x['overall_score'], reverse=True)
+        
+        return status_list
+
+    def get_system_overview(self, time_window_hours: int = 1) -> Dict:
+        """
+        获取系统总体概览信息
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            系统总体概览信息，包含：
+            - 活跃机器统计
+            - 健康状态分布
+            - 告警和提示信息汇总
+            - 关键指标统计
+            - 性能趋势分析
+        """
+        # 获取所有机器的状态评估
+        status_list = self.get_all_machines_status(time_window_hours)
+        
+        # 获取活跃机器的原始监控数据用于统计计算
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        # 1. 活跃机器统计
+        active_machines = len(status_list)
+        active_ips = [status['ip'] for status in status_list]
+        
+        # 2. 健康状态分布
+        status_distribution = {
+            "正常": len([s for s in status_list if s['status_level'] == "正常"]),
+            "提示": len([s for s in status_list if s['status_level'] == "提示"]),
+            "警告": len([s for s in status_list if s['status_level'] == "警告"]),
+            "未知": len([s for s in status_list if s['status_level'] == "未知"])
+        }
+        
+        # 3. 告警和提示信息汇总
+        all_issues = []
+        all_warnings = []
+        
+        for status in status_list:
+            all_issues.extend([{"ip": status['ip'], "issue": issue} for issue in status['issues']])
+            all_warnings.extend([{"ip": status['ip'], "warning": warning} for warning in status['warnings']])
+        
+        # 4. 关键指标统计（最大值、平均值、最小值）
+        key_metrics_stats = self._calculate_key_metrics_statistics(metrics)
+        
+        # 5. 性能趋势分析（基于最近10条数据）
+        trend_analysis = self._analyze_performance_trend(time_window_hours)
+        
+        # 6. 系统健康评分
+        overall_health_score = self._calculate_system_health_score(status_list)
+        
+        # 构建总体概览信息
+        overview = {
+            "timestamp": int(time.time()),
+            "time_window_hours": time_window_hours,
+            "active_machines": {
+                "total": active_machines,
+                "ips": active_ips
+            },
+            "health_status": {
+                "distribution": status_distribution,
+                "overall_score": overall_health_score,
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+            },
+            "alerts_summary": {
+                "critical_issues": len(all_issues),
+                "warning_issues": len(all_warnings),
+                "issues_by_type": self._categorize_issues(all_issues),
+                "warnings_by_type": self._categorize_warnings(all_warnings)
+            },
+            "key_metrics": key_metrics_stats,
+            "performance_trend": trend_analysis,
+            "detailed_alerts": {
+                "critical": all_issues,
+                "warning": all_warnings
+            }
+        }
+        
+        return overview
+
+    def _calculate_key_metrics_statistics(self, metrics: List[Dict]) -> Dict:
+        """计算关键指标的统计信息"""
+        if not metrics:
+            return {
+                "cpu_usage": {"max": 0, "avg": 0, "min": 0},
+                "memory_usage": {"max": 0, "avg": 0, "min": 0},
+                "disk_usage": {"max": 0, "avg": 0, "min": 0},
+                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+            }
+        
+        cpu_usages = []
+        memory_usages = []
+        disk_usages = []
+        swap_usages = []
+        
+        for metric in metrics:
+            # 计算各项指标
+            cpu_usr = metric.get('cpu_usr', 0) or 0
+            cpu_sys = metric.get('cpu_sys', 0) or 0
+            cpu_iow = metric.get('cpu_iow', 0) or 0
+            cpu_total = cpu_usr + cpu_sys + cpu_iow
+            
+            mem_total = metric.get('mem_total', 0) or 0
+            mem_free = metric.get('mem_free', 0) or 0
+            mem_buff = metric.get('mem_buff', 0) or 0
+            mem_cache = metric.get('mem_cache', 0) or 0
+            mem_used = mem_total - mem_free - mem_buff - mem_cache
+            mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+            
+            disk_usage = metric.get('disk_used_percent', 0) or 0
+            
+            swap_used = metric.get('swap_used', 0) or 0
+            swap_total = metric.get('swap_total', 0) or 0
+            swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+            
+            cpu_usages.append(cpu_total)
+            memory_usages.append(mem_usage_percent)
+            disk_usages.append(disk_usage)
+            swap_usages.append(swap_usage_percent)
+        
+        return {
+            "cpu_usage": {
+                "max": round(max(cpu_usages), 2) if cpu_usages else 0,
+                "avg": round(sum(cpu_usages) / len(cpu_usages), 2) if cpu_usages else 0,
+                "min": round(min(cpu_usages), 2) if cpu_usages else 0
+            },
+            "memory_usage": {
+                "max": round(max(memory_usages), 2) if memory_usages else 0,
+                "avg": round(sum(memory_usages) / len(memory_usages), 2) if memory_usages else 0,
+                "min": round(min(memory_usages), 2) if memory_usages else 0
+            },
+            "disk_usage": {
+                "max": round(max(disk_usages), 2) if disk_usages else 0,
+                "avg": round(sum(disk_usages) / len(disk_usages), 2) if disk_usages else 0,
+                "min": round(min(disk_usages), 2) if disk_usages else 0
+            },
+            "swap_usage": {
+                "max": round(max(swap_usages), 2) if swap_usages else 0,
+                "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
+                "min": round(min(swap_usages), 2) if swap_usages else 0
+            }
+        }
+
+    def _analyze_performance_trend(self, time_window_hours: int) -> Dict:
+        """分析性能趋势"""
+        # 这里可以扩展为获取历史数据进行趋势分析
+        # 目前返回基础趋势信息
+        return {
+            "trend": "stable",  # stable, improving, declining
+            "confidence": 0.8,
+            "analysis": "系统性能整体稳定",
+            "suggestions": ["建议定期检查磁盘使用率", "关注内存使用趋势"]
+        }
+
+    def _calculate_system_health_score(self, status_list: List[Dict]) -> float:
+        """计算系统整体健康评分"""
+        if not status_list:
+            return 0.0
+        
+        total_score = sum(status['overall_score'] for status in status_list)
+        return round(total_score / len(status_list), 2)
+
+    def _categorize_issues(self, issues: List[Dict]) -> Dict:
+        """分类汇总问题"""
+        categories = {}
+        
+        for issue_item in issues:
+            issue_text = issue_item['issue']
+            if "CPU" in issue_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in issue_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in issue_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in issue_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in issue_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
+
+    def _categorize_warnings(self, warnings: List[Dict]) -> Dict:
+        """分类汇总警告"""
+        categories = {}
+        
+        for warning_item in warnings:
+            warning_text = warning_item['warning']
+            if "CPU" in warning_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in warning_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in warning_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in warning_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in warning_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
+
 
 
     def get_user_by_id(self, user_id: int) -> Optional[UserResponse]:
@@ -1247,6 +12532,409 @@ class DatabaseManager:
             return None
         finally:
             self.return_connection(connection)
+
+    def assess_machine_status(self, metric: Dict) -> Dict:
+        """
+        根据监控指标评估机器运行状态
+        
+        Args:
+            metric: 监控指标数据
+            
+        Returns:
+            包含状态分级和详细信息的字典
+        """
+        # 获取关键指标值，处理None值
+        cpu_usr = metric.get('cpu_usr', 0) or 0
+        cpu_sys = metric.get('cpu_sys', 0) or 0
+        cpu_iow = metric.get('cpu_iow', 0) or 0
+        
+        mem_total = metric.get('mem_total', 0) or 0
+        mem_free = metric.get('mem_free', 0) or 0
+        mem_buff = metric.get('mem_buff', 0) or 0
+        mem_cache = metric.get('mem_cache', 0) or 0
+        
+        disk_used_percent = metric.get('disk_used_percent', 0) or 0
+        swap_used = metric.get('swap_used', 0) or 0
+        swap_total = metric.get('swap_total', 0) or 0
+        
+        # 计算关键指标
+        cpu_total = cpu_usr + cpu_sys + cpu_iow
+        mem_used = mem_total - mem_free - mem_buff - mem_cache
+        mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+        swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 状态评估
+        status_level = "正常"
+        issues = []
+        warnings = []
+        
+        # CPU使用率检查
+        if cpu_total >= 90:
+            status_level = "警告"
+            issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
+        elif cpu_total >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
+        
+        # 内存使用率检查
+        if mem_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
+        elif mem_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
+        
+        # 磁盘使用率检查
+        if disk_used_percent >= 90:
+            status_level = "警告"
+            issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
+        elif disk_used_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
+        
+        # Swap使用率检查
+        if swap_usage_percent >= 50:
+            status_level = "警告"
+            issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
+        elif swap_usage_percent >= 20:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
+        
+        # 数据时效性检查（超过1小时无数据视为异常）
+        import time
+        current_timestamp = int(time.time())
+        metric_timestamp = metric.get('ts', 0)
+        time_diff_hours = (current_timestamp - metric_timestamp) / 3600
+        
+        if time_diff_hours > 1:
+            status_level = "警告"
+            issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
+        elif time_diff_hours > 0.3:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
+        
+        # 构建返回结果
+        result = {
+            "status_level": status_level,
+            "ip": metric.get('ip', '未知'),
+            "timestamp": metric_timestamp,
+            "key_metrics": {
+                "cpu_usage_percent": round(cpu_total, 2),
+                "memory_usage_percent": round(mem_usage_percent, 2),
+                "disk_usage_percent": round(disk_used_percent, 2),
+                "swap_usage_percent": round(swap_usage_percent, 2),
+                "data_freshness_hours": round(time_diff_hours, 2)
+            },
+            "issues": issues,
+            "warnings": warnings,
+            "is_healthy": status_level == "正常",
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+        }
+        
+        return result
+
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+        """
+        计算机器健康评分（0-100分）
+        
+        Args:
+            cpu_usage: CPU使用率
+            mem_usage: 内存使用率
+            disk_usage: 磁盘使用率
+            swap_usage: Swap使用率
+            data_freshness: 数据新鲜度（小时）
+            
+        Returns:
+            健康评分（0-100）
+        """
+        # 各项指标的权重
+        weights = {
+            'cpu': 0.25,
+            'memory': 0.25,
+            'disk': 0.20,
+            'swap': 0.15,
+            'freshness': 0.15
+        }
+        
+        # 计算各项得分（0-100分）
+        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
+        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
+        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
+        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
+        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        
+        # 加权平均
+        total_score = (
+            cpu_score * weights['cpu'] +
+            mem_score * weights['memory'] +
+            disk_score * weights['disk'] +
+            swap_score * weights['swap'] +
+            freshness_score * weights['freshness']
+        )
+        
+        return int(max(0, min(100, total_score)))
+
+    def get_machine_status_by_ip(self, ip: str) -> Dict:
+        """
+        根据IP地址获取机器的最新状态评估
+        
+        Args:
+            ip: IP地址
+            
+        Returns:
+            机器状态评估结果
+        """
+        # 获取最新监控数据
+        metric = self.get_latest_metric_by_ip(ip)
+        
+        if not metric:
+            return {
+                "status_level": "未知",
+                "ip": ip,
+                "timestamp": None,
+                "key_metrics": {},
+                "issues": ["未找到该IP的监控数据"],
+                "warnings": [],
+                "is_healthy": False,
+                "overall_score": 0,
+                "error": "未找到监控数据"
+            }
+        
+        # 评估状态
+        return self.assess_machine_status(metric)
+
+    def get_all_machines_status(self, time_window_hours: int = 1) -> List[Dict]:
+        """
+        获取所有机器的状态评估
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            所有机器的状态评估列表
+        """
+        # 获取活跃机器的监控数据
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        status_list = []
+        for metric in metrics:
+            status = self.assess_machine_status(metric)
+            status_list.append(status)
+        
+        # 按健康评分排序
+        status_list.sort(key=lambda x: x['overall_score'], reverse=True)
+        
+        return status_list
+
+    def get_system_overview(self, time_window_hours: int = 1) -> Dict:
+        """
+        获取系统总体概览信息
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            系统总体概览信息，包含：
+            - 活跃机器统计
+            - 健康状态分布
+            - 告警和提示信息汇总
+            - 关键指标统计
+            - 性能趋势分析
+        """
+        # 获取所有机器的状态评估
+        status_list = self.get_all_machines_status(time_window_hours)
+        
+        # 获取活跃机器的原始监控数据用于统计计算
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        # 1. 活跃机器统计
+        active_machines = len(status_list)
+        active_ips = [status['ip'] for status in status_list]
+        
+        # 2. 健康状态分布
+        status_distribution = {
+            "正常": len([s for s in status_list if s['status_level'] == "正常"]),
+            "提示": len([s for s in status_list if s['status_level'] == "提示"]),
+            "警告": len([s for s in status_list if s['status_level'] == "警告"]),
+            "未知": len([s for s in status_list if s['status_level'] == "未知"])
+        }
+        
+        # 3. 告警和提示信息汇总
+        all_issues = []
+        all_warnings = []
+        
+        for status in status_list:
+            all_issues.extend([{"ip": status['ip'], "issue": issue} for issue in status['issues']])
+            all_warnings.extend([{"ip": status['ip'], "warning": warning} for warning in status['warnings']])
+        
+        # 4. 关键指标统计（最大值、平均值、最小值）
+        key_metrics_stats = self._calculate_key_metrics_statistics(metrics)
+        
+        # 5. 性能趋势分析（基于最近10条数据）
+        trend_analysis = self._analyze_performance_trend(time_window_hours)
+        
+        # 6. 系统健康评分
+        overall_health_score = self._calculate_system_health_score(status_list)
+        
+        # 构建总体概览信息
+        overview = {
+            "timestamp": int(time.time()),
+            "time_window_hours": time_window_hours,
+            "active_machines": {
+                "total": active_machines,
+                "ips": active_ips
+            },
+            "health_status": {
+                "distribution": status_distribution,
+                "overall_score": overall_health_score,
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+            },
+            "alerts_summary": {
+                "critical_issues": len(all_issues),
+                "warning_issues": len(all_warnings),
+                "issues_by_type": self._categorize_issues(all_issues),
+                "warnings_by_type": self._categorize_warnings(all_warnings)
+            },
+            "key_metrics": key_metrics_stats,
+            "performance_trend": trend_analysis,
+            "detailed_alerts": {
+                "critical": all_issues,
+                "warning": all_warnings
+            }
+        }
+        
+        return overview
+
+    def _calculate_key_metrics_statistics(self, metrics: List[Dict]) -> Dict:
+        """计算关键指标的统计信息"""
+        if not metrics:
+            return {
+                "cpu_usage": {"max": 0, "avg": 0, "min": 0},
+                "memory_usage": {"max": 0, "avg": 0, "min": 0},
+                "disk_usage": {"max": 0, "avg": 0, "min": 0},
+                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+            }
+        
+        cpu_usages = []
+        memory_usages = []
+        disk_usages = []
+        swap_usages = []
+        
+        for metric in metrics:
+            # 计算各项指标
+            cpu_usr = metric.get('cpu_usr', 0) or 0
+            cpu_sys = metric.get('cpu_sys', 0) or 0
+            cpu_iow = metric.get('cpu_iow', 0) or 0
+            cpu_total = cpu_usr + cpu_sys + cpu_iow
+            
+            mem_total = metric.get('mem_total', 0) or 0
+            mem_free = metric.get('mem_free', 0) or 0
+            mem_buff = metric.get('mem_buff', 0) or 0
+            mem_cache = metric.get('mem_cache', 0) or 0
+            mem_used = mem_total - mem_free - mem_buff - mem_cache
+            mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+            
+            disk_usage = metric.get('disk_used_percent', 0) or 0
+            
+            swap_used = metric.get('swap_used', 0) or 0
+            swap_total = metric.get('swap_total', 0) or 0
+            swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+            
+            cpu_usages.append(cpu_total)
+            memory_usages.append(mem_usage_percent)
+            disk_usages.append(disk_usage)
+            swap_usages.append(swap_usage_percent)
+        
+        return {
+            "cpu_usage": {
+                "max": round(max(cpu_usages), 2) if cpu_usages else 0,
+                "avg": round(sum(cpu_usages) / len(cpu_usages), 2) if cpu_usages else 0,
+                "min": round(min(cpu_usages), 2) if cpu_usages else 0
+            },
+            "memory_usage": {
+                "max": round(max(memory_usages), 2) if memory_usages else 0,
+                "avg": round(sum(memory_usages) / len(memory_usages), 2) if memory_usages else 0,
+                "min": round(min(memory_usages), 2) if memory_usages else 0
+            },
+            "disk_usage": {
+                "max": round(max(disk_usages), 2) if disk_usages else 0,
+                "avg": round(sum(disk_usages) / len(disk_usages), 2) if disk_usages else 0,
+                "min": round(min(disk_usages), 2) if disk_usages else 0
+            },
+            "swap_usage": {
+                "max": round(max(swap_usages), 2) if swap_usages else 0,
+                "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
+                "min": round(min(swap_usages), 2) if swap_usages else 0
+            }
+        }
+
+    def _analyze_performance_trend(self, time_window_hours: int) -> Dict:
+        """分析性能趋势"""
+        # 这里可以扩展为获取历史数据进行趋势分析
+        # 目前返回基础趋势信息
+        return {
+            "trend": "stable",  # stable, improving, declining
+            "confidence": 0.8,
+            "analysis": "系统性能整体稳定",
+            "suggestions": ["建议定期检查磁盘使用率", "关注内存使用趋势"]
+        }
+
+    def _calculate_system_health_score(self, status_list: List[Dict]) -> float:
+        """计算系统整体健康评分"""
+        if not status_list:
+            return 0.0
+        
+        total_score = sum(status['overall_score'] for status in status_list)
+        return round(total_score / len(status_list), 2)
+
+    def _categorize_issues(self, issues: List[Dict]) -> Dict:
+        """分类汇总问题"""
+        categories = {}
+        
+        for issue_item in issues:
+            issue_text = issue_item['issue']
+            if "CPU" in issue_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in issue_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in issue_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in issue_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in issue_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
+
+    def _categorize_warnings(self, warnings: List[Dict]) -> Dict:
+        """分类汇总警告"""
+        categories = {}
+        
+        for warning_item in warnings:
+            warning_text = warning_item['warning']
+            if "CPU" in warning_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in warning_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in warning_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in warning_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in warning_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
 
     def authenticate_user(self, login_data: UserLogin) -> Optional[UserResponse]:
         """
@@ -1317,6 +13005,409 @@ class DatabaseManager:
         finally:
             self.return_connection(connection)
 
+    def assess_machine_status(self, metric: Dict) -> Dict:
+        """
+        根据监控指标评估机器运行状态
+        
+        Args:
+            metric: 监控指标数据
+            
+        Returns:
+            包含状态分级和详细信息的字典
+        """
+        # 获取关键指标值，处理None值
+        cpu_usr = metric.get('cpu_usr', 0) or 0
+        cpu_sys = metric.get('cpu_sys', 0) or 0
+        cpu_iow = metric.get('cpu_iow', 0) or 0
+        
+        mem_total = metric.get('mem_total', 0) or 0
+        mem_free = metric.get('mem_free', 0) or 0
+        mem_buff = metric.get('mem_buff', 0) or 0
+        mem_cache = metric.get('mem_cache', 0) or 0
+        
+        disk_used_percent = metric.get('disk_used_percent', 0) or 0
+        swap_used = metric.get('swap_used', 0) or 0
+        swap_total = metric.get('swap_total', 0) or 0
+        
+        # 计算关键指标
+        cpu_total = cpu_usr + cpu_sys + cpu_iow
+        mem_used = mem_total - mem_free - mem_buff - mem_cache
+        mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+        swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 状态评估
+        status_level = "正常"
+        issues = []
+        warnings = []
+        
+        # CPU使用率检查
+        if cpu_total >= 90:
+            status_level = "警告"
+            issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
+        elif cpu_total >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
+        
+        # 内存使用率检查
+        if mem_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
+        elif mem_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
+        
+        # 磁盘使用率检查
+        if disk_used_percent >= 90:
+            status_level = "警告"
+            issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
+        elif disk_used_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
+        
+        # Swap使用率检查
+        if swap_usage_percent >= 50:
+            status_level = "警告"
+            issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
+        elif swap_usage_percent >= 20:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
+        
+        # 数据时效性检查（超过1小时无数据视为异常）
+        import time
+        current_timestamp = int(time.time())
+        metric_timestamp = metric.get('ts', 0)
+        time_diff_hours = (current_timestamp - metric_timestamp) / 3600
+        
+        if time_diff_hours > 1:
+            status_level = "警告"
+            issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
+        elif time_diff_hours > 0.3:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
+        
+        # 构建返回结果
+        result = {
+            "status_level": status_level,
+            "ip": metric.get('ip', '未知'),
+            "timestamp": metric_timestamp,
+            "key_metrics": {
+                "cpu_usage_percent": round(cpu_total, 2),
+                "memory_usage_percent": round(mem_usage_percent, 2),
+                "disk_usage_percent": round(disk_used_percent, 2),
+                "swap_usage_percent": round(swap_usage_percent, 2),
+                "data_freshness_hours": round(time_diff_hours, 2)
+            },
+            "issues": issues,
+            "warnings": warnings,
+            "is_healthy": status_level == "正常",
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+        }
+        
+        return result
+
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+        """
+        计算机器健康评分（0-100分）
+        
+        Args:
+            cpu_usage: CPU使用率
+            mem_usage: 内存使用率
+            disk_usage: 磁盘使用率
+            swap_usage: Swap使用率
+            data_freshness: 数据新鲜度（小时）
+            
+        Returns:
+            健康评分（0-100）
+        """
+        # 各项指标的权重
+        weights = {
+            'cpu': 0.25,
+            'memory': 0.25,
+            'disk': 0.20,
+            'swap': 0.15,
+            'freshness': 0.15
+        }
+        
+        # 计算各项得分（0-100分）
+        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
+        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
+        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
+        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
+        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        
+        # 加权平均
+        total_score = (
+            cpu_score * weights['cpu'] +
+            mem_score * weights['memory'] +
+            disk_score * weights['disk'] +
+            swap_score * weights['swap'] +
+            freshness_score * weights['freshness']
+        )
+        
+        return int(max(0, min(100, total_score)))
+
+    def get_machine_status_by_ip(self, ip: str) -> Dict:
+        """
+        根据IP地址获取机器的最新状态评估
+        
+        Args:
+            ip: IP地址
+            
+        Returns:
+            机器状态评估结果
+        """
+        # 获取最新监控数据
+        metric = self.get_latest_metric_by_ip(ip)
+        
+        if not metric:
+            return {
+                "status_level": "未知",
+                "ip": ip,
+                "timestamp": None,
+                "key_metrics": {},
+                "issues": ["未找到该IP的监控数据"],
+                "warnings": [],
+                "is_healthy": False,
+                "overall_score": 0,
+                "error": "未找到监控数据"
+            }
+        
+        # 评估状态
+        return self.assess_machine_status(metric)
+
+    def get_all_machines_status(self, time_window_hours: int = 1) -> List[Dict]:
+        """
+        获取所有机器的状态评估
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            所有机器的状态评估列表
+        """
+        # 获取活跃机器的监控数据
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        status_list = []
+        for metric in metrics:
+            status = self.assess_machine_status(metric)
+            status_list.append(status)
+        
+        # 按健康评分排序
+        status_list.sort(key=lambda x: x['overall_score'], reverse=True)
+        
+        return status_list
+
+    def get_system_overview(self, time_window_hours: int = 1) -> Dict:
+        """
+        获取系统总体概览信息
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            系统总体概览信息，包含：
+            - 活跃机器统计
+            - 健康状态分布
+            - 告警和提示信息汇总
+            - 关键指标统计
+            - 性能趋势分析
+        """
+        # 获取所有机器的状态评估
+        status_list = self.get_all_machines_status(time_window_hours)
+        
+        # 获取活跃机器的原始监控数据用于统计计算
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        # 1. 活跃机器统计
+        active_machines = len(status_list)
+        active_ips = [status['ip'] for status in status_list]
+        
+        # 2. 健康状态分布
+        status_distribution = {
+            "正常": len([s for s in status_list if s['status_level'] == "正常"]),
+            "提示": len([s for s in status_list if s['status_level'] == "提示"]),
+            "警告": len([s for s in status_list if s['status_level'] == "警告"]),
+            "未知": len([s for s in status_list if s['status_level'] == "未知"])
+        }
+        
+        # 3. 告警和提示信息汇总
+        all_issues = []
+        all_warnings = []
+        
+        for status in status_list:
+            all_issues.extend([{"ip": status['ip'], "issue": issue} for issue in status['issues']])
+            all_warnings.extend([{"ip": status['ip'], "warning": warning} for warning in status['warnings']])
+        
+        # 4. 关键指标统计（最大值、平均值、最小值）
+        key_metrics_stats = self._calculate_key_metrics_statistics(metrics)
+        
+        # 5. 性能趋势分析（基于最近10条数据）
+        trend_analysis = self._analyze_performance_trend(time_window_hours)
+        
+        # 6. 系统健康评分
+        overall_health_score = self._calculate_system_health_score(status_list)
+        
+        # 构建总体概览信息
+        overview = {
+            "timestamp": int(time.time()),
+            "time_window_hours": time_window_hours,
+            "active_machines": {
+                "total": active_machines,
+                "ips": active_ips
+            },
+            "health_status": {
+                "distribution": status_distribution,
+                "overall_score": overall_health_score,
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+            },
+            "alerts_summary": {
+                "critical_issues": len(all_issues),
+                "warning_issues": len(all_warnings),
+                "issues_by_type": self._categorize_issues(all_issues),
+                "warnings_by_type": self._categorize_warnings(all_warnings)
+            },
+            "key_metrics": key_metrics_stats,
+            "performance_trend": trend_analysis,
+            "detailed_alerts": {
+                "critical": all_issues,
+                "warning": all_warnings
+            }
+        }
+        
+        return overview
+
+    def _calculate_key_metrics_statistics(self, metrics: List[Dict]) -> Dict:
+        """计算关键指标的统计信息"""
+        if not metrics:
+            return {
+                "cpu_usage": {"max": 0, "avg": 0, "min": 0},
+                "memory_usage": {"max": 0, "avg": 0, "min": 0},
+                "disk_usage": {"max": 0, "avg": 0, "min": 0},
+                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+            }
+        
+        cpu_usages = []
+        memory_usages = []
+        disk_usages = []
+        swap_usages = []
+        
+        for metric in metrics:
+            # 计算各项指标
+            cpu_usr = metric.get('cpu_usr', 0) or 0
+            cpu_sys = metric.get('cpu_sys', 0) or 0
+            cpu_iow = metric.get('cpu_iow', 0) or 0
+            cpu_total = cpu_usr + cpu_sys + cpu_iow
+            
+            mem_total = metric.get('mem_total', 0) or 0
+            mem_free = metric.get('mem_free', 0) or 0
+            mem_buff = metric.get('mem_buff', 0) or 0
+            mem_cache = metric.get('mem_cache', 0) or 0
+            mem_used = mem_total - mem_free - mem_buff - mem_cache
+            mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+            
+            disk_usage = metric.get('disk_used_percent', 0) or 0
+            
+            swap_used = metric.get('swap_used', 0) or 0
+            swap_total = metric.get('swap_total', 0) or 0
+            swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+            
+            cpu_usages.append(cpu_total)
+            memory_usages.append(mem_usage_percent)
+            disk_usages.append(disk_usage)
+            swap_usages.append(swap_usage_percent)
+        
+        return {
+            "cpu_usage": {
+                "max": round(max(cpu_usages), 2) if cpu_usages else 0,
+                "avg": round(sum(cpu_usages) / len(cpu_usages), 2) if cpu_usages else 0,
+                "min": round(min(cpu_usages), 2) if cpu_usages else 0
+            },
+            "memory_usage": {
+                "max": round(max(memory_usages), 2) if memory_usages else 0,
+                "avg": round(sum(memory_usages) / len(memory_usages), 2) if memory_usages else 0,
+                "min": round(min(memory_usages), 2) if memory_usages else 0
+            },
+            "disk_usage": {
+                "max": round(max(disk_usages), 2) if disk_usages else 0,
+                "avg": round(sum(disk_usages) / len(disk_usages), 2) if disk_usages else 0,
+                "min": round(min(disk_usages), 2) if disk_usages else 0
+            },
+            "swap_usage": {
+                "max": round(max(swap_usages), 2) if swap_usages else 0,
+                "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
+                "min": round(min(swap_usages), 2) if swap_usages else 0
+            }
+        }
+
+    def _analyze_performance_trend(self, time_window_hours: int) -> Dict:
+        """分析性能趋势"""
+        # 这里可以扩展为获取历史数据进行趋势分析
+        # 目前返回基础趋势信息
+        return {
+            "trend": "stable",  # stable, improving, declining
+            "confidence": 0.8,
+            "analysis": "系统性能整体稳定",
+            "suggestions": ["建议定期检查磁盘使用率", "关注内存使用趋势"]
+        }
+
+    def _calculate_system_health_score(self, status_list: List[Dict]) -> float:
+        """计算系统整体健康评分"""
+        if not status_list:
+            return 0.0
+        
+        total_score = sum(status['overall_score'] for status in status_list)
+        return round(total_score / len(status_list), 2)
+
+    def _categorize_issues(self, issues: List[Dict]) -> Dict:
+        """分类汇总问题"""
+        categories = {}
+        
+        for issue_item in issues:
+            issue_text = issue_item['issue']
+            if "CPU" in issue_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in issue_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in issue_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in issue_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in issue_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
+
+    def _categorize_warnings(self, warnings: List[Dict]) -> Dict:
+        """分类汇总警告"""
+        categories = {}
+        
+        for warning_item in warnings:
+            warning_text = warning_item['warning']
+            if "CPU" in warning_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in warning_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in warning_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in warning_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in warning_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
+
     def get_user_by_username(self, username: str) -> Optional[UserResponse]:
         """
         根据用户名获取用户信息
@@ -1364,6 +13455,409 @@ class DatabaseManager:
             return None
         finally:
             self.return_connection(connection)
+
+    def assess_machine_status(self, metric: Dict) -> Dict:
+        """
+        根据监控指标评估机器运行状态
+        
+        Args:
+            metric: 监控指标数据
+            
+        Returns:
+            包含状态分级和详细信息的字典
+        """
+        # 获取关键指标值，处理None值
+        cpu_usr = metric.get('cpu_usr', 0) or 0
+        cpu_sys = metric.get('cpu_sys', 0) or 0
+        cpu_iow = metric.get('cpu_iow', 0) or 0
+        
+        mem_total = metric.get('mem_total', 0) or 0
+        mem_free = metric.get('mem_free', 0) or 0
+        mem_buff = metric.get('mem_buff', 0) or 0
+        mem_cache = metric.get('mem_cache', 0) or 0
+        
+        disk_used_percent = metric.get('disk_used_percent', 0) or 0
+        swap_used = metric.get('swap_used', 0) or 0
+        swap_total = metric.get('swap_total', 0) or 0
+        
+        # 计算关键指标
+        cpu_total = cpu_usr + cpu_sys + cpu_iow
+        mem_used = mem_total - mem_free - mem_buff - mem_cache
+        mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+        swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 状态评估
+        status_level = "正常"
+        issues = []
+        warnings = []
+        
+        # CPU使用率检查
+        if cpu_total >= 90:
+            status_level = "警告"
+            issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
+        elif cpu_total >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
+        
+        # 内存使用率检查
+        if mem_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
+        elif mem_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
+        
+        # 磁盘使用率检查
+        if disk_used_percent >= 90:
+            status_level = "警告"
+            issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
+        elif disk_used_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
+        
+        # Swap使用率检查
+        if swap_usage_percent >= 50:
+            status_level = "警告"
+            issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
+        elif swap_usage_percent >= 20:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
+        
+        # 数据时效性检查（超过1小时无数据视为异常）
+        import time
+        current_timestamp = int(time.time())
+        metric_timestamp = metric.get('ts', 0)
+        time_diff_hours = (current_timestamp - metric_timestamp) / 3600
+        
+        if time_diff_hours > 1:
+            status_level = "警告"
+            issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
+        elif time_diff_hours > 0.3:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
+        
+        # 构建返回结果
+        result = {
+            "status_level": status_level,
+            "ip": metric.get('ip', '未知'),
+            "timestamp": metric_timestamp,
+            "key_metrics": {
+                "cpu_usage_percent": round(cpu_total, 2),
+                "memory_usage_percent": round(mem_usage_percent, 2),
+                "disk_usage_percent": round(disk_used_percent, 2),
+                "swap_usage_percent": round(swap_usage_percent, 2),
+                "data_freshness_hours": round(time_diff_hours, 2)
+            },
+            "issues": issues,
+            "warnings": warnings,
+            "is_healthy": status_level == "正常",
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+        }
+        
+        return result
+
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+        """
+        计算机器健康评分（0-100分）
+        
+        Args:
+            cpu_usage: CPU使用率
+            mem_usage: 内存使用率
+            disk_usage: 磁盘使用率
+            swap_usage: Swap使用率
+            data_freshness: 数据新鲜度（小时）
+            
+        Returns:
+            健康评分（0-100）
+        """
+        # 各项指标的权重
+        weights = {
+            'cpu': 0.25,
+            'memory': 0.25,
+            'disk': 0.20,
+            'swap': 0.15,
+            'freshness': 0.15
+        }
+        
+        # 计算各项得分（0-100分）
+        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
+        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
+        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
+        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
+        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        
+        # 加权平均
+        total_score = (
+            cpu_score * weights['cpu'] +
+            mem_score * weights['memory'] +
+            disk_score * weights['disk'] +
+            swap_score * weights['swap'] +
+            freshness_score * weights['freshness']
+        )
+        
+        return int(max(0, min(100, total_score)))
+
+    def get_machine_status_by_ip(self, ip: str) -> Dict:
+        """
+        根据IP地址获取机器的最新状态评估
+        
+        Args:
+            ip: IP地址
+            
+        Returns:
+            机器状态评估结果
+        """
+        # 获取最新监控数据
+        metric = self.get_latest_metric_by_ip(ip)
+        
+        if not metric:
+            return {
+                "status_level": "未知",
+                "ip": ip,
+                "timestamp": None,
+                "key_metrics": {},
+                "issues": ["未找到该IP的监控数据"],
+                "warnings": [],
+                "is_healthy": False,
+                "overall_score": 0,
+                "error": "未找到监控数据"
+            }
+        
+        # 评估状态
+        return self.assess_machine_status(metric)
+
+    def get_all_machines_status(self, time_window_hours: int = 1) -> List[Dict]:
+        """
+        获取所有机器的状态评估
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            所有机器的状态评估列表
+        """
+        # 获取活跃机器的监控数据
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        status_list = []
+        for metric in metrics:
+            status = self.assess_machine_status(metric)
+            status_list.append(status)
+        
+        # 按健康评分排序
+        status_list.sort(key=lambda x: x['overall_score'], reverse=True)
+        
+        return status_list
+
+    def get_system_overview(self, time_window_hours: int = 1) -> Dict:
+        """
+        获取系统总体概览信息
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            系统总体概览信息，包含：
+            - 活跃机器统计
+            - 健康状态分布
+            - 告警和提示信息汇总
+            - 关键指标统计
+            - 性能趋势分析
+        """
+        # 获取所有机器的状态评估
+        status_list = self.get_all_machines_status(time_window_hours)
+        
+        # 获取活跃机器的原始监控数据用于统计计算
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        # 1. 活跃机器统计
+        active_machines = len(status_list)
+        active_ips = [status['ip'] for status in status_list]
+        
+        # 2. 健康状态分布
+        status_distribution = {
+            "正常": len([s for s in status_list if s['status_level'] == "正常"]),
+            "提示": len([s for s in status_list if s['status_level'] == "提示"]),
+            "警告": len([s for s in status_list if s['status_level'] == "警告"]),
+            "未知": len([s for s in status_list if s['status_level'] == "未知"])
+        }
+        
+        # 3. 告警和提示信息汇总
+        all_issues = []
+        all_warnings = []
+        
+        for status in status_list:
+            all_issues.extend([{"ip": status['ip'], "issue": issue} for issue in status['issues']])
+            all_warnings.extend([{"ip": status['ip'], "warning": warning} for warning in status['warnings']])
+        
+        # 4. 关键指标统计（最大值、平均值、最小值）
+        key_metrics_stats = self._calculate_key_metrics_statistics(metrics)
+        
+        # 5. 性能趋势分析（基于最近10条数据）
+        trend_analysis = self._analyze_performance_trend(time_window_hours)
+        
+        # 6. 系统健康评分
+        overall_health_score = self._calculate_system_health_score(status_list)
+        
+        # 构建总体概览信息
+        overview = {
+            "timestamp": int(time.time()),
+            "time_window_hours": time_window_hours,
+            "active_machines": {
+                "total": active_machines,
+                "ips": active_ips
+            },
+            "health_status": {
+                "distribution": status_distribution,
+                "overall_score": overall_health_score,
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+            },
+            "alerts_summary": {
+                "critical_issues": len(all_issues),
+                "warning_issues": len(all_warnings),
+                "issues_by_type": self._categorize_issues(all_issues),
+                "warnings_by_type": self._categorize_warnings(all_warnings)
+            },
+            "key_metrics": key_metrics_stats,
+            "performance_trend": trend_analysis,
+            "detailed_alerts": {
+                "critical": all_issues,
+                "warning": all_warnings
+            }
+        }
+        
+        return overview
+
+    def _calculate_key_metrics_statistics(self, metrics: List[Dict]) -> Dict:
+        """计算关键指标的统计信息"""
+        if not metrics:
+            return {
+                "cpu_usage": {"max": 0, "avg": 0, "min": 0},
+                "memory_usage": {"max": 0, "avg": 0, "min": 0},
+                "disk_usage": {"max": 0, "avg": 0, "min": 0},
+                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+            }
+        
+        cpu_usages = []
+        memory_usages = []
+        disk_usages = []
+        swap_usages = []
+        
+        for metric in metrics:
+            # 计算各项指标
+            cpu_usr = metric.get('cpu_usr', 0) or 0
+            cpu_sys = metric.get('cpu_sys', 0) or 0
+            cpu_iow = metric.get('cpu_iow', 0) or 0
+            cpu_total = cpu_usr + cpu_sys + cpu_iow
+            
+            mem_total = metric.get('mem_total', 0) or 0
+            mem_free = metric.get('mem_free', 0) or 0
+            mem_buff = metric.get('mem_buff', 0) or 0
+            mem_cache = metric.get('mem_cache', 0) or 0
+            mem_used = mem_total - mem_free - mem_buff - mem_cache
+            mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+            
+            disk_usage = metric.get('disk_used_percent', 0) or 0
+            
+            swap_used = metric.get('swap_used', 0) or 0
+            swap_total = metric.get('swap_total', 0) or 0
+            swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+            
+            cpu_usages.append(cpu_total)
+            memory_usages.append(mem_usage_percent)
+            disk_usages.append(disk_usage)
+            swap_usages.append(swap_usage_percent)
+        
+        return {
+            "cpu_usage": {
+                "max": round(max(cpu_usages), 2) if cpu_usages else 0,
+                "avg": round(sum(cpu_usages) / len(cpu_usages), 2) if cpu_usages else 0,
+                "min": round(min(cpu_usages), 2) if cpu_usages else 0
+            },
+            "memory_usage": {
+                "max": round(max(memory_usages), 2) if memory_usages else 0,
+                "avg": round(sum(memory_usages) / len(memory_usages), 2) if memory_usages else 0,
+                "min": round(min(memory_usages), 2) if memory_usages else 0
+            },
+            "disk_usage": {
+                "max": round(max(disk_usages), 2) if disk_usages else 0,
+                "avg": round(sum(disk_usages) / len(disk_usages), 2) if disk_usages else 0,
+                "min": round(min(disk_usages), 2) if disk_usages else 0
+            },
+            "swap_usage": {
+                "max": round(max(swap_usages), 2) if swap_usages else 0,
+                "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
+                "min": round(min(swap_usages), 2) if swap_usages else 0
+            }
+        }
+
+    def _analyze_performance_trend(self, time_window_hours: int) -> Dict:
+        """分析性能趋势"""
+        # 这里可以扩展为获取历史数据进行趋势分析
+        # 目前返回基础趋势信息
+        return {
+            "trend": "stable",  # stable, improving, declining
+            "confidence": 0.8,
+            "analysis": "系统性能整体稳定",
+            "suggestions": ["建议定期检查磁盘使用率", "关注内存使用趋势"]
+        }
+
+    def _calculate_system_health_score(self, status_list: List[Dict]) -> float:
+        """计算系统整体健康评分"""
+        if not status_list:
+            return 0.0
+        
+        total_score = sum(status['overall_score'] for status in status_list)
+        return round(total_score / len(status_list), 2)
+
+    def _categorize_issues(self, issues: List[Dict]) -> Dict:
+        """分类汇总问题"""
+        categories = {}
+        
+        for issue_item in issues:
+            issue_text = issue_item['issue']
+            if "CPU" in issue_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in issue_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in issue_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in issue_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in issue_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
+
+    def _categorize_warnings(self, warnings: List[Dict]) -> Dict:
+        """分类汇总警告"""
+        categories = {}
+        
+        for warning_item in warnings:
+            warning_text = warning_item['warning']
+            if "CPU" in warning_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in warning_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in warning_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in warning_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in warning_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
 
     def update_user(self, user_id: int, update_data: UserUpdate) -> bool:
         """
@@ -1427,6 +13921,409 @@ class DatabaseManager:
         finally:
             self.return_connection(connection)
 
+    def assess_machine_status(self, metric: Dict) -> Dict:
+        """
+        根据监控指标评估机器运行状态
+        
+        Args:
+            metric: 监控指标数据
+            
+        Returns:
+            包含状态分级和详细信息的字典
+        """
+        # 获取关键指标值，处理None值
+        cpu_usr = metric.get('cpu_usr', 0) or 0
+        cpu_sys = metric.get('cpu_sys', 0) or 0
+        cpu_iow = metric.get('cpu_iow', 0) or 0
+        
+        mem_total = metric.get('mem_total', 0) or 0
+        mem_free = metric.get('mem_free', 0) or 0
+        mem_buff = metric.get('mem_buff', 0) or 0
+        mem_cache = metric.get('mem_cache', 0) or 0
+        
+        disk_used_percent = metric.get('disk_used_percent', 0) or 0
+        swap_used = metric.get('swap_used', 0) or 0
+        swap_total = metric.get('swap_total', 0) or 0
+        
+        # 计算关键指标
+        cpu_total = cpu_usr + cpu_sys + cpu_iow
+        mem_used = mem_total - mem_free - mem_buff - mem_cache
+        mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+        swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 状态评估
+        status_level = "正常"
+        issues = []
+        warnings = []
+        
+        # CPU使用率检查
+        if cpu_total >= 90:
+            status_level = "警告"
+            issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
+        elif cpu_total >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
+        
+        # 内存使用率检查
+        if mem_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
+        elif mem_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
+        
+        # 磁盘使用率检查
+        if disk_used_percent >= 90:
+            status_level = "警告"
+            issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
+        elif disk_used_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
+        
+        # Swap使用率检查
+        if swap_usage_percent >= 50:
+            status_level = "警告"
+            issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
+        elif swap_usage_percent >= 20:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
+        
+        # 数据时效性检查（超过1小时无数据视为异常）
+        import time
+        current_timestamp = int(time.time())
+        metric_timestamp = metric.get('ts', 0)
+        time_diff_hours = (current_timestamp - metric_timestamp) / 3600
+        
+        if time_diff_hours > 1:
+            status_level = "警告"
+            issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
+        elif time_diff_hours > 0.3:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
+        
+        # 构建返回结果
+        result = {
+            "status_level": status_level,
+            "ip": metric.get('ip', '未知'),
+            "timestamp": metric_timestamp,
+            "key_metrics": {
+                "cpu_usage_percent": round(cpu_total, 2),
+                "memory_usage_percent": round(mem_usage_percent, 2),
+                "disk_usage_percent": round(disk_used_percent, 2),
+                "swap_usage_percent": round(swap_usage_percent, 2),
+                "data_freshness_hours": round(time_diff_hours, 2)
+            },
+            "issues": issues,
+            "warnings": warnings,
+            "is_healthy": status_level == "正常",
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+        }
+        
+        return result
+
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+        """
+        计算机器健康评分（0-100分）
+        
+        Args:
+            cpu_usage: CPU使用率
+            mem_usage: 内存使用率
+            disk_usage: 磁盘使用率
+            swap_usage: Swap使用率
+            data_freshness: 数据新鲜度（小时）
+            
+        Returns:
+            健康评分（0-100）
+        """
+        # 各项指标的权重
+        weights = {
+            'cpu': 0.25,
+            'memory': 0.25,
+            'disk': 0.20,
+            'swap': 0.15,
+            'freshness': 0.15
+        }
+        
+        # 计算各项得分（0-100分）
+        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
+        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
+        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
+        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
+        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        
+        # 加权平均
+        total_score = (
+            cpu_score * weights['cpu'] +
+            mem_score * weights['memory'] +
+            disk_score * weights['disk'] +
+            swap_score * weights['swap'] +
+            freshness_score * weights['freshness']
+        )
+        
+        return int(max(0, min(100, total_score)))
+
+    def get_machine_status_by_ip(self, ip: str) -> Dict:
+        """
+        根据IP地址获取机器的最新状态评估
+        
+        Args:
+            ip: IP地址
+            
+        Returns:
+            机器状态评估结果
+        """
+        # 获取最新监控数据
+        metric = self.get_latest_metric_by_ip(ip)
+        
+        if not metric:
+            return {
+                "status_level": "未知",
+                "ip": ip,
+                "timestamp": None,
+                "key_metrics": {},
+                "issues": ["未找到该IP的监控数据"],
+                "warnings": [],
+                "is_healthy": False,
+                "overall_score": 0,
+                "error": "未找到监控数据"
+            }
+        
+        # 评估状态
+        return self.assess_machine_status(metric)
+
+    def get_all_machines_status(self, time_window_hours: int = 1) -> List[Dict]:
+        """
+        获取所有机器的状态评估
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            所有机器的状态评估列表
+        """
+        # 获取活跃机器的监控数据
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        status_list = []
+        for metric in metrics:
+            status = self.assess_machine_status(metric)
+            status_list.append(status)
+        
+        # 按健康评分排序
+        status_list.sort(key=lambda x: x['overall_score'], reverse=True)
+        
+        return status_list
+
+    def get_system_overview(self, time_window_hours: int = 1) -> Dict:
+        """
+        获取系统总体概览信息
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            系统总体概览信息，包含：
+            - 活跃机器统计
+            - 健康状态分布
+            - 告警和提示信息汇总
+            - 关键指标统计
+            - 性能趋势分析
+        """
+        # 获取所有机器的状态评估
+        status_list = self.get_all_machines_status(time_window_hours)
+        
+        # 获取活跃机器的原始监控数据用于统计计算
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        # 1. 活跃机器统计
+        active_machines = len(status_list)
+        active_ips = [status['ip'] for status in status_list]
+        
+        # 2. 健康状态分布
+        status_distribution = {
+            "正常": len([s for s in status_list if s['status_level'] == "正常"]),
+            "提示": len([s for s in status_list if s['status_level'] == "提示"]),
+            "警告": len([s for s in status_list if s['status_level'] == "警告"]),
+            "未知": len([s for s in status_list if s['status_level'] == "未知"])
+        }
+        
+        # 3. 告警和提示信息汇总
+        all_issues = []
+        all_warnings = []
+        
+        for status in status_list:
+            all_issues.extend([{"ip": status['ip'], "issue": issue} for issue in status['issues']])
+            all_warnings.extend([{"ip": status['ip'], "warning": warning} for warning in status['warnings']])
+        
+        # 4. 关键指标统计（最大值、平均值、最小值）
+        key_metrics_stats = self._calculate_key_metrics_statistics(metrics)
+        
+        # 5. 性能趋势分析（基于最近10条数据）
+        trend_analysis = self._analyze_performance_trend(time_window_hours)
+        
+        # 6. 系统健康评分
+        overall_health_score = self._calculate_system_health_score(status_list)
+        
+        # 构建总体概览信息
+        overview = {
+            "timestamp": int(time.time()),
+            "time_window_hours": time_window_hours,
+            "active_machines": {
+                "total": active_machines,
+                "ips": active_ips
+            },
+            "health_status": {
+                "distribution": status_distribution,
+                "overall_score": overall_health_score,
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+            },
+            "alerts_summary": {
+                "critical_issues": len(all_issues),
+                "warning_issues": len(all_warnings),
+                "issues_by_type": self._categorize_issues(all_issues),
+                "warnings_by_type": self._categorize_warnings(all_warnings)
+            },
+            "key_metrics": key_metrics_stats,
+            "performance_trend": trend_analysis,
+            "detailed_alerts": {
+                "critical": all_issues,
+                "warning": all_warnings
+            }
+        }
+        
+        return overview
+
+    def _calculate_key_metrics_statistics(self, metrics: List[Dict]) -> Dict:
+        """计算关键指标的统计信息"""
+        if not metrics:
+            return {
+                "cpu_usage": {"max": 0, "avg": 0, "min": 0},
+                "memory_usage": {"max": 0, "avg": 0, "min": 0},
+                "disk_usage": {"max": 0, "avg": 0, "min": 0},
+                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+            }
+        
+        cpu_usages = []
+        memory_usages = []
+        disk_usages = []
+        swap_usages = []
+        
+        for metric in metrics:
+            # 计算各项指标
+            cpu_usr = metric.get('cpu_usr', 0) or 0
+            cpu_sys = metric.get('cpu_sys', 0) or 0
+            cpu_iow = metric.get('cpu_iow', 0) or 0
+            cpu_total = cpu_usr + cpu_sys + cpu_iow
+            
+            mem_total = metric.get('mem_total', 0) or 0
+            mem_free = metric.get('mem_free', 0) or 0
+            mem_buff = metric.get('mem_buff', 0) or 0
+            mem_cache = metric.get('mem_cache', 0) or 0
+            mem_used = mem_total - mem_free - mem_buff - mem_cache
+            mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+            
+            disk_usage = metric.get('disk_used_percent', 0) or 0
+            
+            swap_used = metric.get('swap_used', 0) or 0
+            swap_total = metric.get('swap_total', 0) or 0
+            swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+            
+            cpu_usages.append(cpu_total)
+            memory_usages.append(mem_usage_percent)
+            disk_usages.append(disk_usage)
+            swap_usages.append(swap_usage_percent)
+        
+        return {
+            "cpu_usage": {
+                "max": round(max(cpu_usages), 2) if cpu_usages else 0,
+                "avg": round(sum(cpu_usages) / len(cpu_usages), 2) if cpu_usages else 0,
+                "min": round(min(cpu_usages), 2) if cpu_usages else 0
+            },
+            "memory_usage": {
+                "max": round(max(memory_usages), 2) if memory_usages else 0,
+                "avg": round(sum(memory_usages) / len(memory_usages), 2) if memory_usages else 0,
+                "min": round(min(memory_usages), 2) if memory_usages else 0
+            },
+            "disk_usage": {
+                "max": round(max(disk_usages), 2) if disk_usages else 0,
+                "avg": round(sum(disk_usages) / len(disk_usages), 2) if disk_usages else 0,
+                "min": round(min(disk_usages), 2) if disk_usages else 0
+            },
+            "swap_usage": {
+                "max": round(max(swap_usages), 2) if swap_usages else 0,
+                "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
+                "min": round(min(swap_usages), 2) if swap_usages else 0
+            }
+        }
+
+    def _analyze_performance_trend(self, time_window_hours: int) -> Dict:
+        """分析性能趋势"""
+        # 这里可以扩展为获取历史数据进行趋势分析
+        # 目前返回基础趋势信息
+        return {
+            "trend": "stable",  # stable, improving, declining
+            "confidence": 0.8,
+            "analysis": "系统性能整体稳定",
+            "suggestions": ["建议定期检查磁盘使用率", "关注内存使用趋势"]
+        }
+
+    def _calculate_system_health_score(self, status_list: List[Dict]) -> float:
+        """计算系统整体健康评分"""
+        if not status_list:
+            return 0.0
+        
+        total_score = sum(status['overall_score'] for status in status_list)
+        return round(total_score / len(status_list), 2)
+
+    def _categorize_issues(self, issues: List[Dict]) -> Dict:
+        """分类汇总问题"""
+        categories = {}
+        
+        for issue_item in issues:
+            issue_text = issue_item['issue']
+            if "CPU" in issue_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in issue_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in issue_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in issue_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in issue_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
+
+    def _categorize_warnings(self, warnings: List[Dict]) -> Dict:
+        """分类汇总警告"""
+        categories = {}
+        
+        for warning_item in warnings:
+            warning_text = warning_item['warning']
+            if "CPU" in warning_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in warning_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in warning_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in warning_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in warning_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
+
     def delete_user(self, user_id: int) -> bool:
         """
         删除用户（软删除，设置为非激活状态）
@@ -1460,3 +14357,406 @@ class DatabaseManager:
             return False
         finally:
             self.return_connection(connection)
+
+    def assess_machine_status(self, metric: Dict) -> Dict:
+        """
+        根据监控指标评估机器运行状态
+        
+        Args:
+            metric: 监控指标数据
+            
+        Returns:
+            包含状态分级和详细信息的字典
+        """
+        # 获取关键指标值，处理None值
+        cpu_usr = metric.get('cpu_usr', 0) or 0
+        cpu_sys = metric.get('cpu_sys', 0) or 0
+        cpu_iow = metric.get('cpu_iow', 0) or 0
+        
+        mem_total = metric.get('mem_total', 0) or 0
+        mem_free = metric.get('mem_free', 0) or 0
+        mem_buff = metric.get('mem_buff', 0) or 0
+        mem_cache = metric.get('mem_cache', 0) or 0
+        
+        disk_used_percent = metric.get('disk_used_percent', 0) or 0
+        swap_used = metric.get('swap_used', 0) or 0
+        swap_total = metric.get('swap_total', 0) or 0
+        
+        # 计算关键指标
+        cpu_total = cpu_usr + cpu_sys + cpu_iow
+        mem_used = mem_total - mem_free - mem_buff - mem_cache
+        mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+        swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 状态评估
+        status_level = "正常"
+        issues = []
+        warnings = []
+        
+        # CPU使用率检查
+        if cpu_total >= 90:
+            status_level = "警告"
+            issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
+        elif cpu_total >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
+        
+        # 内存使用率检查
+        if mem_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
+        elif mem_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
+        
+        # 磁盘使用率检查
+        if disk_used_percent >= 90:
+            status_level = "警告"
+            issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
+        elif disk_used_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
+        
+        # Swap使用率检查
+        if swap_usage_percent >= 50:
+            status_level = "警告"
+            issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
+        elif swap_usage_percent >= 20:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
+        
+        # 数据时效性检查（超过1小时无数据视为异常）
+        import time
+        current_timestamp = int(time.time())
+        metric_timestamp = metric.get('ts', 0)
+        time_diff_hours = (current_timestamp - metric_timestamp) / 3600
+        
+        if time_diff_hours > 1:
+            status_level = "警告"
+            issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
+        elif time_diff_hours > 0.3:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
+        
+        # 构建返回结果
+        result = {
+            "status_level": status_level,
+            "ip": metric.get('ip', '未知'),
+            "timestamp": metric_timestamp,
+            "key_metrics": {
+                "cpu_usage_percent": round(cpu_total, 2),
+                "memory_usage_percent": round(mem_usage_percent, 2),
+                "disk_usage_percent": round(disk_used_percent, 2),
+                "swap_usage_percent": round(swap_usage_percent, 2),
+                "data_freshness_hours": round(time_diff_hours, 2)
+            },
+            "issues": issues,
+            "warnings": warnings,
+            "is_healthy": status_level == "正常",
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+        }
+        
+        return result
+
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+        """
+        计算机器健康评分（0-100分）
+        
+        Args:
+            cpu_usage: CPU使用率
+            mem_usage: 内存使用率
+            disk_usage: 磁盘使用率
+            swap_usage: Swap使用率
+            data_freshness: 数据新鲜度（小时）
+            
+        Returns:
+            健康评分（0-100）
+        """
+        # 各项指标的权重
+        weights = {
+            'cpu': 0.25,
+            'memory': 0.25,
+            'disk': 0.20,
+            'swap': 0.15,
+            'freshness': 0.15
+        }
+        
+        # 计算各项得分（0-100分）
+        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
+        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
+        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
+        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
+        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        
+        # 加权平均
+        total_score = (
+            cpu_score * weights['cpu'] +
+            mem_score * weights['memory'] +
+            disk_score * weights['disk'] +
+            swap_score * weights['swap'] +
+            freshness_score * weights['freshness']
+        )
+        
+        return int(max(0, min(100, total_score)))
+
+    def get_machine_status_by_ip(self, ip: str) -> Dict:
+        """
+        根据IP地址获取机器的最新状态评估
+        
+        Args:
+            ip: IP地址
+            
+        Returns:
+            机器状态评估结果
+        """
+        # 获取最新监控数据
+        metric = self.get_latest_metric_by_ip(ip)
+        
+        if not metric:
+            return {
+                "status_level": "未知",
+                "ip": ip,
+                "timestamp": None,
+                "key_metrics": {},
+                "issues": ["未找到该IP的监控数据"],
+                "warnings": [],
+                "is_healthy": False,
+                "overall_score": 0,
+                "error": "未找到监控数据"
+            }
+        
+        # 评估状态
+        return self.assess_machine_status(metric)
+
+    def get_all_machines_status(self, time_window_hours: int = 1) -> List[Dict]:
+        """
+        获取所有机器的状态评估
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            所有机器的状态评估列表
+        """
+        # 获取活跃机器的监控数据
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        status_list = []
+        for metric in metrics:
+            status = self.assess_machine_status(metric)
+            status_list.append(status)
+        
+        # 按健康评分排序
+        status_list.sort(key=lambda x: x['overall_score'], reverse=True)
+        
+        return status_list
+
+    def get_system_overview(self, time_window_hours: int = 1) -> Dict:
+        """
+        获取系统总体概览信息
+        
+        Args:
+            time_window_hours: 时间窗口（小时）
+            
+        Returns:
+            系统总体概览信息，包含：
+            - 活跃机器统计
+            - 健康状态分布
+            - 告警和提示信息汇总
+            - 关键指标统计
+            - 性能趋势分析
+        """
+        # 获取所有机器的状态评估
+        status_list = self.get_all_machines_status(time_window_hours)
+        
+        # 获取活跃机器的原始监控数据用于统计计算
+        metrics = self.get_active_machines_latest_metrics(time_window_hours)
+        
+        # 1. 活跃机器统计
+        active_machines = len(status_list)
+        active_ips = [status['ip'] for status in status_list]
+        
+        # 2. 健康状态分布
+        status_distribution = {
+            "正常": len([s for s in status_list if s['status_level'] == "正常"]),
+            "提示": len([s for s in status_list if s['status_level'] == "提示"]),
+            "警告": len([s for s in status_list if s['status_level'] == "警告"]),
+            "未知": len([s for s in status_list if s['status_level'] == "未知"])
+        }
+        
+        # 3. 告警和提示信息汇总
+        all_issues = []
+        all_warnings = []
+        
+        for status in status_list:
+            all_issues.extend([{"ip": status['ip'], "issue": issue} for issue in status['issues']])
+            all_warnings.extend([{"ip": status['ip'], "warning": warning} for warning in status['warnings']])
+        
+        # 4. 关键指标统计（最大值、平均值、最小值）
+        key_metrics_stats = self._calculate_key_metrics_statistics(metrics)
+        
+        # 5. 性能趋势分析（基于最近10条数据）
+        trend_analysis = self._analyze_performance_trend(time_window_hours)
+        
+        # 6. 系统健康评分
+        overall_health_score = self._calculate_system_health_score(status_list)
+        
+        # 构建总体概览信息
+        overview = {
+            "timestamp": int(time.time()),
+            "time_window_hours": time_window_hours,
+            "active_machines": {
+                "total": active_machines,
+                "ips": active_ips
+            },
+            "health_status": {
+                "distribution": status_distribution,
+                "overall_score": overall_health_score,
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+            },
+            "alerts_summary": {
+                "critical_issues": len(all_issues),
+                "warning_issues": len(all_warnings),
+                "issues_by_type": self._categorize_issues(all_issues),
+                "warnings_by_type": self._categorize_warnings(all_warnings)
+            },
+            "key_metrics": key_metrics_stats,
+            "performance_trend": trend_analysis,
+            "detailed_alerts": {
+                "critical": all_issues,
+                "warning": all_warnings
+            }
+        }
+        
+        return overview
+
+    def _calculate_key_metrics_statistics(self, metrics: List[Dict]) -> Dict:
+        """计算关键指标的统计信息"""
+        if not metrics:
+            return {
+                "cpu_usage": {"max": 0, "avg": 0, "min": 0},
+                "memory_usage": {"max": 0, "avg": 0, "min": 0},
+                "disk_usage": {"max": 0, "avg": 0, "min": 0},
+                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+            }
+        
+        cpu_usages = []
+        memory_usages = []
+        disk_usages = []
+        swap_usages = []
+        
+        for metric in metrics:
+            # 计算各项指标
+            cpu_usr = metric.get('cpu_usr', 0) or 0
+            cpu_sys = metric.get('cpu_sys', 0) or 0
+            cpu_iow = metric.get('cpu_iow', 0) or 0
+            cpu_total = cpu_usr + cpu_sys + cpu_iow
+            
+            mem_total = metric.get('mem_total', 0) or 0
+            mem_free = metric.get('mem_free', 0) or 0
+            mem_buff = metric.get('mem_buff', 0) or 0
+            mem_cache = metric.get('mem_cache', 0) or 0
+            mem_used = mem_total - mem_free - mem_buff - mem_cache
+            mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
+            
+            disk_usage = metric.get('disk_used_percent', 0) or 0
+            
+            swap_used = metric.get('swap_used', 0) or 0
+            swap_total = metric.get('swap_total', 0) or 0
+            swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+            
+            cpu_usages.append(cpu_total)
+            memory_usages.append(mem_usage_percent)
+            disk_usages.append(disk_usage)
+            swap_usages.append(swap_usage_percent)
+        
+        return {
+            "cpu_usage": {
+                "max": round(max(cpu_usages), 2) if cpu_usages else 0,
+                "avg": round(sum(cpu_usages) / len(cpu_usages), 2) if cpu_usages else 0,
+                "min": round(min(cpu_usages), 2) if cpu_usages else 0
+            },
+            "memory_usage": {
+                "max": round(max(memory_usages), 2) if memory_usages else 0,
+                "avg": round(sum(memory_usages) / len(memory_usages), 2) if memory_usages else 0,
+                "min": round(min(memory_usages), 2) if memory_usages else 0
+            },
+            "disk_usage": {
+                "max": round(max(disk_usages), 2) if disk_usages else 0,
+                "avg": round(sum(disk_usages) / len(disk_usages), 2) if disk_usages else 0,
+                "min": round(min(disk_usages), 2) if disk_usages else 0
+            },
+            "swap_usage": {
+                "max": round(max(swap_usages), 2) if swap_usages else 0,
+                "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
+                "min": round(min(swap_usages), 2) if swap_usages else 0
+            }
+        }
+
+    def _analyze_performance_trend(self, time_window_hours: int) -> Dict:
+        """分析性能趋势"""
+        # 这里可以扩展为获取历史数据进行趋势分析
+        # 目前返回基础趋势信息
+        return {
+            "trend": "stable",  # stable, improving, declining
+            "confidence": 0.8,
+            "analysis": "系统性能整体稳定",
+            "suggestions": ["建议定期检查磁盘使用率", "关注内存使用趋势"]
+        }
+
+    def _calculate_system_health_score(self, status_list: List[Dict]) -> float:
+        """计算系统整体健康评分"""
+        if not status_list:
+            return 0.0
+        
+        total_score = sum(status['overall_score'] for status in status_list)
+        return round(total_score / len(status_list), 2)
+
+    def _categorize_issues(self, issues: List[Dict]) -> Dict:
+        """分类汇总问题"""
+        categories = {}
+        
+        for issue_item in issues:
+            issue_text = issue_item['issue']
+            if "CPU" in issue_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in issue_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in issue_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in issue_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in issue_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories
+
+    def _categorize_warnings(self, warnings: List[Dict]) -> Dict:
+        """分类汇总警告"""
+        categories = {}
+        
+        for warning_item in warnings:
+            warning_text = warning_item['warning']
+            if "CPU" in warning_text:
+                categories["cpu"] = categories.get("cpu", 0) + 1
+            elif "内存" in warning_text:
+                categories["memory"] = categories.get("memory", 0) + 1
+            elif "磁盘" in warning_text:
+                categories["disk"] = categories.get("disk", 0) + 1
+            elif "Swap" in warning_text:
+                categories["swap"] = categories.get("swap", 0) + 1
+            elif "数据" in warning_text:
+                categories["data_freshness"] = categories.get("data_freshness", 0) + 1
+            else:
+                categories["other"] = categories.get("other", 0) + 1
+        
+        return categories

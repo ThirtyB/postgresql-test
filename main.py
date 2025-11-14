@@ -847,6 +847,135 @@ async def refresh_token(refresh_token: str):
         )
 
 
+@app.get("/monitor-metrics/machine-status/{ip}", response_model=SuccessResponse)
+@cache_decorator(expire_seconds=60, key_prefix="machine_status")
+async def get_machine_status_by_ip(ip: str, current_user: UserResponse = Depends(allow_all)):
+    """
+    根据IP地址获取机器的最新状态评估（需要认证，1分钟缓存）
+    
+    Args:
+        ip: IP地址
+        current_user: 当前认证用户
+        
+    Returns:
+        机器状态评估结果，包含：
+        - status_level: 状态分级（正常/提示/警告/未知）
+        - key_metrics: 关键指标数据
+        - issues: 问题列表
+        - warnings: 警告列表
+        - is_healthy: 是否健康
+        - overall_score: 健康评分（0-100）
+    """
+    try:
+        status = db_manager.get_machine_status_by_ip(ip)
+        cache_metrics.record_hit()
+        return SuccessResponse(
+            data=status,
+            message=f"成功获取IP {ip} 的状态评估"
+        )
+        
+    except Exception as e:
+        cache_metrics.record_error()
+        return ErrorResponse(
+            code=ErrorCode.DATABASE_ERROR,
+            message=f"获取机器状态评估失败: {str(e)}"
+        )
+
+@app.get("/monitor-metrics/all-machines-status", response_model=SuccessResponse)
+@cache_decorator(expire_seconds=60, key_prefix="all_machines_status")
+async def get_all_machines_status(
+    time_window_hours: int = Query(default=1, ge=1, le=24, description="时间窗口（小时），默认为1小时"),
+    current_user: UserResponse = Depends(allow_all)
+):
+    """
+    获取所有机器的状态评估（需要认证，1分钟缓存）
+    
+    Args:
+        time_window_hours: 时间窗口（小时）
+        current_user: 当前认证用户
+        
+    Returns:
+        所有机器的状态评估列表，按健康评分排序
+    """
+    try:
+        status_list = db_manager.get_all_machines_status(time_window_hours)
+        
+        # 统计信息
+        total_machines = len(status_list)
+        healthy_machines = len([s for s in status_list if s['is_healthy']])
+        warning_machines = len([s for s in status_list if s['status_level'] == "提示"])
+        critical_machines = len([s for s in status_list if s['status_level'] == "警告"])
+        unknown_machines = len([s for s in status_list if s['status_level'] == "未知"])
+        
+        summary = {
+            "total_machines": total_machines,
+            "healthy_machines": healthy_machines,
+            "warning_machines": warning_machines,
+            "critical_machines": critical_machines,
+            "unknown_machines": unknown_machines,
+            "health_percentage": round((healthy_machines / total_machines * 100), 2) if total_machines > 0 else 0
+        }
+        
+        cache_metrics.record_hit()
+        return SuccessResponse(
+            data={
+                "machines": status_list,
+                "summary": summary
+            },
+            message=f"成功获取{total_machines}个机器的状态评估"
+        )
+        
+    except Exception as e:
+        cache_metrics.record_error()
+        return ErrorResponse(
+            code=ErrorCode.DATABASE_ERROR,
+            message=f"获取所有机器状态评估失败: {str(e)}"
+        )
+
+@app.get("/monitor-metrics/system-overview")
+@cache_decorator(expire_seconds=60, key_prefix="system_overview")
+async def get_system_overview(
+    time_window_hours: int = Query(default=1, ge=1, le=24, description="时间窗口（小时），默认为1小时"),
+    current_user: UserResponse = Depends(allow_all)
+):
+    """
+    获取系统总体概览信息（需要认证，1分钟缓存）
+    
+    Args:
+        time_window_hours: 时间窗口（小时）
+        current_user: 当前认证用户
+        
+    Returns:
+        系统总体概览信息，包含：
+        - 活跃机器数量和IP列表
+        - 健康状态分布统计
+        - 告警和提示信息汇总
+        - 关键指标的最大值、平均值、最小值
+        - 性能趋势分析
+        - 详细告警信息
+    """
+    try:
+        overview = db_manager.get_system_overview(time_window_hours)
+        
+        cache_metrics.record_hit()
+        # 直接返回数据，避免响应模型验证问题
+        return {
+            "code": 200,
+            "message": "成功获取系统总体概览信息",
+            "status": "success",
+            "timestamp": datetime.now().isoformat(),
+            "data": overview
+        }
+        
+    except Exception as e:
+        cache_metrics.record_error()
+        return {
+            "code": ErrorCode.DATABASE_ERROR,
+            "message": f"获取系统总体概览信息失败: {str(e)}",
+            "status": "error",
+            "timestamp": datetime.now().isoformat()
+        }
+
 @app.get("/cache/stats", response_model=SuccessResponse)
 async def get_cache_statistics(current_user: UserResponse = Depends(allow_admin)):
     """
