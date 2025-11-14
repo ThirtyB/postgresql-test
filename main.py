@@ -860,11 +860,11 @@ async def get_machine_status_by_ip(ip: str, current_user: UserResponse = Depends
     Returns:
         机器状态评估结果，包含：
         - status_level: 状态分级（正常/提示/警告/未知）
-        - key_metrics: 关键指标数据
+        - key_metrics: 关键指标数据（CPU、内存、磁盘、Swap、网络5维指标）
         - issues: 问题列表
         - warnings: 警告列表
         - is_healthy: 是否健康
-        - overall_score: 健康评分（0-100）
+        - overall_score: 基于5维指标的健康评分（0-100）
     """
     try:
         status = db_manager.get_machine_status_by_ip(ip)
@@ -950,9 +950,10 @@ async def get_system_overview(
         - 活跃机器数量和IP列表
         - 健康状态分布统计
         - 告警和提示信息汇总
-        - 关键指标的最大值、平均值、最小值
+        - 关键指标的最大值、平均值、最小值（CPU、内存、磁盘、Swap、网络5维指标）
         - 性能趋势分析
         - 详细告警信息
+        - 基于5维指标的系统健康评分
     """
     try:
         overview = db_manager.get_system_overview(time_window_hours)

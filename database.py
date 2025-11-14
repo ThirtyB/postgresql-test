@@ -106,11 +106,21 @@ class DatabaseManager:
         swap_used = metric.get('swap_used', 0) or 0
         swap_total = metric.get('swap_total', 0) or 0
         
+        # 网络指标
+        net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+        net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+        
         # 计算关键指标
         cpu_total = cpu_usr + cpu_sys + cpu_iow
         mem_used = mem_total - mem_free - mem_buff - mem_cache
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
+        # 1000 Mbps = 125,000 KB/s
+        max_bandwidth_kbps = 125000
+        total_network_usage = net_rx_kbps + net_tx_kbps
+        network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
         # 状态评估
         status_level = "正常"
@@ -153,6 +163,15 @@ class DatabaseManager:
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
+        # 网络使用率检查
+        if network_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
+        elif network_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
+        
         # 数据时效性检查（超过1小时无数据视为异常）
         import time
         current_timestamp = int(time.time())
@@ -177,17 +196,18 @@ class DatabaseManager:
                 "memory_usage_percent": round(mem_usage_percent, 2),
                 "disk_usage_percent": round(disk_used_percent, 2),
                 "swap_usage_percent": round(swap_usage_percent, 2),
+                "network_usage_percent": round(network_usage_percent, 2),
                 "data_freshness_hours": round(time_diff_hours, 2)
             },
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -196,18 +216,20 @@ class DatabaseManager:
             mem_usage: 内存使用率
             disk_usage: 磁盘使用率
             swap_usage: Swap使用率
+            network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重
+        # 各项指标的权重（调整为5维评分）
         weights = {
-            'cpu': 0.25,
-            'memory': 0.25,
+            'cpu': 0.20,
+            'memory': 0.20,
             'disk': 0.20,
             'swap': 0.15,
-            'freshness': 0.15
+            'network': 0.15,
+            'freshness': 0.10
         }
         
         # 计算各项得分（0-100分）
@@ -215,6 +237,13 @@ class DatabaseManager:
         mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
         disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
         swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+        # 网络使用率越高得分越高，但超过80%开始扣分
+        if network_usage <= 80:
+            network_score = 100
+        else:
+            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
         
         # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
         freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
@@ -225,6 +254,7 @@ class DatabaseManager:
             mem_score * weights['memory'] +
             disk_score * weights['disk'] +
             swap_score * weights['swap'] +
+            network_score * weights['network'] +
             freshness_score * weights['freshness']
         )
         
@@ -296,6 +326,7 @@ class DatabaseManager:
             - 告警和提示信息汇总
             - 关键指标统计
             - 性能趋势分析
+            - 五维健康度评分
         """
         # 获取所有机器的状态评估
         status_list = self.get_all_machines_status(time_window_hours)
@@ -332,6 +363,9 @@ class DatabaseManager:
         # 6. 系统健康评分
         overall_health_score = self._calculate_system_health_score(status_list)
         
+        # 7. 五维健康度评分
+        five_dimension_scores = self._calculate_five_dimension_scores(status_list)
+        
         # 构建总体概览信息
         overview = {
             "timestamp": int(time.time()),
@@ -343,7 +377,8 @@ class DatabaseManager:
             "health_status": {
                 "distribution": status_distribution,
                 "overall_score": overall_health_score,
-                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0,
+                "five_dimension_scores": five_dimension_scores
             },
             "alerts_summary": {
                 "critical_issues": len(all_issues),
@@ -368,13 +403,15 @@ class DatabaseManager:
                 "cpu_usage": {"max": 0, "avg": 0, "min": 0},
                 "memory_usage": {"max": 0, "avg": 0, "min": 0},
                 "disk_usage": {"max": 0, "avg": 0, "min": 0},
-                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+                "swap_usage": {"max": 0, "avg": 0, "min": 0},
+                "network_usage": {"max": 0, "avg": 0, "min": 0}
             }
         
         cpu_usages = []
         memory_usages = []
         disk_usages = []
         swap_usages = []
+        network_usages = []
         
         for metric in metrics:
             # 计算各项指标
@@ -396,10 +433,18 @@ class DatabaseManager:
             swap_total = metric.get('swap_total', 0) or 0
             swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
             
+            # 计算网络使用率
+            net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+            net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+            max_bandwidth_kbps = 125000  # 1000 Mbps = 125,000 KB/s
+            total_network_usage = net_rx_kbps + net_tx_kbps
+            network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
+            
             cpu_usages.append(cpu_total)
             memory_usages.append(mem_usage_percent)
             disk_usages.append(disk_usage)
             swap_usages.append(swap_usage_percent)
+            network_usages.append(network_usage_percent)
         
         return {
             "cpu_usage": {
@@ -421,6 +466,11 @@ class DatabaseManager:
                 "max": round(max(swap_usages), 2) if swap_usages else 0,
                 "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
                 "min": round(min(swap_usages), 2) if swap_usages else 0
+            },
+            "network_usage": {
+                "max": round(max(network_usages), 2) if network_usages else 0,
+                "avg": round(sum(network_usages) / len(network_usages), 2) if network_usages else 0,
+                "min": round(min(network_usages), 2) if network_usages else 0
             }
         }
 
@@ -442,6 +492,70 @@ class DatabaseManager:
         
         total_score = sum(status['overall_score'] for status in status_list)
         return round(total_score / len(status_list), 2)
+
+    def _calculate_five_dimension_scores(self, status_list: List[Dict]) -> Dict:
+        """
+        计算五维健康度评分
+        
+        Args:
+            status_list: 机器状态列表
+            
+        Returns:
+            五维健康度评分字典，包含CPU、内存、Swap、磁盘、网络五个维度的平均评分
+        """
+        if not status_list:
+            return {
+                "cpu_score": 0.0,
+                "memory_score": 0.0,
+                "swap_score": 0.0,
+                "disk_score": 0.0,
+                "network_score": 0.0
+            }
+        
+        # 收集每个维度的评分
+        cpu_scores = []
+        memory_scores = []
+        swap_scores = []
+        disk_scores = []
+        network_scores = []
+        
+        for status in status_list:
+            key_metrics = status.get('key_metrics', {})
+            
+            # 计算每个维度的评分（基于使用率，使用率越低评分越高）
+            cpu_usage = key_metrics.get('cpu_usage_percent', 0)
+            cpu_score = max(0, 100 - cpu_usage)
+            cpu_scores.append(cpu_score)
+            
+            memory_usage = key_metrics.get('memory_usage_percent', 0)
+            memory_score = max(0, 100 - memory_usage)
+            memory_scores.append(memory_score)
+            
+            swap_usage = key_metrics.get('swap_usage_percent', 0)
+            swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+            swap_scores.append(swap_score)
+            
+            disk_usage = key_metrics.get('disk_usage_percent', 0)
+            disk_score = max(0, 100 - disk_usage)
+            disk_scores.append(disk_score)
+            
+            network_usage = key_metrics.get('network_usage_percent', 0)
+            # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+            # 网络使用率越高得分越高，但超过80%开始扣分
+            if network_usage <= 80:
+                network_score = 100
+            else:
+                network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_scores.append(network_score)
+        
+        # 计算平均评分
+        return {
+            "cpu_score": round(sum(cpu_scores) / len(cpu_scores), 2) if cpu_scores else 0.0,
+            "memory_score": round(sum(memory_scores) / len(memory_scores), 2) if memory_scores else 0.0,
+            "swap_score": round(sum(swap_scores) / len(swap_scores), 2) if swap_scores else 0.0,
+            "disk_score": round(sum(disk_scores) / len(disk_scores), 2) if disk_scores else 0.0,
+            "network_score": round(sum(network_scores) / len(network_scores), 2) if network_scores else 0.0
+        }
 
     def _categorize_issues(self, issues: List[Dict]) -> Dict:
         """分类汇总问题"""
@@ -538,11 +652,21 @@ class DatabaseManager:
         swap_used = metric.get('swap_used', 0) or 0
         swap_total = metric.get('swap_total', 0) or 0
         
+        # 网络指标
+        net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+        net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+        
         # 计算关键指标
         cpu_total = cpu_usr + cpu_sys + cpu_iow
         mem_used = mem_total - mem_free - mem_buff - mem_cache
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
+        # 1000 Mbps = 125,000 KB/s
+        max_bandwidth_kbps = 125000
+        total_network_usage = net_rx_kbps + net_tx_kbps
+        network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
         # 状态评估
         status_level = "正常"
@@ -585,6 +709,15 @@ class DatabaseManager:
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
+        # 网络使用率检查
+        if network_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
+        elif network_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
+        
         # 数据时效性检查（超过1小时无数据视为异常）
         import time
         current_timestamp = int(time.time())
@@ -609,17 +742,18 @@ class DatabaseManager:
                 "memory_usage_percent": round(mem_usage_percent, 2),
                 "disk_usage_percent": round(disk_used_percent, 2),
                 "swap_usage_percent": round(swap_usage_percent, 2),
+                "network_usage_percent": round(network_usage_percent, 2),
                 "data_freshness_hours": round(time_diff_hours, 2)
             },
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -628,18 +762,20 @@ class DatabaseManager:
             mem_usage: 内存使用率
             disk_usage: 磁盘使用率
             swap_usage: Swap使用率
+            network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重
+        # 各项指标的权重（调整为5维评分）
         weights = {
-            'cpu': 0.25,
-            'memory': 0.25,
+            'cpu': 0.20,
+            'memory': 0.20,
             'disk': 0.20,
             'swap': 0.15,
-            'freshness': 0.15
+            'network': 0.15,
+            'freshness': 0.10
         }
         
         # 计算各项得分（0-100分）
@@ -647,6 +783,13 @@ class DatabaseManager:
         mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
         disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
         swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+        # 网络使用率越高得分越高，但超过80%开始扣分
+        if network_usage <= 80:
+            network_score = 100
+        else:
+            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
         
         # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
         freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
@@ -657,6 +800,7 @@ class DatabaseManager:
             mem_score * weights['memory'] +
             disk_score * weights['disk'] +
             swap_score * weights['swap'] +
+            network_score * weights['network'] +
             freshness_score * weights['freshness']
         )
         
@@ -728,6 +872,7 @@ class DatabaseManager:
             - 告警和提示信息汇总
             - 关键指标统计
             - 性能趋势分析
+            - 五维健康度评分
         """
         # 获取所有机器的状态评估
         status_list = self.get_all_machines_status(time_window_hours)
@@ -764,6 +909,9 @@ class DatabaseManager:
         # 6. 系统健康评分
         overall_health_score = self._calculate_system_health_score(status_list)
         
+        # 7. 五维健康度评分
+        five_dimension_scores = self._calculate_five_dimension_scores(status_list)
+        
         # 构建总体概览信息
         overview = {
             "timestamp": int(time.time()),
@@ -775,7 +923,8 @@ class DatabaseManager:
             "health_status": {
                 "distribution": status_distribution,
                 "overall_score": overall_health_score,
-                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0,
+                "five_dimension_scores": five_dimension_scores
             },
             "alerts_summary": {
                 "critical_issues": len(all_issues),
@@ -800,13 +949,15 @@ class DatabaseManager:
                 "cpu_usage": {"max": 0, "avg": 0, "min": 0},
                 "memory_usage": {"max": 0, "avg": 0, "min": 0},
                 "disk_usage": {"max": 0, "avg": 0, "min": 0},
-                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+                "swap_usage": {"max": 0, "avg": 0, "min": 0},
+                "network_usage": {"max": 0, "avg": 0, "min": 0}
             }
         
         cpu_usages = []
         memory_usages = []
         disk_usages = []
         swap_usages = []
+        network_usages = []
         
         for metric in metrics:
             # 计算各项指标
@@ -828,10 +979,18 @@ class DatabaseManager:
             swap_total = metric.get('swap_total', 0) or 0
             swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
             
+            # 计算网络使用率
+            net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+            net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+            max_bandwidth_kbps = 125000  # 1000 Mbps = 125,000 KB/s
+            total_network_usage = net_rx_kbps + net_tx_kbps
+            network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
+            
             cpu_usages.append(cpu_total)
             memory_usages.append(mem_usage_percent)
             disk_usages.append(disk_usage)
             swap_usages.append(swap_usage_percent)
+            network_usages.append(network_usage_percent)
         
         return {
             "cpu_usage": {
@@ -853,6 +1012,11 @@ class DatabaseManager:
                 "max": round(max(swap_usages), 2) if swap_usages else 0,
                 "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
                 "min": round(min(swap_usages), 2) if swap_usages else 0
+            },
+            "network_usage": {
+                "max": round(max(network_usages), 2) if network_usages else 0,
+                "avg": round(sum(network_usages) / len(network_usages), 2) if network_usages else 0,
+                "min": round(min(network_usages), 2) if network_usages else 0
             }
         }
 
@@ -874,6 +1038,70 @@ class DatabaseManager:
         
         total_score = sum(status['overall_score'] for status in status_list)
         return round(total_score / len(status_list), 2)
+
+    def _calculate_five_dimension_scores(self, status_list: List[Dict]) -> Dict:
+        """
+        计算五维健康度评分
+        
+        Args:
+            status_list: 机器状态列表
+            
+        Returns:
+            五维健康度评分字典，包含CPU、内存、Swap、磁盘、网络五个维度的平均评分
+        """
+        if not status_list:
+            return {
+                "cpu_score": 0.0,
+                "memory_score": 0.0,
+                "swap_score": 0.0,
+                "disk_score": 0.0,
+                "network_score": 0.0
+            }
+        
+        # 收集每个维度的评分
+        cpu_scores = []
+        memory_scores = []
+        swap_scores = []
+        disk_scores = []
+        network_scores = []
+        
+        for status in status_list:
+            key_metrics = status.get('key_metrics', {})
+            
+            # 计算每个维度的评分（基于使用率，使用率越低评分越高）
+            cpu_usage = key_metrics.get('cpu_usage_percent', 0)
+            cpu_score = max(0, 100 - cpu_usage)
+            cpu_scores.append(cpu_score)
+            
+            memory_usage = key_metrics.get('memory_usage_percent', 0)
+            memory_score = max(0, 100 - memory_usage)
+            memory_scores.append(memory_score)
+            
+            swap_usage = key_metrics.get('swap_usage_percent', 0)
+            swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+            swap_scores.append(swap_score)
+            
+            disk_usage = key_metrics.get('disk_usage_percent', 0)
+            disk_score = max(0, 100 - disk_usage)
+            disk_scores.append(disk_score)
+            
+            network_usage = key_metrics.get('network_usage_percent', 0)
+            # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+            # 网络使用率越高得分越高，但超过80%开始扣分
+            if network_usage <= 80:
+                network_score = 100
+            else:
+                network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_scores.append(network_score)
+        
+        # 计算平均评分
+        return {
+            "cpu_score": round(sum(cpu_scores) / len(cpu_scores), 2) if cpu_scores else 0.0,
+            "memory_score": round(sum(memory_scores) / len(memory_scores), 2) if memory_scores else 0.0,
+            "swap_score": round(sum(swap_scores) / len(swap_scores), 2) if swap_scores else 0.0,
+            "disk_score": round(sum(disk_scores) / len(disk_scores), 2) if disk_scores else 0.0,
+            "network_score": round(sum(network_scores) / len(network_scores), 2) if network_scores else 0.0
+        }
 
     def _categorize_issues(self, issues: List[Dict]) -> Dict:
         """分类汇总问题"""
@@ -966,11 +1194,21 @@ class DatabaseManager:
         swap_used = metric.get('swap_used', 0) or 0
         swap_total = metric.get('swap_total', 0) or 0
         
+        # 网络指标
+        net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+        net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+        
         # 计算关键指标
         cpu_total = cpu_usr + cpu_sys + cpu_iow
         mem_used = mem_total - mem_free - mem_buff - mem_cache
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
+        # 1000 Mbps = 125,000 KB/s
+        max_bandwidth_kbps = 125000
+        total_network_usage = net_rx_kbps + net_tx_kbps
+        network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
         # 状态评估
         status_level = "正常"
@@ -1013,6 +1251,15 @@ class DatabaseManager:
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
+        # 网络使用率检查
+        if network_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
+        elif network_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
+        
         # 数据时效性检查（超过1小时无数据视为异常）
         import time
         current_timestamp = int(time.time())
@@ -1037,17 +1284,18 @@ class DatabaseManager:
                 "memory_usage_percent": round(mem_usage_percent, 2),
                 "disk_usage_percent": round(disk_used_percent, 2),
                 "swap_usage_percent": round(swap_usage_percent, 2),
+                "network_usage_percent": round(network_usage_percent, 2),
                 "data_freshness_hours": round(time_diff_hours, 2)
             },
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -1056,18 +1304,20 @@ class DatabaseManager:
             mem_usage: 内存使用率
             disk_usage: 磁盘使用率
             swap_usage: Swap使用率
+            network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重
+        # 各项指标的权重（调整为5维评分）
         weights = {
-            'cpu': 0.25,
-            'memory': 0.25,
+            'cpu': 0.20,
+            'memory': 0.20,
             'disk': 0.20,
             'swap': 0.15,
-            'freshness': 0.15
+            'network': 0.15,
+            'freshness': 0.10
         }
         
         # 计算各项得分（0-100分）
@@ -1075,6 +1325,13 @@ class DatabaseManager:
         mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
         disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
         swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+        # 网络使用率越高得分越高，但超过80%开始扣分
+        if network_usage <= 80:
+            network_score = 100
+        else:
+            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
         
         # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
         freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
@@ -1085,6 +1342,7 @@ class DatabaseManager:
             mem_score * weights['memory'] +
             disk_score * weights['disk'] +
             swap_score * weights['swap'] +
+            network_score * weights['network'] +
             freshness_score * weights['freshness']
         )
         
@@ -1156,6 +1414,7 @@ class DatabaseManager:
             - 告警和提示信息汇总
             - 关键指标统计
             - 性能趋势分析
+            - 五维健康度评分
         """
         # 获取所有机器的状态评估
         status_list = self.get_all_machines_status(time_window_hours)
@@ -1192,6 +1451,9 @@ class DatabaseManager:
         # 6. 系统健康评分
         overall_health_score = self._calculate_system_health_score(status_list)
         
+        # 7. 五维健康度评分
+        five_dimension_scores = self._calculate_five_dimension_scores(status_list)
+        
         # 构建总体概览信息
         overview = {
             "timestamp": int(time.time()),
@@ -1203,7 +1465,8 @@ class DatabaseManager:
             "health_status": {
                 "distribution": status_distribution,
                 "overall_score": overall_health_score,
-                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0,
+                "five_dimension_scores": five_dimension_scores
             },
             "alerts_summary": {
                 "critical_issues": len(all_issues),
@@ -1228,13 +1491,15 @@ class DatabaseManager:
                 "cpu_usage": {"max": 0, "avg": 0, "min": 0},
                 "memory_usage": {"max": 0, "avg": 0, "min": 0},
                 "disk_usage": {"max": 0, "avg": 0, "min": 0},
-                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+                "swap_usage": {"max": 0, "avg": 0, "min": 0},
+                "network_usage": {"max": 0, "avg": 0, "min": 0}
             }
         
         cpu_usages = []
         memory_usages = []
         disk_usages = []
         swap_usages = []
+        network_usages = []
         
         for metric in metrics:
             # 计算各项指标
@@ -1256,10 +1521,18 @@ class DatabaseManager:
             swap_total = metric.get('swap_total', 0) or 0
             swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
             
+            # 计算网络使用率
+            net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+            net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+            max_bandwidth_kbps = 125000  # 1000 Mbps = 125,000 KB/s
+            total_network_usage = net_rx_kbps + net_tx_kbps
+            network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
+            
             cpu_usages.append(cpu_total)
             memory_usages.append(mem_usage_percent)
             disk_usages.append(disk_usage)
             swap_usages.append(swap_usage_percent)
+            network_usages.append(network_usage_percent)
         
         return {
             "cpu_usage": {
@@ -1281,6 +1554,11 @@ class DatabaseManager:
                 "max": round(max(swap_usages), 2) if swap_usages else 0,
                 "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
                 "min": round(min(swap_usages), 2) if swap_usages else 0
+            },
+            "network_usage": {
+                "max": round(max(network_usages), 2) if network_usages else 0,
+                "avg": round(sum(network_usages) / len(network_usages), 2) if network_usages else 0,
+                "min": round(min(network_usages), 2) if network_usages else 0
             }
         }
 
@@ -1302,6 +1580,70 @@ class DatabaseManager:
         
         total_score = sum(status['overall_score'] for status in status_list)
         return round(total_score / len(status_list), 2)
+
+    def _calculate_five_dimension_scores(self, status_list: List[Dict]) -> Dict:
+        """
+        计算五维健康度评分
+        
+        Args:
+            status_list: 机器状态列表
+            
+        Returns:
+            五维健康度评分字典，包含CPU、内存、Swap、磁盘、网络五个维度的平均评分
+        """
+        if not status_list:
+            return {
+                "cpu_score": 0.0,
+                "memory_score": 0.0,
+                "swap_score": 0.0,
+                "disk_score": 0.0,
+                "network_score": 0.0
+            }
+        
+        # 收集每个维度的评分
+        cpu_scores = []
+        memory_scores = []
+        swap_scores = []
+        disk_scores = []
+        network_scores = []
+        
+        for status in status_list:
+            key_metrics = status.get('key_metrics', {})
+            
+            # 计算每个维度的评分（基于使用率，使用率越低评分越高）
+            cpu_usage = key_metrics.get('cpu_usage_percent', 0)
+            cpu_score = max(0, 100 - cpu_usage)
+            cpu_scores.append(cpu_score)
+            
+            memory_usage = key_metrics.get('memory_usage_percent', 0)
+            memory_score = max(0, 100 - memory_usage)
+            memory_scores.append(memory_score)
+            
+            swap_usage = key_metrics.get('swap_usage_percent', 0)
+            swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+            swap_scores.append(swap_score)
+            
+            disk_usage = key_metrics.get('disk_usage_percent', 0)
+            disk_score = max(0, 100 - disk_usage)
+            disk_scores.append(disk_score)
+            
+            network_usage = key_metrics.get('network_usage_percent', 0)
+            # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+            # 网络使用率越高得分越高，但超过80%开始扣分
+            if network_usage <= 80:
+                network_score = 100
+            else:
+                network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_scores.append(network_score)
+        
+        # 计算平均评分
+        return {
+            "cpu_score": round(sum(cpu_scores) / len(cpu_scores), 2) if cpu_scores else 0.0,
+            "memory_score": round(sum(memory_scores) / len(memory_scores), 2) if memory_scores else 0.0,
+            "swap_score": round(sum(swap_scores) / len(swap_scores), 2) if swap_scores else 0.0,
+            "disk_score": round(sum(disk_scores) / len(disk_scores), 2) if disk_scores else 0.0,
+            "network_score": round(sum(network_scores) / len(network_scores), 2) if network_scores else 0.0
+        }
 
     def _categorize_issues(self, issues: List[Dict]) -> Dict:
         """分类汇总问题"""
@@ -1388,11 +1730,21 @@ class DatabaseManager:
         swap_used = metric.get('swap_used', 0) or 0
         swap_total = metric.get('swap_total', 0) or 0
         
+        # 网络指标
+        net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+        net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+        
         # 计算关键指标
         cpu_total = cpu_usr + cpu_sys + cpu_iow
         mem_used = mem_total - mem_free - mem_buff - mem_cache
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
+        # 1000 Mbps = 125,000 KB/s
+        max_bandwidth_kbps = 125000
+        total_network_usage = net_rx_kbps + net_tx_kbps
+        network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
         # 状态评估
         status_level = "正常"
@@ -1435,6 +1787,15 @@ class DatabaseManager:
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
+        # 网络使用率检查
+        if network_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
+        elif network_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
+        
         # 数据时效性检查（超过1小时无数据视为异常）
         import time
         current_timestamp = int(time.time())
@@ -1459,17 +1820,18 @@ class DatabaseManager:
                 "memory_usage_percent": round(mem_usage_percent, 2),
                 "disk_usage_percent": round(disk_used_percent, 2),
                 "swap_usage_percent": round(swap_usage_percent, 2),
+                "network_usage_percent": round(network_usage_percent, 2),
                 "data_freshness_hours": round(time_diff_hours, 2)
             },
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -1478,18 +1840,20 @@ class DatabaseManager:
             mem_usage: 内存使用率
             disk_usage: 磁盘使用率
             swap_usage: Swap使用率
+            network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重
+        # 各项指标的权重（调整为5维评分）
         weights = {
-            'cpu': 0.25,
-            'memory': 0.25,
+            'cpu': 0.20,
+            'memory': 0.20,
             'disk': 0.20,
             'swap': 0.15,
-            'freshness': 0.15
+            'network': 0.15,
+            'freshness': 0.10
         }
         
         # 计算各项得分（0-100分）
@@ -1497,6 +1861,13 @@ class DatabaseManager:
         mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
         disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
         swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+        # 网络使用率越高得分越高，但超过80%开始扣分
+        if network_usage <= 80:
+            network_score = 100
+        else:
+            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
         
         # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
         freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
@@ -1507,6 +1878,7 @@ class DatabaseManager:
             mem_score * weights['memory'] +
             disk_score * weights['disk'] +
             swap_score * weights['swap'] +
+            network_score * weights['network'] +
             freshness_score * weights['freshness']
         )
         
@@ -1578,6 +1950,7 @@ class DatabaseManager:
             - 告警和提示信息汇总
             - 关键指标统计
             - 性能趋势分析
+            - 五维健康度评分
         """
         # 获取所有机器的状态评估
         status_list = self.get_all_machines_status(time_window_hours)
@@ -1614,6 +1987,9 @@ class DatabaseManager:
         # 6. 系统健康评分
         overall_health_score = self._calculate_system_health_score(status_list)
         
+        # 7. 五维健康度评分
+        five_dimension_scores = self._calculate_five_dimension_scores(status_list)
+        
         # 构建总体概览信息
         overview = {
             "timestamp": int(time.time()),
@@ -1625,7 +2001,8 @@ class DatabaseManager:
             "health_status": {
                 "distribution": status_distribution,
                 "overall_score": overall_health_score,
-                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0,
+                "five_dimension_scores": five_dimension_scores
             },
             "alerts_summary": {
                 "critical_issues": len(all_issues),
@@ -1650,13 +2027,15 @@ class DatabaseManager:
                 "cpu_usage": {"max": 0, "avg": 0, "min": 0},
                 "memory_usage": {"max": 0, "avg": 0, "min": 0},
                 "disk_usage": {"max": 0, "avg": 0, "min": 0},
-                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+                "swap_usage": {"max": 0, "avg": 0, "min": 0},
+                "network_usage": {"max": 0, "avg": 0, "min": 0}
             }
         
         cpu_usages = []
         memory_usages = []
         disk_usages = []
         swap_usages = []
+        network_usages = []
         
         for metric in metrics:
             # 计算各项指标
@@ -1678,10 +2057,18 @@ class DatabaseManager:
             swap_total = metric.get('swap_total', 0) or 0
             swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
             
+            # 计算网络使用率
+            net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+            net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+            max_bandwidth_kbps = 125000  # 1000 Mbps = 125,000 KB/s
+            total_network_usage = net_rx_kbps + net_tx_kbps
+            network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
+            
             cpu_usages.append(cpu_total)
             memory_usages.append(mem_usage_percent)
             disk_usages.append(disk_usage)
             swap_usages.append(swap_usage_percent)
+            network_usages.append(network_usage_percent)
         
         return {
             "cpu_usage": {
@@ -1703,6 +2090,11 @@ class DatabaseManager:
                 "max": round(max(swap_usages), 2) if swap_usages else 0,
                 "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
                 "min": round(min(swap_usages), 2) if swap_usages else 0
+            },
+            "network_usage": {
+                "max": round(max(network_usages), 2) if network_usages else 0,
+                "avg": round(sum(network_usages) / len(network_usages), 2) if network_usages else 0,
+                "min": round(min(network_usages), 2) if network_usages else 0
             }
         }
 
@@ -1724,6 +2116,70 @@ class DatabaseManager:
         
         total_score = sum(status['overall_score'] for status in status_list)
         return round(total_score / len(status_list), 2)
+
+    def _calculate_five_dimension_scores(self, status_list: List[Dict]) -> Dict:
+        """
+        计算五维健康度评分
+        
+        Args:
+            status_list: 机器状态列表
+            
+        Returns:
+            五维健康度评分字典，包含CPU、内存、Swap、磁盘、网络五个维度的平均评分
+        """
+        if not status_list:
+            return {
+                "cpu_score": 0.0,
+                "memory_score": 0.0,
+                "swap_score": 0.0,
+                "disk_score": 0.0,
+                "network_score": 0.0
+            }
+        
+        # 收集每个维度的评分
+        cpu_scores = []
+        memory_scores = []
+        swap_scores = []
+        disk_scores = []
+        network_scores = []
+        
+        for status in status_list:
+            key_metrics = status.get('key_metrics', {})
+            
+            # 计算每个维度的评分（基于使用率，使用率越低评分越高）
+            cpu_usage = key_metrics.get('cpu_usage_percent', 0)
+            cpu_score = max(0, 100 - cpu_usage)
+            cpu_scores.append(cpu_score)
+            
+            memory_usage = key_metrics.get('memory_usage_percent', 0)
+            memory_score = max(0, 100 - memory_usage)
+            memory_scores.append(memory_score)
+            
+            swap_usage = key_metrics.get('swap_usage_percent', 0)
+            swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+            swap_scores.append(swap_score)
+            
+            disk_usage = key_metrics.get('disk_usage_percent', 0)
+            disk_score = max(0, 100 - disk_usage)
+            disk_scores.append(disk_score)
+            
+            network_usage = key_metrics.get('network_usage_percent', 0)
+            # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+            # 网络使用率越高得分越高，但超过80%开始扣分
+            if network_usage <= 80:
+                network_score = 100
+            else:
+                network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_scores.append(network_score)
+        
+        # 计算平均评分
+        return {
+            "cpu_score": round(sum(cpu_scores) / len(cpu_scores), 2) if cpu_scores else 0.0,
+            "memory_score": round(sum(memory_scores) / len(memory_scores), 2) if memory_scores else 0.0,
+            "swap_score": round(sum(swap_scores) / len(swap_scores), 2) if swap_scores else 0.0,
+            "disk_score": round(sum(disk_scores) / len(disk_scores), 2) if disk_scores else 0.0,
+            "network_score": round(sum(network_scores) / len(network_scores), 2) if network_scores else 0.0
+        }
 
     def _categorize_issues(self, issues: List[Dict]) -> Dict:
         """分类汇总问题"""
@@ -1812,11 +2268,21 @@ class DatabaseManager:
         swap_used = metric.get('swap_used', 0) or 0
         swap_total = metric.get('swap_total', 0) or 0
         
+        # 网络指标
+        net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+        net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+        
         # 计算关键指标
         cpu_total = cpu_usr + cpu_sys + cpu_iow
         mem_used = mem_total - mem_free - mem_buff - mem_cache
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
+        # 1000 Mbps = 125,000 KB/s
+        max_bandwidth_kbps = 125000
+        total_network_usage = net_rx_kbps + net_tx_kbps
+        network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
         # 状态评估
         status_level = "正常"
@@ -1859,6 +2325,15 @@ class DatabaseManager:
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
+        # 网络使用率检查
+        if network_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
+        elif network_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
+        
         # 数据时效性检查（超过1小时无数据视为异常）
         import time
         current_timestamp = int(time.time())
@@ -1883,17 +2358,18 @@ class DatabaseManager:
                 "memory_usage_percent": round(mem_usage_percent, 2),
                 "disk_usage_percent": round(disk_used_percent, 2),
                 "swap_usage_percent": round(swap_usage_percent, 2),
+                "network_usage_percent": round(network_usage_percent, 2),
                 "data_freshness_hours": round(time_diff_hours, 2)
             },
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -1902,18 +2378,20 @@ class DatabaseManager:
             mem_usage: 内存使用率
             disk_usage: 磁盘使用率
             swap_usage: Swap使用率
+            network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重
+        # 各项指标的权重（调整为5维评分）
         weights = {
-            'cpu': 0.25,
-            'memory': 0.25,
+            'cpu': 0.20,
+            'memory': 0.20,
             'disk': 0.20,
             'swap': 0.15,
-            'freshness': 0.15
+            'network': 0.15,
+            'freshness': 0.10
         }
         
         # 计算各项得分（0-100分）
@@ -1921,6 +2399,13 @@ class DatabaseManager:
         mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
         disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
         swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+        # 网络使用率越高得分越高，但超过80%开始扣分
+        if network_usage <= 80:
+            network_score = 100
+        else:
+            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
         
         # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
         freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
@@ -1931,6 +2416,7 @@ class DatabaseManager:
             mem_score * weights['memory'] +
             disk_score * weights['disk'] +
             swap_score * weights['swap'] +
+            network_score * weights['network'] +
             freshness_score * weights['freshness']
         )
         
@@ -2002,6 +2488,7 @@ class DatabaseManager:
             - 告警和提示信息汇总
             - 关键指标统计
             - 性能趋势分析
+            - 五维健康度评分
         """
         # 获取所有机器的状态评估
         status_list = self.get_all_machines_status(time_window_hours)
@@ -2038,6 +2525,9 @@ class DatabaseManager:
         # 6. 系统健康评分
         overall_health_score = self._calculate_system_health_score(status_list)
         
+        # 7. 五维健康度评分
+        five_dimension_scores = self._calculate_five_dimension_scores(status_list)
+        
         # 构建总体概览信息
         overview = {
             "timestamp": int(time.time()),
@@ -2049,7 +2539,8 @@ class DatabaseManager:
             "health_status": {
                 "distribution": status_distribution,
                 "overall_score": overall_health_score,
-                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0,
+                "five_dimension_scores": five_dimension_scores
             },
             "alerts_summary": {
                 "critical_issues": len(all_issues),
@@ -2074,13 +2565,15 @@ class DatabaseManager:
                 "cpu_usage": {"max": 0, "avg": 0, "min": 0},
                 "memory_usage": {"max": 0, "avg": 0, "min": 0},
                 "disk_usage": {"max": 0, "avg": 0, "min": 0},
-                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+                "swap_usage": {"max": 0, "avg": 0, "min": 0},
+                "network_usage": {"max": 0, "avg": 0, "min": 0}
             }
         
         cpu_usages = []
         memory_usages = []
         disk_usages = []
         swap_usages = []
+        network_usages = []
         
         for metric in metrics:
             # 计算各项指标
@@ -2102,10 +2595,18 @@ class DatabaseManager:
             swap_total = metric.get('swap_total', 0) or 0
             swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
             
+            # 计算网络使用率
+            net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+            net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+            max_bandwidth_kbps = 125000  # 1000 Mbps = 125,000 KB/s
+            total_network_usage = net_rx_kbps + net_tx_kbps
+            network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
+            
             cpu_usages.append(cpu_total)
             memory_usages.append(mem_usage_percent)
             disk_usages.append(disk_usage)
             swap_usages.append(swap_usage_percent)
+            network_usages.append(network_usage_percent)
         
         return {
             "cpu_usage": {
@@ -2127,6 +2628,11 @@ class DatabaseManager:
                 "max": round(max(swap_usages), 2) if swap_usages else 0,
                 "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
                 "min": round(min(swap_usages), 2) if swap_usages else 0
+            },
+            "network_usage": {
+                "max": round(max(network_usages), 2) if network_usages else 0,
+                "avg": round(sum(network_usages) / len(network_usages), 2) if network_usages else 0,
+                "min": round(min(network_usages), 2) if network_usages else 0
             }
         }
 
@@ -2148,6 +2654,70 @@ class DatabaseManager:
         
         total_score = sum(status['overall_score'] for status in status_list)
         return round(total_score / len(status_list), 2)
+
+    def _calculate_five_dimension_scores(self, status_list: List[Dict]) -> Dict:
+        """
+        计算五维健康度评分
+        
+        Args:
+            status_list: 机器状态列表
+            
+        Returns:
+            五维健康度评分字典，包含CPU、内存、Swap、磁盘、网络五个维度的平均评分
+        """
+        if not status_list:
+            return {
+                "cpu_score": 0.0,
+                "memory_score": 0.0,
+                "swap_score": 0.0,
+                "disk_score": 0.0,
+                "network_score": 0.0
+            }
+        
+        # 收集每个维度的评分
+        cpu_scores = []
+        memory_scores = []
+        swap_scores = []
+        disk_scores = []
+        network_scores = []
+        
+        for status in status_list:
+            key_metrics = status.get('key_metrics', {})
+            
+            # 计算每个维度的评分（基于使用率，使用率越低评分越高）
+            cpu_usage = key_metrics.get('cpu_usage_percent', 0)
+            cpu_score = max(0, 100 - cpu_usage)
+            cpu_scores.append(cpu_score)
+            
+            memory_usage = key_metrics.get('memory_usage_percent', 0)
+            memory_score = max(0, 100 - memory_usage)
+            memory_scores.append(memory_score)
+            
+            swap_usage = key_metrics.get('swap_usage_percent', 0)
+            swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+            swap_scores.append(swap_score)
+            
+            disk_usage = key_metrics.get('disk_usage_percent', 0)
+            disk_score = max(0, 100 - disk_usage)
+            disk_scores.append(disk_score)
+            
+            network_usage = key_metrics.get('network_usage_percent', 0)
+            # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+            # 网络使用率越高得分越高，但超过80%开始扣分
+            if network_usage <= 80:
+                network_score = 100
+            else:
+                network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_scores.append(network_score)
+        
+        # 计算平均评分
+        return {
+            "cpu_score": round(sum(cpu_scores) / len(cpu_scores), 2) if cpu_scores else 0.0,
+            "memory_score": round(sum(memory_scores) / len(memory_scores), 2) if memory_scores else 0.0,
+            "swap_score": round(sum(swap_scores) / len(swap_scores), 2) if swap_scores else 0.0,
+            "disk_score": round(sum(disk_scores) / len(disk_scores), 2) if disk_scores else 0.0,
+            "network_score": round(sum(network_scores) / len(network_scores), 2) if network_scores else 0.0
+        }
 
     def _categorize_issues(self, issues: List[Dict]) -> Dict:
         """分类汇总问题"""
@@ -2265,11 +2835,21 @@ class DatabaseManager:
         swap_used = metric.get('swap_used', 0) or 0
         swap_total = metric.get('swap_total', 0) or 0
         
+        # 网络指标
+        net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+        net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+        
         # 计算关键指标
         cpu_total = cpu_usr + cpu_sys + cpu_iow
         mem_used = mem_total - mem_free - mem_buff - mem_cache
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
+        # 1000 Mbps = 125,000 KB/s
+        max_bandwidth_kbps = 125000
+        total_network_usage = net_rx_kbps + net_tx_kbps
+        network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
         # 状态评估
         status_level = "正常"
@@ -2312,6 +2892,15 @@ class DatabaseManager:
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
+        # 网络使用率检查
+        if network_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
+        elif network_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
+        
         # 数据时效性检查（超过1小时无数据视为异常）
         import time
         current_timestamp = int(time.time())
@@ -2336,17 +2925,18 @@ class DatabaseManager:
                 "memory_usage_percent": round(mem_usage_percent, 2),
                 "disk_usage_percent": round(disk_used_percent, 2),
                 "swap_usage_percent": round(swap_usage_percent, 2),
+                "network_usage_percent": round(network_usage_percent, 2),
                 "data_freshness_hours": round(time_diff_hours, 2)
             },
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -2355,18 +2945,20 @@ class DatabaseManager:
             mem_usage: 内存使用率
             disk_usage: 磁盘使用率
             swap_usage: Swap使用率
+            network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重
+        # 各项指标的权重（调整为5维评分）
         weights = {
-            'cpu': 0.25,
-            'memory': 0.25,
+            'cpu': 0.20,
+            'memory': 0.20,
             'disk': 0.20,
             'swap': 0.15,
-            'freshness': 0.15
+            'network': 0.15,
+            'freshness': 0.10
         }
         
         # 计算各项得分（0-100分）
@@ -2374,6 +2966,13 @@ class DatabaseManager:
         mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
         disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
         swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+        # 网络使用率越高得分越高，但超过80%开始扣分
+        if network_usage <= 80:
+            network_score = 100
+        else:
+            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
         
         # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
         freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
@@ -2384,6 +2983,7 @@ class DatabaseManager:
             mem_score * weights['memory'] +
             disk_score * weights['disk'] +
             swap_score * weights['swap'] +
+            network_score * weights['network'] +
             freshness_score * weights['freshness']
         )
         
@@ -2455,6 +3055,7 @@ class DatabaseManager:
             - 告警和提示信息汇总
             - 关键指标统计
             - 性能趋势分析
+            - 五维健康度评分
         """
         # 获取所有机器的状态评估
         status_list = self.get_all_machines_status(time_window_hours)
@@ -2491,6 +3092,9 @@ class DatabaseManager:
         # 6. 系统健康评分
         overall_health_score = self._calculate_system_health_score(status_list)
         
+        # 7. 五维健康度评分
+        five_dimension_scores = self._calculate_five_dimension_scores(status_list)
+        
         # 构建总体概览信息
         overview = {
             "timestamp": int(time.time()),
@@ -2502,7 +3106,8 @@ class DatabaseManager:
             "health_status": {
                 "distribution": status_distribution,
                 "overall_score": overall_health_score,
-                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0,
+                "five_dimension_scores": five_dimension_scores
             },
             "alerts_summary": {
                 "critical_issues": len(all_issues),
@@ -2527,13 +3132,15 @@ class DatabaseManager:
                 "cpu_usage": {"max": 0, "avg": 0, "min": 0},
                 "memory_usage": {"max": 0, "avg": 0, "min": 0},
                 "disk_usage": {"max": 0, "avg": 0, "min": 0},
-                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+                "swap_usage": {"max": 0, "avg": 0, "min": 0},
+                "network_usage": {"max": 0, "avg": 0, "min": 0}
             }
         
         cpu_usages = []
         memory_usages = []
         disk_usages = []
         swap_usages = []
+        network_usages = []
         
         for metric in metrics:
             # 计算各项指标
@@ -2555,10 +3162,18 @@ class DatabaseManager:
             swap_total = metric.get('swap_total', 0) or 0
             swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
             
+            # 计算网络使用率
+            net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+            net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+            max_bandwidth_kbps = 125000  # 1000 Mbps = 125,000 KB/s
+            total_network_usage = net_rx_kbps + net_tx_kbps
+            network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
+            
             cpu_usages.append(cpu_total)
             memory_usages.append(mem_usage_percent)
             disk_usages.append(disk_usage)
             swap_usages.append(swap_usage_percent)
+            network_usages.append(network_usage_percent)
         
         return {
             "cpu_usage": {
@@ -2580,6 +3195,11 @@ class DatabaseManager:
                 "max": round(max(swap_usages), 2) if swap_usages else 0,
                 "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
                 "min": round(min(swap_usages), 2) if swap_usages else 0
+            },
+            "network_usage": {
+                "max": round(max(network_usages), 2) if network_usages else 0,
+                "avg": round(sum(network_usages) / len(network_usages), 2) if network_usages else 0,
+                "min": round(min(network_usages), 2) if network_usages else 0
             }
         }
 
@@ -2601,6 +3221,70 @@ class DatabaseManager:
         
         total_score = sum(status['overall_score'] for status in status_list)
         return round(total_score / len(status_list), 2)
+
+    def _calculate_five_dimension_scores(self, status_list: List[Dict]) -> Dict:
+        """
+        计算五维健康度评分
+        
+        Args:
+            status_list: 机器状态列表
+            
+        Returns:
+            五维健康度评分字典，包含CPU、内存、Swap、磁盘、网络五个维度的平均评分
+        """
+        if not status_list:
+            return {
+                "cpu_score": 0.0,
+                "memory_score": 0.0,
+                "swap_score": 0.0,
+                "disk_score": 0.0,
+                "network_score": 0.0
+            }
+        
+        # 收集每个维度的评分
+        cpu_scores = []
+        memory_scores = []
+        swap_scores = []
+        disk_scores = []
+        network_scores = []
+        
+        for status in status_list:
+            key_metrics = status.get('key_metrics', {})
+            
+            # 计算每个维度的评分（基于使用率，使用率越低评分越高）
+            cpu_usage = key_metrics.get('cpu_usage_percent', 0)
+            cpu_score = max(0, 100 - cpu_usage)
+            cpu_scores.append(cpu_score)
+            
+            memory_usage = key_metrics.get('memory_usage_percent', 0)
+            memory_score = max(0, 100 - memory_usage)
+            memory_scores.append(memory_score)
+            
+            swap_usage = key_metrics.get('swap_usage_percent', 0)
+            swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+            swap_scores.append(swap_score)
+            
+            disk_usage = key_metrics.get('disk_usage_percent', 0)
+            disk_score = max(0, 100 - disk_usage)
+            disk_scores.append(disk_score)
+            
+            network_usage = key_metrics.get('network_usage_percent', 0)
+            # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+            # 网络使用率越高得分越高，但超过80%开始扣分
+            if network_usage <= 80:
+                network_score = 100
+            else:
+                network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_scores.append(network_score)
+        
+        # 计算平均评分
+        return {
+            "cpu_score": round(sum(cpu_scores) / len(cpu_scores), 2) if cpu_scores else 0.0,
+            "memory_score": round(sum(memory_scores) / len(memory_scores), 2) if memory_scores else 0.0,
+            "swap_score": round(sum(swap_scores) / len(swap_scores), 2) if swap_scores else 0.0,
+            "disk_score": round(sum(disk_scores) / len(disk_scores), 2) if disk_scores else 0.0,
+            "network_score": round(sum(network_scores) / len(network_scores), 2) if network_scores else 0.0
+        }
 
     def _categorize_issues(self, issues: List[Dict]) -> Dict:
         """分类汇总问题"""
@@ -2695,11 +3379,21 @@ class DatabaseManager:
         swap_used = metric.get('swap_used', 0) or 0
         swap_total = metric.get('swap_total', 0) or 0
         
+        # 网络指标
+        net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+        net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+        
         # 计算关键指标
         cpu_total = cpu_usr + cpu_sys + cpu_iow
         mem_used = mem_total - mem_free - mem_buff - mem_cache
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
+        # 1000 Mbps = 125,000 KB/s
+        max_bandwidth_kbps = 125000
+        total_network_usage = net_rx_kbps + net_tx_kbps
+        network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
         # 状态评估
         status_level = "正常"
@@ -2742,6 +3436,15 @@ class DatabaseManager:
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
+        # 网络使用率检查
+        if network_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
+        elif network_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
+        
         # 数据时效性检查（超过1小时无数据视为异常）
         import time
         current_timestamp = int(time.time())
@@ -2766,17 +3469,18 @@ class DatabaseManager:
                 "memory_usage_percent": round(mem_usage_percent, 2),
                 "disk_usage_percent": round(disk_used_percent, 2),
                 "swap_usage_percent": round(swap_usage_percent, 2),
+                "network_usage_percent": round(network_usage_percent, 2),
                 "data_freshness_hours": round(time_diff_hours, 2)
             },
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -2785,18 +3489,20 @@ class DatabaseManager:
             mem_usage: 内存使用率
             disk_usage: 磁盘使用率
             swap_usage: Swap使用率
+            network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重
+        # 各项指标的权重（调整为5维评分）
         weights = {
-            'cpu': 0.25,
-            'memory': 0.25,
+            'cpu': 0.20,
+            'memory': 0.20,
             'disk': 0.20,
             'swap': 0.15,
-            'freshness': 0.15
+            'network': 0.15,
+            'freshness': 0.10
         }
         
         # 计算各项得分（0-100分）
@@ -2804,6 +3510,13 @@ class DatabaseManager:
         mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
         disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
         swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+        # 网络使用率越高得分越高，但超过80%开始扣分
+        if network_usage <= 80:
+            network_score = 100
+        else:
+            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
         
         # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
         freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
@@ -2814,6 +3527,7 @@ class DatabaseManager:
             mem_score * weights['memory'] +
             disk_score * weights['disk'] +
             swap_score * weights['swap'] +
+            network_score * weights['network'] +
             freshness_score * weights['freshness']
         )
         
@@ -2885,6 +3599,7 @@ class DatabaseManager:
             - 告警和提示信息汇总
             - 关键指标统计
             - 性能趋势分析
+            - 五维健康度评分
         """
         # 获取所有机器的状态评估
         status_list = self.get_all_machines_status(time_window_hours)
@@ -2921,6 +3636,9 @@ class DatabaseManager:
         # 6. 系统健康评分
         overall_health_score = self._calculate_system_health_score(status_list)
         
+        # 7. 五维健康度评分
+        five_dimension_scores = self._calculate_five_dimension_scores(status_list)
+        
         # 构建总体概览信息
         overview = {
             "timestamp": int(time.time()),
@@ -2932,7 +3650,8 @@ class DatabaseManager:
             "health_status": {
                 "distribution": status_distribution,
                 "overall_score": overall_health_score,
-                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0,
+                "five_dimension_scores": five_dimension_scores
             },
             "alerts_summary": {
                 "critical_issues": len(all_issues),
@@ -2957,13 +3676,15 @@ class DatabaseManager:
                 "cpu_usage": {"max": 0, "avg": 0, "min": 0},
                 "memory_usage": {"max": 0, "avg": 0, "min": 0},
                 "disk_usage": {"max": 0, "avg": 0, "min": 0},
-                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+                "swap_usage": {"max": 0, "avg": 0, "min": 0},
+                "network_usage": {"max": 0, "avg": 0, "min": 0}
             }
         
         cpu_usages = []
         memory_usages = []
         disk_usages = []
         swap_usages = []
+        network_usages = []
         
         for metric in metrics:
             # 计算各项指标
@@ -2985,10 +3706,18 @@ class DatabaseManager:
             swap_total = metric.get('swap_total', 0) or 0
             swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
             
+            # 计算网络使用率
+            net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+            net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+            max_bandwidth_kbps = 125000  # 1000 Mbps = 125,000 KB/s
+            total_network_usage = net_rx_kbps + net_tx_kbps
+            network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
+            
             cpu_usages.append(cpu_total)
             memory_usages.append(mem_usage_percent)
             disk_usages.append(disk_usage)
             swap_usages.append(swap_usage_percent)
+            network_usages.append(network_usage_percent)
         
         return {
             "cpu_usage": {
@@ -3010,6 +3739,11 @@ class DatabaseManager:
                 "max": round(max(swap_usages), 2) if swap_usages else 0,
                 "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
                 "min": round(min(swap_usages), 2) if swap_usages else 0
+            },
+            "network_usage": {
+                "max": round(max(network_usages), 2) if network_usages else 0,
+                "avg": round(sum(network_usages) / len(network_usages), 2) if network_usages else 0,
+                "min": round(min(network_usages), 2) if network_usages else 0
             }
         }
 
@@ -3031,6 +3765,70 @@ class DatabaseManager:
         
         total_score = sum(status['overall_score'] for status in status_list)
         return round(total_score / len(status_list), 2)
+
+    def _calculate_five_dimension_scores(self, status_list: List[Dict]) -> Dict:
+        """
+        计算五维健康度评分
+        
+        Args:
+            status_list: 机器状态列表
+            
+        Returns:
+            五维健康度评分字典，包含CPU、内存、Swap、磁盘、网络五个维度的平均评分
+        """
+        if not status_list:
+            return {
+                "cpu_score": 0.0,
+                "memory_score": 0.0,
+                "swap_score": 0.0,
+                "disk_score": 0.0,
+                "network_score": 0.0
+            }
+        
+        # 收集每个维度的评分
+        cpu_scores = []
+        memory_scores = []
+        swap_scores = []
+        disk_scores = []
+        network_scores = []
+        
+        for status in status_list:
+            key_metrics = status.get('key_metrics', {})
+            
+            # 计算每个维度的评分（基于使用率，使用率越低评分越高）
+            cpu_usage = key_metrics.get('cpu_usage_percent', 0)
+            cpu_score = max(0, 100 - cpu_usage)
+            cpu_scores.append(cpu_score)
+            
+            memory_usage = key_metrics.get('memory_usage_percent', 0)
+            memory_score = max(0, 100 - memory_usage)
+            memory_scores.append(memory_score)
+            
+            swap_usage = key_metrics.get('swap_usage_percent', 0)
+            swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+            swap_scores.append(swap_score)
+            
+            disk_usage = key_metrics.get('disk_usage_percent', 0)
+            disk_score = max(0, 100 - disk_usage)
+            disk_scores.append(disk_score)
+            
+            network_usage = key_metrics.get('network_usage_percent', 0)
+            # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+            # 网络使用率越高得分越高，但超过80%开始扣分
+            if network_usage <= 80:
+                network_score = 100
+            else:
+                network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_scores.append(network_score)
+        
+        # 计算平均评分
+        return {
+            "cpu_score": round(sum(cpu_scores) / len(cpu_scores), 2) if cpu_scores else 0.0,
+            "memory_score": round(sum(memory_scores) / len(memory_scores), 2) if memory_scores else 0.0,
+            "swap_score": round(sum(swap_scores) / len(swap_scores), 2) if swap_scores else 0.0,
+            "disk_score": round(sum(disk_scores) / len(disk_scores), 2) if disk_scores else 0.0,
+            "network_score": round(sum(network_scores) / len(network_scores), 2) if network_scores else 0.0
+        }
 
     def _categorize_issues(self, issues: List[Dict]) -> Dict:
         """分类汇总问题"""
@@ -3119,11 +3917,21 @@ class DatabaseManager:
         swap_used = metric.get('swap_used', 0) or 0
         swap_total = metric.get('swap_total', 0) or 0
         
+        # 网络指标
+        net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+        net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+        
         # 计算关键指标
         cpu_total = cpu_usr + cpu_sys + cpu_iow
         mem_used = mem_total - mem_free - mem_buff - mem_cache
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
+        # 1000 Mbps = 125,000 KB/s
+        max_bandwidth_kbps = 125000
+        total_network_usage = net_rx_kbps + net_tx_kbps
+        network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
         # 状态评估
         status_level = "正常"
@@ -3166,6 +3974,15 @@ class DatabaseManager:
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
+        # 网络使用率检查
+        if network_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
+        elif network_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
+        
         # 数据时效性检查（超过1小时无数据视为异常）
         import time
         current_timestamp = int(time.time())
@@ -3190,17 +4007,18 @@ class DatabaseManager:
                 "memory_usage_percent": round(mem_usage_percent, 2),
                 "disk_usage_percent": round(disk_used_percent, 2),
                 "swap_usage_percent": round(swap_usage_percent, 2),
+                "network_usage_percent": round(network_usage_percent, 2),
                 "data_freshness_hours": round(time_diff_hours, 2)
             },
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -3209,18 +4027,20 @@ class DatabaseManager:
             mem_usage: 内存使用率
             disk_usage: 磁盘使用率
             swap_usage: Swap使用率
+            network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重
+        # 各项指标的权重（调整为5维评分）
         weights = {
-            'cpu': 0.25,
-            'memory': 0.25,
+            'cpu': 0.20,
+            'memory': 0.20,
             'disk': 0.20,
             'swap': 0.15,
-            'freshness': 0.15
+            'network': 0.15,
+            'freshness': 0.10
         }
         
         # 计算各项得分（0-100分）
@@ -3228,6 +4048,13 @@ class DatabaseManager:
         mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
         disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
         swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+        # 网络使用率越高得分越高，但超过80%开始扣分
+        if network_usage <= 80:
+            network_score = 100
+        else:
+            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
         
         # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
         freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
@@ -3238,6 +4065,7 @@ class DatabaseManager:
             mem_score * weights['memory'] +
             disk_score * weights['disk'] +
             swap_score * weights['swap'] +
+            network_score * weights['network'] +
             freshness_score * weights['freshness']
         )
         
@@ -3309,6 +4137,7 @@ class DatabaseManager:
             - 告警和提示信息汇总
             - 关键指标统计
             - 性能趋势分析
+            - 五维健康度评分
         """
         # 获取所有机器的状态评估
         status_list = self.get_all_machines_status(time_window_hours)
@@ -3345,6 +4174,9 @@ class DatabaseManager:
         # 6. 系统健康评分
         overall_health_score = self._calculate_system_health_score(status_list)
         
+        # 7. 五维健康度评分
+        five_dimension_scores = self._calculate_five_dimension_scores(status_list)
+        
         # 构建总体概览信息
         overview = {
             "timestamp": int(time.time()),
@@ -3356,7 +4188,8 @@ class DatabaseManager:
             "health_status": {
                 "distribution": status_distribution,
                 "overall_score": overall_health_score,
-                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0,
+                "five_dimension_scores": five_dimension_scores
             },
             "alerts_summary": {
                 "critical_issues": len(all_issues),
@@ -3381,13 +4214,15 @@ class DatabaseManager:
                 "cpu_usage": {"max": 0, "avg": 0, "min": 0},
                 "memory_usage": {"max": 0, "avg": 0, "min": 0},
                 "disk_usage": {"max": 0, "avg": 0, "min": 0},
-                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+                "swap_usage": {"max": 0, "avg": 0, "min": 0},
+                "network_usage": {"max": 0, "avg": 0, "min": 0}
             }
         
         cpu_usages = []
         memory_usages = []
         disk_usages = []
         swap_usages = []
+        network_usages = []
         
         for metric in metrics:
             # 计算各项指标
@@ -3409,10 +4244,18 @@ class DatabaseManager:
             swap_total = metric.get('swap_total', 0) or 0
             swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
             
+            # 计算网络使用率
+            net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+            net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+            max_bandwidth_kbps = 125000  # 1000 Mbps = 125,000 KB/s
+            total_network_usage = net_rx_kbps + net_tx_kbps
+            network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
+            
             cpu_usages.append(cpu_total)
             memory_usages.append(mem_usage_percent)
             disk_usages.append(disk_usage)
             swap_usages.append(swap_usage_percent)
+            network_usages.append(network_usage_percent)
         
         return {
             "cpu_usage": {
@@ -3434,6 +4277,11 @@ class DatabaseManager:
                 "max": round(max(swap_usages), 2) if swap_usages else 0,
                 "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
                 "min": round(min(swap_usages), 2) if swap_usages else 0
+            },
+            "network_usage": {
+                "max": round(max(network_usages), 2) if network_usages else 0,
+                "avg": round(sum(network_usages) / len(network_usages), 2) if network_usages else 0,
+                "min": round(min(network_usages), 2) if network_usages else 0
             }
         }
 
@@ -3455,6 +4303,70 @@ class DatabaseManager:
         
         total_score = sum(status['overall_score'] for status in status_list)
         return round(total_score / len(status_list), 2)
+
+    def _calculate_five_dimension_scores(self, status_list: List[Dict]) -> Dict:
+        """
+        计算五维健康度评分
+        
+        Args:
+            status_list: 机器状态列表
+            
+        Returns:
+            五维健康度评分字典，包含CPU、内存、Swap、磁盘、网络五个维度的平均评分
+        """
+        if not status_list:
+            return {
+                "cpu_score": 0.0,
+                "memory_score": 0.0,
+                "swap_score": 0.0,
+                "disk_score": 0.0,
+                "network_score": 0.0
+            }
+        
+        # 收集每个维度的评分
+        cpu_scores = []
+        memory_scores = []
+        swap_scores = []
+        disk_scores = []
+        network_scores = []
+        
+        for status in status_list:
+            key_metrics = status.get('key_metrics', {})
+            
+            # 计算每个维度的评分（基于使用率，使用率越低评分越高）
+            cpu_usage = key_metrics.get('cpu_usage_percent', 0)
+            cpu_score = max(0, 100 - cpu_usage)
+            cpu_scores.append(cpu_score)
+            
+            memory_usage = key_metrics.get('memory_usage_percent', 0)
+            memory_score = max(0, 100 - memory_usage)
+            memory_scores.append(memory_score)
+            
+            swap_usage = key_metrics.get('swap_usage_percent', 0)
+            swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+            swap_scores.append(swap_score)
+            
+            disk_usage = key_metrics.get('disk_usage_percent', 0)
+            disk_score = max(0, 100 - disk_usage)
+            disk_scores.append(disk_score)
+            
+            network_usage = key_metrics.get('network_usage_percent', 0)
+            # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+            # 网络使用率越高得分越高，但超过80%开始扣分
+            if network_usage <= 80:
+                network_score = 100
+            else:
+                network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_scores.append(network_score)
+        
+        # 计算平均评分
+        return {
+            "cpu_score": round(sum(cpu_scores) / len(cpu_scores), 2) if cpu_scores else 0.0,
+            "memory_score": round(sum(memory_scores) / len(memory_scores), 2) if memory_scores else 0.0,
+            "swap_score": round(sum(swap_scores) / len(swap_scores), 2) if swap_scores else 0.0,
+            "disk_score": round(sum(disk_scores) / len(disk_scores), 2) if disk_scores else 0.0,
+            "network_score": round(sum(network_scores) / len(network_scores), 2) if network_scores else 0.0
+        }
 
     def _categorize_issues(self, issues: List[Dict]) -> Dict:
         """分类汇总问题"""
@@ -3547,11 +4459,21 @@ class DatabaseManager:
         swap_used = metric.get('swap_used', 0) or 0
         swap_total = metric.get('swap_total', 0) or 0
         
+        # 网络指标
+        net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+        net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+        
         # 计算关键指标
         cpu_total = cpu_usr + cpu_sys + cpu_iow
         mem_used = mem_total - mem_free - mem_buff - mem_cache
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
+        # 1000 Mbps = 125,000 KB/s
+        max_bandwidth_kbps = 125000
+        total_network_usage = net_rx_kbps + net_tx_kbps
+        network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
         # 状态评估
         status_level = "正常"
@@ -3594,6 +4516,15 @@ class DatabaseManager:
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
+        # 网络使用率检查
+        if network_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
+        elif network_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
+        
         # 数据时效性检查（超过1小时无数据视为异常）
         import time
         current_timestamp = int(time.time())
@@ -3618,17 +4549,18 @@ class DatabaseManager:
                 "memory_usage_percent": round(mem_usage_percent, 2),
                 "disk_usage_percent": round(disk_used_percent, 2),
                 "swap_usage_percent": round(swap_usage_percent, 2),
+                "network_usage_percent": round(network_usage_percent, 2),
                 "data_freshness_hours": round(time_diff_hours, 2)
             },
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -3637,18 +4569,20 @@ class DatabaseManager:
             mem_usage: 内存使用率
             disk_usage: 磁盘使用率
             swap_usage: Swap使用率
+            network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重
+        # 各项指标的权重（调整为5维评分）
         weights = {
-            'cpu': 0.25,
-            'memory': 0.25,
+            'cpu': 0.20,
+            'memory': 0.20,
             'disk': 0.20,
             'swap': 0.15,
-            'freshness': 0.15
+            'network': 0.15,
+            'freshness': 0.10
         }
         
         # 计算各项得分（0-100分）
@@ -3656,6 +4590,13 @@ class DatabaseManager:
         mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
         disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
         swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+        # 网络使用率越高得分越高，但超过80%开始扣分
+        if network_usage <= 80:
+            network_score = 100
+        else:
+            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
         
         # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
         freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
@@ -3666,6 +4607,7 @@ class DatabaseManager:
             mem_score * weights['memory'] +
             disk_score * weights['disk'] +
             swap_score * weights['swap'] +
+            network_score * weights['network'] +
             freshness_score * weights['freshness']
         )
         
@@ -3737,6 +4679,7 @@ class DatabaseManager:
             - 告警和提示信息汇总
             - 关键指标统计
             - 性能趋势分析
+            - 五维健康度评分
         """
         # 获取所有机器的状态评估
         status_list = self.get_all_machines_status(time_window_hours)
@@ -3773,6 +4716,9 @@ class DatabaseManager:
         # 6. 系统健康评分
         overall_health_score = self._calculate_system_health_score(status_list)
         
+        # 7. 五维健康度评分
+        five_dimension_scores = self._calculate_five_dimension_scores(status_list)
+        
         # 构建总体概览信息
         overview = {
             "timestamp": int(time.time()),
@@ -3784,7 +4730,8 @@ class DatabaseManager:
             "health_status": {
                 "distribution": status_distribution,
                 "overall_score": overall_health_score,
-                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0,
+                "five_dimension_scores": five_dimension_scores
             },
             "alerts_summary": {
                 "critical_issues": len(all_issues),
@@ -3809,13 +4756,15 @@ class DatabaseManager:
                 "cpu_usage": {"max": 0, "avg": 0, "min": 0},
                 "memory_usage": {"max": 0, "avg": 0, "min": 0},
                 "disk_usage": {"max": 0, "avg": 0, "min": 0},
-                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+                "swap_usage": {"max": 0, "avg": 0, "min": 0},
+                "network_usage": {"max": 0, "avg": 0, "min": 0}
             }
         
         cpu_usages = []
         memory_usages = []
         disk_usages = []
         swap_usages = []
+        network_usages = []
         
         for metric in metrics:
             # 计算各项指标
@@ -3837,10 +4786,18 @@ class DatabaseManager:
             swap_total = metric.get('swap_total', 0) or 0
             swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
             
+            # 计算网络使用率
+            net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+            net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+            max_bandwidth_kbps = 125000  # 1000 Mbps = 125,000 KB/s
+            total_network_usage = net_rx_kbps + net_tx_kbps
+            network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
+            
             cpu_usages.append(cpu_total)
             memory_usages.append(mem_usage_percent)
             disk_usages.append(disk_usage)
             swap_usages.append(swap_usage_percent)
+            network_usages.append(network_usage_percent)
         
         return {
             "cpu_usage": {
@@ -3862,6 +4819,11 @@ class DatabaseManager:
                 "max": round(max(swap_usages), 2) if swap_usages else 0,
                 "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
                 "min": round(min(swap_usages), 2) if swap_usages else 0
+            },
+            "network_usage": {
+                "max": round(max(network_usages), 2) if network_usages else 0,
+                "avg": round(sum(network_usages) / len(network_usages), 2) if network_usages else 0,
+                "min": round(min(network_usages), 2) if network_usages else 0
             }
         }
 
@@ -3883,6 +4845,70 @@ class DatabaseManager:
         
         total_score = sum(status['overall_score'] for status in status_list)
         return round(total_score / len(status_list), 2)
+
+    def _calculate_five_dimension_scores(self, status_list: List[Dict]) -> Dict:
+        """
+        计算五维健康度评分
+        
+        Args:
+            status_list: 机器状态列表
+            
+        Returns:
+            五维健康度评分字典，包含CPU、内存、Swap、磁盘、网络五个维度的平均评分
+        """
+        if not status_list:
+            return {
+                "cpu_score": 0.0,
+                "memory_score": 0.0,
+                "swap_score": 0.0,
+                "disk_score": 0.0,
+                "network_score": 0.0
+            }
+        
+        # 收集每个维度的评分
+        cpu_scores = []
+        memory_scores = []
+        swap_scores = []
+        disk_scores = []
+        network_scores = []
+        
+        for status in status_list:
+            key_metrics = status.get('key_metrics', {})
+            
+            # 计算每个维度的评分（基于使用率，使用率越低评分越高）
+            cpu_usage = key_metrics.get('cpu_usage_percent', 0)
+            cpu_score = max(0, 100 - cpu_usage)
+            cpu_scores.append(cpu_score)
+            
+            memory_usage = key_metrics.get('memory_usage_percent', 0)
+            memory_score = max(0, 100 - memory_usage)
+            memory_scores.append(memory_score)
+            
+            swap_usage = key_metrics.get('swap_usage_percent', 0)
+            swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+            swap_scores.append(swap_score)
+            
+            disk_usage = key_metrics.get('disk_usage_percent', 0)
+            disk_score = max(0, 100 - disk_usage)
+            disk_scores.append(disk_score)
+            
+            network_usage = key_metrics.get('network_usage_percent', 0)
+            # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+            # 网络使用率越高得分越高，但超过80%开始扣分
+            if network_usage <= 80:
+                network_score = 100
+            else:
+                network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_scores.append(network_score)
+        
+        # 计算平均评分
+        return {
+            "cpu_score": round(sum(cpu_scores) / len(cpu_scores), 2) if cpu_scores else 0.0,
+            "memory_score": round(sum(memory_scores) / len(memory_scores), 2) if memory_scores else 0.0,
+            "swap_score": round(sum(swap_scores) / len(swap_scores), 2) if swap_scores else 0.0,
+            "disk_score": round(sum(disk_scores) / len(disk_scores), 2) if disk_scores else 0.0,
+            "network_score": round(sum(network_scores) / len(network_scores), 2) if network_scores else 0.0
+        }
 
     def _categorize_issues(self, issues: List[Dict]) -> Dict:
         """分类汇总问题"""
@@ -3976,11 +5002,21 @@ class DatabaseManager:
         swap_used = metric.get('swap_used', 0) or 0
         swap_total = metric.get('swap_total', 0) or 0
         
+        # 网络指标
+        net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+        net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+        
         # 计算关键指标
         cpu_total = cpu_usr + cpu_sys + cpu_iow
         mem_used = mem_total - mem_free - mem_buff - mem_cache
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
+        # 1000 Mbps = 125,000 KB/s
+        max_bandwidth_kbps = 125000
+        total_network_usage = net_rx_kbps + net_tx_kbps
+        network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
         # 状态评估
         status_level = "正常"
@@ -4023,6 +5059,15 @@ class DatabaseManager:
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
+        # 网络使用率检查
+        if network_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
+        elif network_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
+        
         # 数据时效性检查（超过1小时无数据视为异常）
         import time
         current_timestamp = int(time.time())
@@ -4047,17 +5092,18 @@ class DatabaseManager:
                 "memory_usage_percent": round(mem_usage_percent, 2),
                 "disk_usage_percent": round(disk_used_percent, 2),
                 "swap_usage_percent": round(swap_usage_percent, 2),
+                "network_usage_percent": round(network_usage_percent, 2),
                 "data_freshness_hours": round(time_diff_hours, 2)
             },
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -4066,18 +5112,20 @@ class DatabaseManager:
             mem_usage: 内存使用率
             disk_usage: 磁盘使用率
             swap_usage: Swap使用率
+            network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重
+        # 各项指标的权重（调整为5维评分）
         weights = {
-            'cpu': 0.25,
-            'memory': 0.25,
+            'cpu': 0.20,
+            'memory': 0.20,
             'disk': 0.20,
             'swap': 0.15,
-            'freshness': 0.15
+            'network': 0.15,
+            'freshness': 0.10
         }
         
         # 计算各项得分（0-100分）
@@ -4085,6 +5133,13 @@ class DatabaseManager:
         mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
         disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
         swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+        # 网络使用率越高得分越高，但超过80%开始扣分
+        if network_usage <= 80:
+            network_score = 100
+        else:
+            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
         
         # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
         freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
@@ -4095,6 +5150,7 @@ class DatabaseManager:
             mem_score * weights['memory'] +
             disk_score * weights['disk'] +
             swap_score * weights['swap'] +
+            network_score * weights['network'] +
             freshness_score * weights['freshness']
         )
         
@@ -4166,6 +5222,7 @@ class DatabaseManager:
             - 告警和提示信息汇总
             - 关键指标统计
             - 性能趋势分析
+            - 五维健康度评分
         """
         # 获取所有机器的状态评估
         status_list = self.get_all_machines_status(time_window_hours)
@@ -4202,6 +5259,9 @@ class DatabaseManager:
         # 6. 系统健康评分
         overall_health_score = self._calculate_system_health_score(status_list)
         
+        # 7. 五维健康度评分
+        five_dimension_scores = self._calculate_five_dimension_scores(status_list)
+        
         # 构建总体概览信息
         overview = {
             "timestamp": int(time.time()),
@@ -4213,7 +5273,8 @@ class DatabaseManager:
             "health_status": {
                 "distribution": status_distribution,
                 "overall_score": overall_health_score,
-                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0,
+                "five_dimension_scores": five_dimension_scores
             },
             "alerts_summary": {
                 "critical_issues": len(all_issues),
@@ -4238,13 +5299,15 @@ class DatabaseManager:
                 "cpu_usage": {"max": 0, "avg": 0, "min": 0},
                 "memory_usage": {"max": 0, "avg": 0, "min": 0},
                 "disk_usage": {"max": 0, "avg": 0, "min": 0},
-                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+                "swap_usage": {"max": 0, "avg": 0, "min": 0},
+                "network_usage": {"max": 0, "avg": 0, "min": 0}
             }
         
         cpu_usages = []
         memory_usages = []
         disk_usages = []
         swap_usages = []
+        network_usages = []
         
         for metric in metrics:
             # 计算各项指标
@@ -4266,10 +5329,18 @@ class DatabaseManager:
             swap_total = metric.get('swap_total', 0) or 0
             swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
             
+            # 计算网络使用率
+            net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+            net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+            max_bandwidth_kbps = 125000  # 1000 Mbps = 125,000 KB/s
+            total_network_usage = net_rx_kbps + net_tx_kbps
+            network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
+            
             cpu_usages.append(cpu_total)
             memory_usages.append(mem_usage_percent)
             disk_usages.append(disk_usage)
             swap_usages.append(swap_usage_percent)
+            network_usages.append(network_usage_percent)
         
         return {
             "cpu_usage": {
@@ -4291,6 +5362,11 @@ class DatabaseManager:
                 "max": round(max(swap_usages), 2) if swap_usages else 0,
                 "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
                 "min": round(min(swap_usages), 2) if swap_usages else 0
+            },
+            "network_usage": {
+                "max": round(max(network_usages), 2) if network_usages else 0,
+                "avg": round(sum(network_usages) / len(network_usages), 2) if network_usages else 0,
+                "min": round(min(network_usages), 2) if network_usages else 0
             }
         }
 
@@ -4312,6 +5388,70 @@ class DatabaseManager:
         
         total_score = sum(status['overall_score'] for status in status_list)
         return round(total_score / len(status_list), 2)
+
+    def _calculate_five_dimension_scores(self, status_list: List[Dict]) -> Dict:
+        """
+        计算五维健康度评分
+        
+        Args:
+            status_list: 机器状态列表
+            
+        Returns:
+            五维健康度评分字典，包含CPU、内存、Swap、磁盘、网络五个维度的平均评分
+        """
+        if not status_list:
+            return {
+                "cpu_score": 0.0,
+                "memory_score": 0.0,
+                "swap_score": 0.0,
+                "disk_score": 0.0,
+                "network_score": 0.0
+            }
+        
+        # 收集每个维度的评分
+        cpu_scores = []
+        memory_scores = []
+        swap_scores = []
+        disk_scores = []
+        network_scores = []
+        
+        for status in status_list:
+            key_metrics = status.get('key_metrics', {})
+            
+            # 计算每个维度的评分（基于使用率，使用率越低评分越高）
+            cpu_usage = key_metrics.get('cpu_usage_percent', 0)
+            cpu_score = max(0, 100 - cpu_usage)
+            cpu_scores.append(cpu_score)
+            
+            memory_usage = key_metrics.get('memory_usage_percent', 0)
+            memory_score = max(0, 100 - memory_usage)
+            memory_scores.append(memory_score)
+            
+            swap_usage = key_metrics.get('swap_usage_percent', 0)
+            swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+            swap_scores.append(swap_score)
+            
+            disk_usage = key_metrics.get('disk_usage_percent', 0)
+            disk_score = max(0, 100 - disk_usage)
+            disk_scores.append(disk_score)
+            
+            network_usage = key_metrics.get('network_usage_percent', 0)
+            # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+            # 网络使用率越高得分越高，但超过80%开始扣分
+            if network_usage <= 80:
+                network_score = 100
+            else:
+                network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_scores.append(network_score)
+        
+        # 计算平均评分
+        return {
+            "cpu_score": round(sum(cpu_scores) / len(cpu_scores), 2) if cpu_scores else 0.0,
+            "memory_score": round(sum(memory_scores) / len(memory_scores), 2) if memory_scores else 0.0,
+            "swap_score": round(sum(swap_scores) / len(swap_scores), 2) if swap_scores else 0.0,
+            "disk_score": round(sum(disk_scores) / len(disk_scores), 2) if disk_scores else 0.0,
+            "network_score": round(sum(network_scores) / len(network_scores), 2) if network_scores else 0.0
+        }
 
     def _categorize_issues(self, issues: List[Dict]) -> Dict:
         """分类汇总问题"""
@@ -4405,11 +5545,21 @@ class DatabaseManager:
         swap_used = metric.get('swap_used', 0) or 0
         swap_total = metric.get('swap_total', 0) or 0
         
+        # 网络指标
+        net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+        net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+        
         # 计算关键指标
         cpu_total = cpu_usr + cpu_sys + cpu_iow
         mem_used = mem_total - mem_free - mem_buff - mem_cache
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
+        # 1000 Mbps = 125,000 KB/s
+        max_bandwidth_kbps = 125000
+        total_network_usage = net_rx_kbps + net_tx_kbps
+        network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
         # 状态评估
         status_level = "正常"
@@ -4452,6 +5602,15 @@ class DatabaseManager:
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
+        # 网络使用率检查
+        if network_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
+        elif network_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
+        
         # 数据时效性检查（超过1小时无数据视为异常）
         import time
         current_timestamp = int(time.time())
@@ -4476,17 +5635,18 @@ class DatabaseManager:
                 "memory_usage_percent": round(mem_usage_percent, 2),
                 "disk_usage_percent": round(disk_used_percent, 2),
                 "swap_usage_percent": round(swap_usage_percent, 2),
+                "network_usage_percent": round(network_usage_percent, 2),
                 "data_freshness_hours": round(time_diff_hours, 2)
             },
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -4495,18 +5655,20 @@ class DatabaseManager:
             mem_usage: 内存使用率
             disk_usage: 磁盘使用率
             swap_usage: Swap使用率
+            network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重
+        # 各项指标的权重（调整为5维评分）
         weights = {
-            'cpu': 0.25,
-            'memory': 0.25,
+            'cpu': 0.20,
+            'memory': 0.20,
             'disk': 0.20,
             'swap': 0.15,
-            'freshness': 0.15
+            'network': 0.15,
+            'freshness': 0.10
         }
         
         # 计算各项得分（0-100分）
@@ -4514,6 +5676,13 @@ class DatabaseManager:
         mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
         disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
         swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+        # 网络使用率越高得分越高，但超过80%开始扣分
+        if network_usage <= 80:
+            network_score = 100
+        else:
+            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
         
         # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
         freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
@@ -4524,6 +5693,7 @@ class DatabaseManager:
             mem_score * weights['memory'] +
             disk_score * weights['disk'] +
             swap_score * weights['swap'] +
+            network_score * weights['network'] +
             freshness_score * weights['freshness']
         )
         
@@ -4595,6 +5765,7 @@ class DatabaseManager:
             - 告警和提示信息汇总
             - 关键指标统计
             - 性能趋势分析
+            - 五维健康度评分
         """
         # 获取所有机器的状态评估
         status_list = self.get_all_machines_status(time_window_hours)
@@ -4631,6 +5802,9 @@ class DatabaseManager:
         # 6. 系统健康评分
         overall_health_score = self._calculate_system_health_score(status_list)
         
+        # 7. 五维健康度评分
+        five_dimension_scores = self._calculate_five_dimension_scores(status_list)
+        
         # 构建总体概览信息
         overview = {
             "timestamp": int(time.time()),
@@ -4642,7 +5816,8 @@ class DatabaseManager:
             "health_status": {
                 "distribution": status_distribution,
                 "overall_score": overall_health_score,
-                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0,
+                "five_dimension_scores": five_dimension_scores
             },
             "alerts_summary": {
                 "critical_issues": len(all_issues),
@@ -4667,13 +5842,15 @@ class DatabaseManager:
                 "cpu_usage": {"max": 0, "avg": 0, "min": 0},
                 "memory_usage": {"max": 0, "avg": 0, "min": 0},
                 "disk_usage": {"max": 0, "avg": 0, "min": 0},
-                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+                "swap_usage": {"max": 0, "avg": 0, "min": 0},
+                "network_usage": {"max": 0, "avg": 0, "min": 0}
             }
         
         cpu_usages = []
         memory_usages = []
         disk_usages = []
         swap_usages = []
+        network_usages = []
         
         for metric in metrics:
             # 计算各项指标
@@ -4695,10 +5872,18 @@ class DatabaseManager:
             swap_total = metric.get('swap_total', 0) or 0
             swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
             
+            # 计算网络使用率
+            net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+            net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+            max_bandwidth_kbps = 125000  # 1000 Mbps = 125,000 KB/s
+            total_network_usage = net_rx_kbps + net_tx_kbps
+            network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
+            
             cpu_usages.append(cpu_total)
             memory_usages.append(mem_usage_percent)
             disk_usages.append(disk_usage)
             swap_usages.append(swap_usage_percent)
+            network_usages.append(network_usage_percent)
         
         return {
             "cpu_usage": {
@@ -4720,6 +5905,11 @@ class DatabaseManager:
                 "max": round(max(swap_usages), 2) if swap_usages else 0,
                 "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
                 "min": round(min(swap_usages), 2) if swap_usages else 0
+            },
+            "network_usage": {
+                "max": round(max(network_usages), 2) if network_usages else 0,
+                "avg": round(sum(network_usages) / len(network_usages), 2) if network_usages else 0,
+                "min": round(min(network_usages), 2) if network_usages else 0
             }
         }
 
@@ -4741,6 +5931,70 @@ class DatabaseManager:
         
         total_score = sum(status['overall_score'] for status in status_list)
         return round(total_score / len(status_list), 2)
+
+    def _calculate_five_dimension_scores(self, status_list: List[Dict]) -> Dict:
+        """
+        计算五维健康度评分
+        
+        Args:
+            status_list: 机器状态列表
+            
+        Returns:
+            五维健康度评分字典，包含CPU、内存、Swap、磁盘、网络五个维度的平均评分
+        """
+        if not status_list:
+            return {
+                "cpu_score": 0.0,
+                "memory_score": 0.0,
+                "swap_score": 0.0,
+                "disk_score": 0.0,
+                "network_score": 0.0
+            }
+        
+        # 收集每个维度的评分
+        cpu_scores = []
+        memory_scores = []
+        swap_scores = []
+        disk_scores = []
+        network_scores = []
+        
+        for status in status_list:
+            key_metrics = status.get('key_metrics', {})
+            
+            # 计算每个维度的评分（基于使用率，使用率越低评分越高）
+            cpu_usage = key_metrics.get('cpu_usage_percent', 0)
+            cpu_score = max(0, 100 - cpu_usage)
+            cpu_scores.append(cpu_score)
+            
+            memory_usage = key_metrics.get('memory_usage_percent', 0)
+            memory_score = max(0, 100 - memory_usage)
+            memory_scores.append(memory_score)
+            
+            swap_usage = key_metrics.get('swap_usage_percent', 0)
+            swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+            swap_scores.append(swap_score)
+            
+            disk_usage = key_metrics.get('disk_usage_percent', 0)
+            disk_score = max(0, 100 - disk_usage)
+            disk_scores.append(disk_score)
+            
+            network_usage = key_metrics.get('network_usage_percent', 0)
+            # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+            # 网络使用率越高得分越高，但超过80%开始扣分
+            if network_usage <= 80:
+                network_score = 100
+            else:
+                network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_scores.append(network_score)
+        
+        # 计算平均评分
+        return {
+            "cpu_score": round(sum(cpu_scores) / len(cpu_scores), 2) if cpu_scores else 0.0,
+            "memory_score": round(sum(memory_scores) / len(memory_scores), 2) if memory_scores else 0.0,
+            "swap_score": round(sum(swap_scores) / len(swap_scores), 2) if swap_scores else 0.0,
+            "disk_score": round(sum(disk_scores) / len(disk_scores), 2) if disk_scores else 0.0,
+            "network_score": round(sum(network_scores) / len(network_scores), 2) if network_scores else 0.0
+        }
 
     def _categorize_issues(self, issues: List[Dict]) -> Dict:
         """分类汇总问题"""
@@ -4843,11 +6097,21 @@ class DatabaseManager:
         swap_used = metric.get('swap_used', 0) or 0
         swap_total = metric.get('swap_total', 0) or 0
         
+        # 网络指标
+        net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+        net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+        
         # 计算关键指标
         cpu_total = cpu_usr + cpu_sys + cpu_iow
         mem_used = mem_total - mem_free - mem_buff - mem_cache
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
+        # 1000 Mbps = 125,000 KB/s
+        max_bandwidth_kbps = 125000
+        total_network_usage = net_rx_kbps + net_tx_kbps
+        network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
         # 状态评估
         status_level = "正常"
@@ -4890,6 +6154,15 @@ class DatabaseManager:
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
+        # 网络使用率检查
+        if network_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
+        elif network_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
+        
         # 数据时效性检查（超过1小时无数据视为异常）
         import time
         current_timestamp = int(time.time())
@@ -4914,17 +6187,18 @@ class DatabaseManager:
                 "memory_usage_percent": round(mem_usage_percent, 2),
                 "disk_usage_percent": round(disk_used_percent, 2),
                 "swap_usage_percent": round(swap_usage_percent, 2),
+                "network_usage_percent": round(network_usage_percent, 2),
                 "data_freshness_hours": round(time_diff_hours, 2)
             },
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -4933,18 +6207,20 @@ class DatabaseManager:
             mem_usage: 内存使用率
             disk_usage: 磁盘使用率
             swap_usage: Swap使用率
+            network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重
+        # 各项指标的权重（调整为5维评分）
         weights = {
-            'cpu': 0.25,
-            'memory': 0.25,
+            'cpu': 0.20,
+            'memory': 0.20,
             'disk': 0.20,
             'swap': 0.15,
-            'freshness': 0.15
+            'network': 0.15,
+            'freshness': 0.10
         }
         
         # 计算各项得分（0-100分）
@@ -4952,6 +6228,13 @@ class DatabaseManager:
         mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
         disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
         swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+        # 网络使用率越高得分越高，但超过80%开始扣分
+        if network_usage <= 80:
+            network_score = 100
+        else:
+            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
         
         # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
         freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
@@ -4962,6 +6245,7 @@ class DatabaseManager:
             mem_score * weights['memory'] +
             disk_score * weights['disk'] +
             swap_score * weights['swap'] +
+            network_score * weights['network'] +
             freshness_score * weights['freshness']
         )
         
@@ -5033,6 +6317,7 @@ class DatabaseManager:
             - 告警和提示信息汇总
             - 关键指标统计
             - 性能趋势分析
+            - 五维健康度评分
         """
         # 获取所有机器的状态评估
         status_list = self.get_all_machines_status(time_window_hours)
@@ -5069,6 +6354,9 @@ class DatabaseManager:
         # 6. 系统健康评分
         overall_health_score = self._calculate_system_health_score(status_list)
         
+        # 7. 五维健康度评分
+        five_dimension_scores = self._calculate_five_dimension_scores(status_list)
+        
         # 构建总体概览信息
         overview = {
             "timestamp": int(time.time()),
@@ -5080,7 +6368,8 @@ class DatabaseManager:
             "health_status": {
                 "distribution": status_distribution,
                 "overall_score": overall_health_score,
-                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0,
+                "five_dimension_scores": five_dimension_scores
             },
             "alerts_summary": {
                 "critical_issues": len(all_issues),
@@ -5105,13 +6394,15 @@ class DatabaseManager:
                 "cpu_usage": {"max": 0, "avg": 0, "min": 0},
                 "memory_usage": {"max": 0, "avg": 0, "min": 0},
                 "disk_usage": {"max": 0, "avg": 0, "min": 0},
-                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+                "swap_usage": {"max": 0, "avg": 0, "min": 0},
+                "network_usage": {"max": 0, "avg": 0, "min": 0}
             }
         
         cpu_usages = []
         memory_usages = []
         disk_usages = []
         swap_usages = []
+        network_usages = []
         
         for metric in metrics:
             # 计算各项指标
@@ -5133,10 +6424,18 @@ class DatabaseManager:
             swap_total = metric.get('swap_total', 0) or 0
             swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
             
+            # 计算网络使用率
+            net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+            net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+            max_bandwidth_kbps = 125000  # 1000 Mbps = 125,000 KB/s
+            total_network_usage = net_rx_kbps + net_tx_kbps
+            network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
+            
             cpu_usages.append(cpu_total)
             memory_usages.append(mem_usage_percent)
             disk_usages.append(disk_usage)
             swap_usages.append(swap_usage_percent)
+            network_usages.append(network_usage_percent)
         
         return {
             "cpu_usage": {
@@ -5158,6 +6457,11 @@ class DatabaseManager:
                 "max": round(max(swap_usages), 2) if swap_usages else 0,
                 "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
                 "min": round(min(swap_usages), 2) if swap_usages else 0
+            },
+            "network_usage": {
+                "max": round(max(network_usages), 2) if network_usages else 0,
+                "avg": round(sum(network_usages) / len(network_usages), 2) if network_usages else 0,
+                "min": round(min(network_usages), 2) if network_usages else 0
             }
         }
 
@@ -5179,6 +6483,70 @@ class DatabaseManager:
         
         total_score = sum(status['overall_score'] for status in status_list)
         return round(total_score / len(status_list), 2)
+
+    def _calculate_five_dimension_scores(self, status_list: List[Dict]) -> Dict:
+        """
+        计算五维健康度评分
+        
+        Args:
+            status_list: 机器状态列表
+            
+        Returns:
+            五维健康度评分字典，包含CPU、内存、Swap、磁盘、网络五个维度的平均评分
+        """
+        if not status_list:
+            return {
+                "cpu_score": 0.0,
+                "memory_score": 0.0,
+                "swap_score": 0.0,
+                "disk_score": 0.0,
+                "network_score": 0.0
+            }
+        
+        # 收集每个维度的评分
+        cpu_scores = []
+        memory_scores = []
+        swap_scores = []
+        disk_scores = []
+        network_scores = []
+        
+        for status in status_list:
+            key_metrics = status.get('key_metrics', {})
+            
+            # 计算每个维度的评分（基于使用率，使用率越低评分越高）
+            cpu_usage = key_metrics.get('cpu_usage_percent', 0)
+            cpu_score = max(0, 100 - cpu_usage)
+            cpu_scores.append(cpu_score)
+            
+            memory_usage = key_metrics.get('memory_usage_percent', 0)
+            memory_score = max(0, 100 - memory_usage)
+            memory_scores.append(memory_score)
+            
+            swap_usage = key_metrics.get('swap_usage_percent', 0)
+            swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+            swap_scores.append(swap_score)
+            
+            disk_usage = key_metrics.get('disk_usage_percent', 0)
+            disk_score = max(0, 100 - disk_usage)
+            disk_scores.append(disk_score)
+            
+            network_usage = key_metrics.get('network_usage_percent', 0)
+            # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+            # 网络使用率越高得分越高，但超过80%开始扣分
+            if network_usage <= 80:
+                network_score = 100
+            else:
+                network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_scores.append(network_score)
+        
+        # 计算平均评分
+        return {
+            "cpu_score": round(sum(cpu_scores) / len(cpu_scores), 2) if cpu_scores else 0.0,
+            "memory_score": round(sum(memory_scores) / len(memory_scores), 2) if memory_scores else 0.0,
+            "swap_score": round(sum(swap_scores) / len(swap_scores), 2) if swap_scores else 0.0,
+            "disk_score": round(sum(disk_scores) / len(disk_scores), 2) if disk_scores else 0.0,
+            "network_score": round(sum(network_scores) / len(network_scores), 2) if network_scores else 0.0
+        }
 
     def _categorize_issues(self, issues: List[Dict]) -> Dict:
         """分类汇总问题"""
@@ -5301,11 +6669,21 @@ class DatabaseManager:
         swap_used = metric.get('swap_used', 0) or 0
         swap_total = metric.get('swap_total', 0) or 0
         
+        # 网络指标
+        net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+        net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+        
         # 计算关键指标
         cpu_total = cpu_usr + cpu_sys + cpu_iow
         mem_used = mem_total - mem_free - mem_buff - mem_cache
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
+        # 1000 Mbps = 125,000 KB/s
+        max_bandwidth_kbps = 125000
+        total_network_usage = net_rx_kbps + net_tx_kbps
+        network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
         # 状态评估
         status_level = "正常"
@@ -5348,6 +6726,15 @@ class DatabaseManager:
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
+        # 网络使用率检查
+        if network_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
+        elif network_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
+        
         # 数据时效性检查（超过1小时无数据视为异常）
         import time
         current_timestamp = int(time.time())
@@ -5372,17 +6759,18 @@ class DatabaseManager:
                 "memory_usage_percent": round(mem_usage_percent, 2),
                 "disk_usage_percent": round(disk_used_percent, 2),
                 "swap_usage_percent": round(swap_usage_percent, 2),
+                "network_usage_percent": round(network_usage_percent, 2),
                 "data_freshness_hours": round(time_diff_hours, 2)
             },
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -5391,18 +6779,20 @@ class DatabaseManager:
             mem_usage: 内存使用率
             disk_usage: 磁盘使用率
             swap_usage: Swap使用率
+            network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重
+        # 各项指标的权重（调整为5维评分）
         weights = {
-            'cpu': 0.25,
-            'memory': 0.25,
+            'cpu': 0.20,
+            'memory': 0.20,
             'disk': 0.20,
             'swap': 0.15,
-            'freshness': 0.15
+            'network': 0.15,
+            'freshness': 0.10
         }
         
         # 计算各项得分（0-100分）
@@ -5410,6 +6800,13 @@ class DatabaseManager:
         mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
         disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
         swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+        # 网络使用率越高得分越高，但超过80%开始扣分
+        if network_usage <= 80:
+            network_score = 100
+        else:
+            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
         
         # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
         freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
@@ -5420,6 +6817,7 @@ class DatabaseManager:
             mem_score * weights['memory'] +
             disk_score * weights['disk'] +
             swap_score * weights['swap'] +
+            network_score * weights['network'] +
             freshness_score * weights['freshness']
         )
         
@@ -5491,6 +6889,7 @@ class DatabaseManager:
             - 告警和提示信息汇总
             - 关键指标统计
             - 性能趋势分析
+            - 五维健康度评分
         """
         # 获取所有机器的状态评估
         status_list = self.get_all_machines_status(time_window_hours)
@@ -5527,6 +6926,9 @@ class DatabaseManager:
         # 6. 系统健康评分
         overall_health_score = self._calculate_system_health_score(status_list)
         
+        # 7. 五维健康度评分
+        five_dimension_scores = self._calculate_five_dimension_scores(status_list)
+        
         # 构建总体概览信息
         overview = {
             "timestamp": int(time.time()),
@@ -5538,7 +6940,8 @@ class DatabaseManager:
             "health_status": {
                 "distribution": status_distribution,
                 "overall_score": overall_health_score,
-                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0,
+                "five_dimension_scores": five_dimension_scores
             },
             "alerts_summary": {
                 "critical_issues": len(all_issues),
@@ -5563,13 +6966,15 @@ class DatabaseManager:
                 "cpu_usage": {"max": 0, "avg": 0, "min": 0},
                 "memory_usage": {"max": 0, "avg": 0, "min": 0},
                 "disk_usage": {"max": 0, "avg": 0, "min": 0},
-                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+                "swap_usage": {"max": 0, "avg": 0, "min": 0},
+                "network_usage": {"max": 0, "avg": 0, "min": 0}
             }
         
         cpu_usages = []
         memory_usages = []
         disk_usages = []
         swap_usages = []
+        network_usages = []
         
         for metric in metrics:
             # 计算各项指标
@@ -5591,10 +6996,18 @@ class DatabaseManager:
             swap_total = metric.get('swap_total', 0) or 0
             swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
             
+            # 计算网络使用率
+            net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+            net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+            max_bandwidth_kbps = 125000  # 1000 Mbps = 125,000 KB/s
+            total_network_usage = net_rx_kbps + net_tx_kbps
+            network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
+            
             cpu_usages.append(cpu_total)
             memory_usages.append(mem_usage_percent)
             disk_usages.append(disk_usage)
             swap_usages.append(swap_usage_percent)
+            network_usages.append(network_usage_percent)
         
         return {
             "cpu_usage": {
@@ -5616,6 +7029,11 @@ class DatabaseManager:
                 "max": round(max(swap_usages), 2) if swap_usages else 0,
                 "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
                 "min": round(min(swap_usages), 2) if swap_usages else 0
+            },
+            "network_usage": {
+                "max": round(max(network_usages), 2) if network_usages else 0,
+                "avg": round(sum(network_usages) / len(network_usages), 2) if network_usages else 0,
+                "min": round(min(network_usages), 2) if network_usages else 0
             }
         }
 
@@ -5637,6 +7055,70 @@ class DatabaseManager:
         
         total_score = sum(status['overall_score'] for status in status_list)
         return round(total_score / len(status_list), 2)
+
+    def _calculate_five_dimension_scores(self, status_list: List[Dict]) -> Dict:
+        """
+        计算五维健康度评分
+        
+        Args:
+            status_list: 机器状态列表
+            
+        Returns:
+            五维健康度评分字典，包含CPU、内存、Swap、磁盘、网络五个维度的平均评分
+        """
+        if not status_list:
+            return {
+                "cpu_score": 0.0,
+                "memory_score": 0.0,
+                "swap_score": 0.0,
+                "disk_score": 0.0,
+                "network_score": 0.0
+            }
+        
+        # 收集每个维度的评分
+        cpu_scores = []
+        memory_scores = []
+        swap_scores = []
+        disk_scores = []
+        network_scores = []
+        
+        for status in status_list:
+            key_metrics = status.get('key_metrics', {})
+            
+            # 计算每个维度的评分（基于使用率，使用率越低评分越高）
+            cpu_usage = key_metrics.get('cpu_usage_percent', 0)
+            cpu_score = max(0, 100 - cpu_usage)
+            cpu_scores.append(cpu_score)
+            
+            memory_usage = key_metrics.get('memory_usage_percent', 0)
+            memory_score = max(0, 100 - memory_usage)
+            memory_scores.append(memory_score)
+            
+            swap_usage = key_metrics.get('swap_usage_percent', 0)
+            swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+            swap_scores.append(swap_score)
+            
+            disk_usage = key_metrics.get('disk_usage_percent', 0)
+            disk_score = max(0, 100 - disk_usage)
+            disk_scores.append(disk_score)
+            
+            network_usage = key_metrics.get('network_usage_percent', 0)
+            # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+            # 网络使用率越高得分越高，但超过80%开始扣分
+            if network_usage <= 80:
+                network_score = 100
+            else:
+                network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_scores.append(network_score)
+        
+        # 计算平均评分
+        return {
+            "cpu_score": round(sum(cpu_scores) / len(cpu_scores), 2) if cpu_scores else 0.0,
+            "memory_score": round(sum(memory_scores) / len(memory_scores), 2) if memory_scores else 0.0,
+            "swap_score": round(sum(swap_scores) / len(swap_scores), 2) if swap_scores else 0.0,
+            "disk_score": round(sum(disk_scores) / len(disk_scores), 2) if disk_scores else 0.0,
+            "network_score": round(sum(network_scores) / len(network_scores), 2) if network_scores else 0.0
+        }
 
     def _categorize_issues(self, issues: List[Dict]) -> Dict:
         """分类汇总问题"""
@@ -5724,11 +7206,21 @@ class DatabaseManager:
         swap_used = metric.get('swap_used', 0) or 0
         swap_total = metric.get('swap_total', 0) or 0
         
+        # 网络指标
+        net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+        net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+        
         # 计算关键指标
         cpu_total = cpu_usr + cpu_sys + cpu_iow
         mem_used = mem_total - mem_free - mem_buff - mem_cache
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
+        # 1000 Mbps = 125,000 KB/s
+        max_bandwidth_kbps = 125000
+        total_network_usage = net_rx_kbps + net_tx_kbps
+        network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
         # 状态评估
         status_level = "正常"
@@ -5771,6 +7263,15 @@ class DatabaseManager:
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
+        # 网络使用率检查
+        if network_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
+        elif network_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
+        
         # 数据时效性检查（超过1小时无数据视为异常）
         import time
         current_timestamp = int(time.time())
@@ -5795,17 +7296,18 @@ class DatabaseManager:
                 "memory_usage_percent": round(mem_usage_percent, 2),
                 "disk_usage_percent": round(disk_used_percent, 2),
                 "swap_usage_percent": round(swap_usage_percent, 2),
+                "network_usage_percent": round(network_usage_percent, 2),
                 "data_freshness_hours": round(time_diff_hours, 2)
             },
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -5814,18 +7316,20 @@ class DatabaseManager:
             mem_usage: 内存使用率
             disk_usage: 磁盘使用率
             swap_usage: Swap使用率
+            network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重
+        # 各项指标的权重（调整为5维评分）
         weights = {
-            'cpu': 0.25,
-            'memory': 0.25,
+            'cpu': 0.20,
+            'memory': 0.20,
             'disk': 0.20,
             'swap': 0.15,
-            'freshness': 0.15
+            'network': 0.15,
+            'freshness': 0.10
         }
         
         # 计算各项得分（0-100分）
@@ -5833,6 +7337,13 @@ class DatabaseManager:
         mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
         disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
         swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+        # 网络使用率越高得分越高，但超过80%开始扣分
+        if network_usage <= 80:
+            network_score = 100
+        else:
+            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
         
         # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
         freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
@@ -5843,6 +7354,7 @@ class DatabaseManager:
             mem_score * weights['memory'] +
             disk_score * weights['disk'] +
             swap_score * weights['swap'] +
+            network_score * weights['network'] +
             freshness_score * weights['freshness']
         )
         
@@ -5914,6 +7426,7 @@ class DatabaseManager:
             - 告警和提示信息汇总
             - 关键指标统计
             - 性能趋势分析
+            - 五维健康度评分
         """
         # 获取所有机器的状态评估
         status_list = self.get_all_machines_status(time_window_hours)
@@ -5950,6 +7463,9 @@ class DatabaseManager:
         # 6. 系统健康评分
         overall_health_score = self._calculate_system_health_score(status_list)
         
+        # 7. 五维健康度评分
+        five_dimension_scores = self._calculate_five_dimension_scores(status_list)
+        
         # 构建总体概览信息
         overview = {
             "timestamp": int(time.time()),
@@ -5961,7 +7477,8 @@ class DatabaseManager:
             "health_status": {
                 "distribution": status_distribution,
                 "overall_score": overall_health_score,
-                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0,
+                "five_dimension_scores": five_dimension_scores
             },
             "alerts_summary": {
                 "critical_issues": len(all_issues),
@@ -5986,13 +7503,15 @@ class DatabaseManager:
                 "cpu_usage": {"max": 0, "avg": 0, "min": 0},
                 "memory_usage": {"max": 0, "avg": 0, "min": 0},
                 "disk_usage": {"max": 0, "avg": 0, "min": 0},
-                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+                "swap_usage": {"max": 0, "avg": 0, "min": 0},
+                "network_usage": {"max": 0, "avg": 0, "min": 0}
             }
         
         cpu_usages = []
         memory_usages = []
         disk_usages = []
         swap_usages = []
+        network_usages = []
         
         for metric in metrics:
             # 计算各项指标
@@ -6014,10 +7533,18 @@ class DatabaseManager:
             swap_total = metric.get('swap_total', 0) or 0
             swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
             
+            # 计算网络使用率
+            net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+            net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+            max_bandwidth_kbps = 125000  # 1000 Mbps = 125,000 KB/s
+            total_network_usage = net_rx_kbps + net_tx_kbps
+            network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
+            
             cpu_usages.append(cpu_total)
             memory_usages.append(mem_usage_percent)
             disk_usages.append(disk_usage)
             swap_usages.append(swap_usage_percent)
+            network_usages.append(network_usage_percent)
         
         return {
             "cpu_usage": {
@@ -6039,6 +7566,11 @@ class DatabaseManager:
                 "max": round(max(swap_usages), 2) if swap_usages else 0,
                 "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
                 "min": round(min(swap_usages), 2) if swap_usages else 0
+            },
+            "network_usage": {
+                "max": round(max(network_usages), 2) if network_usages else 0,
+                "avg": round(sum(network_usages) / len(network_usages), 2) if network_usages else 0,
+                "min": round(min(network_usages), 2) if network_usages else 0
             }
         }
 
@@ -6060,6 +7592,70 @@ class DatabaseManager:
         
         total_score = sum(status['overall_score'] for status in status_list)
         return round(total_score / len(status_list), 2)
+
+    def _calculate_five_dimension_scores(self, status_list: List[Dict]) -> Dict:
+        """
+        计算五维健康度评分
+        
+        Args:
+            status_list: 机器状态列表
+            
+        Returns:
+            五维健康度评分字典，包含CPU、内存、Swap、磁盘、网络五个维度的平均评分
+        """
+        if not status_list:
+            return {
+                "cpu_score": 0.0,
+                "memory_score": 0.0,
+                "swap_score": 0.0,
+                "disk_score": 0.0,
+                "network_score": 0.0
+            }
+        
+        # 收集每个维度的评分
+        cpu_scores = []
+        memory_scores = []
+        swap_scores = []
+        disk_scores = []
+        network_scores = []
+        
+        for status in status_list:
+            key_metrics = status.get('key_metrics', {})
+            
+            # 计算每个维度的评分（基于使用率，使用率越低评分越高）
+            cpu_usage = key_metrics.get('cpu_usage_percent', 0)
+            cpu_score = max(0, 100 - cpu_usage)
+            cpu_scores.append(cpu_score)
+            
+            memory_usage = key_metrics.get('memory_usage_percent', 0)
+            memory_score = max(0, 100 - memory_usage)
+            memory_scores.append(memory_score)
+            
+            swap_usage = key_metrics.get('swap_usage_percent', 0)
+            swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+            swap_scores.append(swap_score)
+            
+            disk_usage = key_metrics.get('disk_usage_percent', 0)
+            disk_score = max(0, 100 - disk_usage)
+            disk_scores.append(disk_score)
+            
+            network_usage = key_metrics.get('network_usage_percent', 0)
+            # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+            # 网络使用率越高得分越高，但超过80%开始扣分
+            if network_usage <= 80:
+                network_score = 100
+            else:
+                network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_scores.append(network_score)
+        
+        # 计算平均评分
+        return {
+            "cpu_score": round(sum(cpu_scores) / len(cpu_scores), 2) if cpu_scores else 0.0,
+            "memory_score": round(sum(memory_scores) / len(memory_scores), 2) if memory_scores else 0.0,
+            "swap_score": round(sum(swap_scores) / len(swap_scores), 2) if swap_scores else 0.0,
+            "disk_score": round(sum(disk_scores) / len(disk_scores), 2) if disk_scores else 0.0,
+            "network_score": round(sum(network_scores) / len(network_scores), 2) if network_scores else 0.0
+        }
 
     def _categorize_issues(self, issues: List[Dict]) -> Dict:
         """分类汇总问题"""
@@ -6183,11 +7779,21 @@ class DatabaseManager:
         swap_used = metric.get('swap_used', 0) or 0
         swap_total = metric.get('swap_total', 0) or 0
         
+        # 网络指标
+        net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+        net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+        
         # 计算关键指标
         cpu_total = cpu_usr + cpu_sys + cpu_iow
         mem_used = mem_total - mem_free - mem_buff - mem_cache
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
+        # 1000 Mbps = 125,000 KB/s
+        max_bandwidth_kbps = 125000
+        total_network_usage = net_rx_kbps + net_tx_kbps
+        network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
         # 状态评估
         status_level = "正常"
@@ -6230,6 +7836,15 @@ class DatabaseManager:
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
+        # 网络使用率检查
+        if network_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
+        elif network_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
+        
         # 数据时效性检查（超过1小时无数据视为异常）
         import time
         current_timestamp = int(time.time())
@@ -6254,17 +7869,18 @@ class DatabaseManager:
                 "memory_usage_percent": round(mem_usage_percent, 2),
                 "disk_usage_percent": round(disk_used_percent, 2),
                 "swap_usage_percent": round(swap_usage_percent, 2),
+                "network_usage_percent": round(network_usage_percent, 2),
                 "data_freshness_hours": round(time_diff_hours, 2)
             },
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -6273,18 +7889,20 @@ class DatabaseManager:
             mem_usage: 内存使用率
             disk_usage: 磁盘使用率
             swap_usage: Swap使用率
+            network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重
+        # 各项指标的权重（调整为5维评分）
         weights = {
-            'cpu': 0.25,
-            'memory': 0.25,
+            'cpu': 0.20,
+            'memory': 0.20,
             'disk': 0.20,
             'swap': 0.15,
-            'freshness': 0.15
+            'network': 0.15,
+            'freshness': 0.10
         }
         
         # 计算各项得分（0-100分）
@@ -6292,6 +7910,13 @@ class DatabaseManager:
         mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
         disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
         swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+        # 网络使用率越高得分越高，但超过80%开始扣分
+        if network_usage <= 80:
+            network_score = 100
+        else:
+            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
         
         # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
         freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
@@ -6302,6 +7927,7 @@ class DatabaseManager:
             mem_score * weights['memory'] +
             disk_score * weights['disk'] +
             swap_score * weights['swap'] +
+            network_score * weights['network'] +
             freshness_score * weights['freshness']
         )
         
@@ -6373,6 +7999,7 @@ class DatabaseManager:
             - 告警和提示信息汇总
             - 关键指标统计
             - 性能趋势分析
+            - 五维健康度评分
         """
         # 获取所有机器的状态评估
         status_list = self.get_all_machines_status(time_window_hours)
@@ -6409,6 +8036,9 @@ class DatabaseManager:
         # 6. 系统健康评分
         overall_health_score = self._calculate_system_health_score(status_list)
         
+        # 7. 五维健康度评分
+        five_dimension_scores = self._calculate_five_dimension_scores(status_list)
+        
         # 构建总体概览信息
         overview = {
             "timestamp": int(time.time()),
@@ -6420,7 +8050,8 @@ class DatabaseManager:
             "health_status": {
                 "distribution": status_distribution,
                 "overall_score": overall_health_score,
-                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0,
+                "five_dimension_scores": five_dimension_scores
             },
             "alerts_summary": {
                 "critical_issues": len(all_issues),
@@ -6445,13 +8076,15 @@ class DatabaseManager:
                 "cpu_usage": {"max": 0, "avg": 0, "min": 0},
                 "memory_usage": {"max": 0, "avg": 0, "min": 0},
                 "disk_usage": {"max": 0, "avg": 0, "min": 0},
-                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+                "swap_usage": {"max": 0, "avg": 0, "min": 0},
+                "network_usage": {"max": 0, "avg": 0, "min": 0}
             }
         
         cpu_usages = []
         memory_usages = []
         disk_usages = []
         swap_usages = []
+        network_usages = []
         
         for metric in metrics:
             # 计算各项指标
@@ -6473,10 +8106,18 @@ class DatabaseManager:
             swap_total = metric.get('swap_total', 0) or 0
             swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
             
+            # 计算网络使用率
+            net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+            net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+            max_bandwidth_kbps = 125000  # 1000 Mbps = 125,000 KB/s
+            total_network_usage = net_rx_kbps + net_tx_kbps
+            network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
+            
             cpu_usages.append(cpu_total)
             memory_usages.append(mem_usage_percent)
             disk_usages.append(disk_usage)
             swap_usages.append(swap_usage_percent)
+            network_usages.append(network_usage_percent)
         
         return {
             "cpu_usage": {
@@ -6498,6 +8139,11 @@ class DatabaseManager:
                 "max": round(max(swap_usages), 2) if swap_usages else 0,
                 "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
                 "min": round(min(swap_usages), 2) if swap_usages else 0
+            },
+            "network_usage": {
+                "max": round(max(network_usages), 2) if network_usages else 0,
+                "avg": round(sum(network_usages) / len(network_usages), 2) if network_usages else 0,
+                "min": round(min(network_usages), 2) if network_usages else 0
             }
         }
 
@@ -6519,6 +8165,70 @@ class DatabaseManager:
         
         total_score = sum(status['overall_score'] for status in status_list)
         return round(total_score / len(status_list), 2)
+
+    def _calculate_five_dimension_scores(self, status_list: List[Dict]) -> Dict:
+        """
+        计算五维健康度评分
+        
+        Args:
+            status_list: 机器状态列表
+            
+        Returns:
+            五维健康度评分字典，包含CPU、内存、Swap、磁盘、网络五个维度的平均评分
+        """
+        if not status_list:
+            return {
+                "cpu_score": 0.0,
+                "memory_score": 0.0,
+                "swap_score": 0.0,
+                "disk_score": 0.0,
+                "network_score": 0.0
+            }
+        
+        # 收集每个维度的评分
+        cpu_scores = []
+        memory_scores = []
+        swap_scores = []
+        disk_scores = []
+        network_scores = []
+        
+        for status in status_list:
+            key_metrics = status.get('key_metrics', {})
+            
+            # 计算每个维度的评分（基于使用率，使用率越低评分越高）
+            cpu_usage = key_metrics.get('cpu_usage_percent', 0)
+            cpu_score = max(0, 100 - cpu_usage)
+            cpu_scores.append(cpu_score)
+            
+            memory_usage = key_metrics.get('memory_usage_percent', 0)
+            memory_score = max(0, 100 - memory_usage)
+            memory_scores.append(memory_score)
+            
+            swap_usage = key_metrics.get('swap_usage_percent', 0)
+            swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+            swap_scores.append(swap_score)
+            
+            disk_usage = key_metrics.get('disk_usage_percent', 0)
+            disk_score = max(0, 100 - disk_usage)
+            disk_scores.append(disk_score)
+            
+            network_usage = key_metrics.get('network_usage_percent', 0)
+            # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+            # 网络使用率越高得分越高，但超过80%开始扣分
+            if network_usage <= 80:
+                network_score = 100
+            else:
+                network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_scores.append(network_score)
+        
+        # 计算平均评分
+        return {
+            "cpu_score": round(sum(cpu_scores) / len(cpu_scores), 2) if cpu_scores else 0.0,
+            "memory_score": round(sum(memory_scores) / len(memory_scores), 2) if memory_scores else 0.0,
+            "swap_score": round(sum(swap_scores) / len(swap_scores), 2) if swap_scores else 0.0,
+            "disk_score": round(sum(disk_scores) / len(disk_scores), 2) if disk_scores else 0.0,
+            "network_score": round(sum(network_scores) / len(network_scores), 2) if network_scores else 0.0
+        }
 
     def _categorize_issues(self, issues: List[Dict]) -> Dict:
         """分类汇总问题"""
@@ -6612,11 +8322,21 @@ class DatabaseManager:
         swap_used = metric.get('swap_used', 0) or 0
         swap_total = metric.get('swap_total', 0) or 0
         
+        # 网络指标
+        net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+        net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+        
         # 计算关键指标
         cpu_total = cpu_usr + cpu_sys + cpu_iow
         mem_used = mem_total - mem_free - mem_buff - mem_cache
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
+        # 1000 Mbps = 125,000 KB/s
+        max_bandwidth_kbps = 125000
+        total_network_usage = net_rx_kbps + net_tx_kbps
+        network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
         # 状态评估
         status_level = "正常"
@@ -6659,6 +8379,15 @@ class DatabaseManager:
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
+        # 网络使用率检查
+        if network_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
+        elif network_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
+        
         # 数据时效性检查（超过1小时无数据视为异常）
         import time
         current_timestamp = int(time.time())
@@ -6683,17 +8412,18 @@ class DatabaseManager:
                 "memory_usage_percent": round(mem_usage_percent, 2),
                 "disk_usage_percent": round(disk_used_percent, 2),
                 "swap_usage_percent": round(swap_usage_percent, 2),
+                "network_usage_percent": round(network_usage_percent, 2),
                 "data_freshness_hours": round(time_diff_hours, 2)
             },
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -6702,18 +8432,20 @@ class DatabaseManager:
             mem_usage: 内存使用率
             disk_usage: 磁盘使用率
             swap_usage: Swap使用率
+            network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重
+        # 各项指标的权重（调整为5维评分）
         weights = {
-            'cpu': 0.25,
-            'memory': 0.25,
+            'cpu': 0.20,
+            'memory': 0.20,
             'disk': 0.20,
             'swap': 0.15,
-            'freshness': 0.15
+            'network': 0.15,
+            'freshness': 0.10
         }
         
         # 计算各项得分（0-100分）
@@ -6721,6 +8453,13 @@ class DatabaseManager:
         mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
         disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
         swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+        # 网络使用率越高得分越高，但超过80%开始扣分
+        if network_usage <= 80:
+            network_score = 100
+        else:
+            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
         
         # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
         freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
@@ -6731,6 +8470,7 @@ class DatabaseManager:
             mem_score * weights['memory'] +
             disk_score * weights['disk'] +
             swap_score * weights['swap'] +
+            network_score * weights['network'] +
             freshness_score * weights['freshness']
         )
         
@@ -6802,6 +8542,7 @@ class DatabaseManager:
             - 告警和提示信息汇总
             - 关键指标统计
             - 性能趋势分析
+            - 五维健康度评分
         """
         # 获取所有机器的状态评估
         status_list = self.get_all_machines_status(time_window_hours)
@@ -6838,6 +8579,9 @@ class DatabaseManager:
         # 6. 系统健康评分
         overall_health_score = self._calculate_system_health_score(status_list)
         
+        # 7. 五维健康度评分
+        five_dimension_scores = self._calculate_five_dimension_scores(status_list)
+        
         # 构建总体概览信息
         overview = {
             "timestamp": int(time.time()),
@@ -6849,7 +8593,8 @@ class DatabaseManager:
             "health_status": {
                 "distribution": status_distribution,
                 "overall_score": overall_health_score,
-                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0,
+                "five_dimension_scores": five_dimension_scores
             },
             "alerts_summary": {
                 "critical_issues": len(all_issues),
@@ -6874,13 +8619,15 @@ class DatabaseManager:
                 "cpu_usage": {"max": 0, "avg": 0, "min": 0},
                 "memory_usage": {"max": 0, "avg": 0, "min": 0},
                 "disk_usage": {"max": 0, "avg": 0, "min": 0},
-                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+                "swap_usage": {"max": 0, "avg": 0, "min": 0},
+                "network_usage": {"max": 0, "avg": 0, "min": 0}
             }
         
         cpu_usages = []
         memory_usages = []
         disk_usages = []
         swap_usages = []
+        network_usages = []
         
         for metric in metrics:
             # 计算各项指标
@@ -6902,10 +8649,18 @@ class DatabaseManager:
             swap_total = metric.get('swap_total', 0) or 0
             swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
             
+            # 计算网络使用率
+            net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+            net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+            max_bandwidth_kbps = 125000  # 1000 Mbps = 125,000 KB/s
+            total_network_usage = net_rx_kbps + net_tx_kbps
+            network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
+            
             cpu_usages.append(cpu_total)
             memory_usages.append(mem_usage_percent)
             disk_usages.append(disk_usage)
             swap_usages.append(swap_usage_percent)
+            network_usages.append(network_usage_percent)
         
         return {
             "cpu_usage": {
@@ -6927,6 +8682,11 @@ class DatabaseManager:
                 "max": round(max(swap_usages), 2) if swap_usages else 0,
                 "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
                 "min": round(min(swap_usages), 2) if swap_usages else 0
+            },
+            "network_usage": {
+                "max": round(max(network_usages), 2) if network_usages else 0,
+                "avg": round(sum(network_usages) / len(network_usages), 2) if network_usages else 0,
+                "min": round(min(network_usages), 2) if network_usages else 0
             }
         }
 
@@ -6948,6 +8708,70 @@ class DatabaseManager:
         
         total_score = sum(status['overall_score'] for status in status_list)
         return round(total_score / len(status_list), 2)
+
+    def _calculate_five_dimension_scores(self, status_list: List[Dict]) -> Dict:
+        """
+        计算五维健康度评分
+        
+        Args:
+            status_list: 机器状态列表
+            
+        Returns:
+            五维健康度评分字典，包含CPU、内存、Swap、磁盘、网络五个维度的平均评分
+        """
+        if not status_list:
+            return {
+                "cpu_score": 0.0,
+                "memory_score": 0.0,
+                "swap_score": 0.0,
+                "disk_score": 0.0,
+                "network_score": 0.0
+            }
+        
+        # 收集每个维度的评分
+        cpu_scores = []
+        memory_scores = []
+        swap_scores = []
+        disk_scores = []
+        network_scores = []
+        
+        for status in status_list:
+            key_metrics = status.get('key_metrics', {})
+            
+            # 计算每个维度的评分（基于使用率，使用率越低评分越高）
+            cpu_usage = key_metrics.get('cpu_usage_percent', 0)
+            cpu_score = max(0, 100 - cpu_usage)
+            cpu_scores.append(cpu_score)
+            
+            memory_usage = key_metrics.get('memory_usage_percent', 0)
+            memory_score = max(0, 100 - memory_usage)
+            memory_scores.append(memory_score)
+            
+            swap_usage = key_metrics.get('swap_usage_percent', 0)
+            swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+            swap_scores.append(swap_score)
+            
+            disk_usage = key_metrics.get('disk_usage_percent', 0)
+            disk_score = max(0, 100 - disk_usage)
+            disk_scores.append(disk_score)
+            
+            network_usage = key_metrics.get('network_usage_percent', 0)
+            # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+            # 网络使用率越高得分越高，但超过80%开始扣分
+            if network_usage <= 80:
+                network_score = 100
+            else:
+                network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_scores.append(network_score)
+        
+        # 计算平均评分
+        return {
+            "cpu_score": round(sum(cpu_scores) / len(cpu_scores), 2) if cpu_scores else 0.0,
+            "memory_score": round(sum(memory_scores) / len(memory_scores), 2) if memory_scores else 0.0,
+            "swap_score": round(sum(swap_scores) / len(swap_scores), 2) if swap_scores else 0.0,
+            "disk_score": round(sum(disk_scores) / len(disk_scores), 2) if disk_scores else 0.0,
+            "network_score": round(sum(network_scores) / len(network_scores), 2) if network_scores else 0.0
+        }
 
     def _categorize_issues(self, issues: List[Dict]) -> Dict:
         """分类汇总问题"""
@@ -7041,11 +8865,21 @@ class DatabaseManager:
         swap_used = metric.get('swap_used', 0) or 0
         swap_total = metric.get('swap_total', 0) or 0
         
+        # 网络指标
+        net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+        net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+        
         # 计算关键指标
         cpu_total = cpu_usr + cpu_sys + cpu_iow
         mem_used = mem_total - mem_free - mem_buff - mem_cache
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
+        # 1000 Mbps = 125,000 KB/s
+        max_bandwidth_kbps = 125000
+        total_network_usage = net_rx_kbps + net_tx_kbps
+        network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
         # 状态评估
         status_level = "正常"
@@ -7088,6 +8922,15 @@ class DatabaseManager:
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
+        # 网络使用率检查
+        if network_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
+        elif network_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
+        
         # 数据时效性检查（超过1小时无数据视为异常）
         import time
         current_timestamp = int(time.time())
@@ -7112,17 +8955,18 @@ class DatabaseManager:
                 "memory_usage_percent": round(mem_usage_percent, 2),
                 "disk_usage_percent": round(disk_used_percent, 2),
                 "swap_usage_percent": round(swap_usage_percent, 2),
+                "network_usage_percent": round(network_usage_percent, 2),
                 "data_freshness_hours": round(time_diff_hours, 2)
             },
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -7131,18 +8975,20 @@ class DatabaseManager:
             mem_usage: 内存使用率
             disk_usage: 磁盘使用率
             swap_usage: Swap使用率
+            network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重
+        # 各项指标的权重（调整为5维评分）
         weights = {
-            'cpu': 0.25,
-            'memory': 0.25,
+            'cpu': 0.20,
+            'memory': 0.20,
             'disk': 0.20,
             'swap': 0.15,
-            'freshness': 0.15
+            'network': 0.15,
+            'freshness': 0.10
         }
         
         # 计算各项得分（0-100分）
@@ -7150,6 +8996,13 @@ class DatabaseManager:
         mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
         disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
         swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+        # 网络使用率越高得分越高，但超过80%开始扣分
+        if network_usage <= 80:
+            network_score = 100
+        else:
+            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
         
         # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
         freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
@@ -7160,6 +9013,7 @@ class DatabaseManager:
             mem_score * weights['memory'] +
             disk_score * weights['disk'] +
             swap_score * weights['swap'] +
+            network_score * weights['network'] +
             freshness_score * weights['freshness']
         )
         
@@ -7231,6 +9085,7 @@ class DatabaseManager:
             - 告警和提示信息汇总
             - 关键指标统计
             - 性能趋势分析
+            - 五维健康度评分
         """
         # 获取所有机器的状态评估
         status_list = self.get_all_machines_status(time_window_hours)
@@ -7267,6 +9122,9 @@ class DatabaseManager:
         # 6. 系统健康评分
         overall_health_score = self._calculate_system_health_score(status_list)
         
+        # 7. 五维健康度评分
+        five_dimension_scores = self._calculate_five_dimension_scores(status_list)
+        
         # 构建总体概览信息
         overview = {
             "timestamp": int(time.time()),
@@ -7278,7 +9136,8 @@ class DatabaseManager:
             "health_status": {
                 "distribution": status_distribution,
                 "overall_score": overall_health_score,
-                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0,
+                "five_dimension_scores": five_dimension_scores
             },
             "alerts_summary": {
                 "critical_issues": len(all_issues),
@@ -7303,13 +9162,15 @@ class DatabaseManager:
                 "cpu_usage": {"max": 0, "avg": 0, "min": 0},
                 "memory_usage": {"max": 0, "avg": 0, "min": 0},
                 "disk_usage": {"max": 0, "avg": 0, "min": 0},
-                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+                "swap_usage": {"max": 0, "avg": 0, "min": 0},
+                "network_usage": {"max": 0, "avg": 0, "min": 0}
             }
         
         cpu_usages = []
         memory_usages = []
         disk_usages = []
         swap_usages = []
+        network_usages = []
         
         for metric in metrics:
             # 计算各项指标
@@ -7331,10 +9192,18 @@ class DatabaseManager:
             swap_total = metric.get('swap_total', 0) or 0
             swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
             
+            # 计算网络使用率
+            net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+            net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+            max_bandwidth_kbps = 125000  # 1000 Mbps = 125,000 KB/s
+            total_network_usage = net_rx_kbps + net_tx_kbps
+            network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
+            
             cpu_usages.append(cpu_total)
             memory_usages.append(mem_usage_percent)
             disk_usages.append(disk_usage)
             swap_usages.append(swap_usage_percent)
+            network_usages.append(network_usage_percent)
         
         return {
             "cpu_usage": {
@@ -7356,6 +9225,11 @@ class DatabaseManager:
                 "max": round(max(swap_usages), 2) if swap_usages else 0,
                 "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
                 "min": round(min(swap_usages), 2) if swap_usages else 0
+            },
+            "network_usage": {
+                "max": round(max(network_usages), 2) if network_usages else 0,
+                "avg": round(sum(network_usages) / len(network_usages), 2) if network_usages else 0,
+                "min": round(min(network_usages), 2) if network_usages else 0
             }
         }
 
@@ -7377,6 +9251,70 @@ class DatabaseManager:
         
         total_score = sum(status['overall_score'] for status in status_list)
         return round(total_score / len(status_list), 2)
+
+    def _calculate_five_dimension_scores(self, status_list: List[Dict]) -> Dict:
+        """
+        计算五维健康度评分
+        
+        Args:
+            status_list: 机器状态列表
+            
+        Returns:
+            五维健康度评分字典，包含CPU、内存、Swap、磁盘、网络五个维度的平均评分
+        """
+        if not status_list:
+            return {
+                "cpu_score": 0.0,
+                "memory_score": 0.0,
+                "swap_score": 0.0,
+                "disk_score": 0.0,
+                "network_score": 0.0
+            }
+        
+        # 收集每个维度的评分
+        cpu_scores = []
+        memory_scores = []
+        swap_scores = []
+        disk_scores = []
+        network_scores = []
+        
+        for status in status_list:
+            key_metrics = status.get('key_metrics', {})
+            
+            # 计算每个维度的评分（基于使用率，使用率越低评分越高）
+            cpu_usage = key_metrics.get('cpu_usage_percent', 0)
+            cpu_score = max(0, 100 - cpu_usage)
+            cpu_scores.append(cpu_score)
+            
+            memory_usage = key_metrics.get('memory_usage_percent', 0)
+            memory_score = max(0, 100 - memory_usage)
+            memory_scores.append(memory_score)
+            
+            swap_usage = key_metrics.get('swap_usage_percent', 0)
+            swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+            swap_scores.append(swap_score)
+            
+            disk_usage = key_metrics.get('disk_usage_percent', 0)
+            disk_score = max(0, 100 - disk_usage)
+            disk_scores.append(disk_score)
+            
+            network_usage = key_metrics.get('network_usage_percent', 0)
+            # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+            # 网络使用率越高得分越高，但超过80%开始扣分
+            if network_usage <= 80:
+                network_score = 100
+            else:
+                network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_scores.append(network_score)
+        
+        # 计算平均评分
+        return {
+            "cpu_score": round(sum(cpu_scores) / len(cpu_scores), 2) if cpu_scores else 0.0,
+            "memory_score": round(sum(memory_scores) / len(memory_scores), 2) if memory_scores else 0.0,
+            "swap_score": round(sum(swap_scores) / len(swap_scores), 2) if swap_scores else 0.0,
+            "disk_score": round(sum(disk_scores) / len(disk_scores), 2) if disk_scores else 0.0,
+            "network_score": round(sum(network_scores) / len(network_scores), 2) if network_scores else 0.0
+        }
 
     def _categorize_issues(self, issues: List[Dict]) -> Dict:
         """分类汇总问题"""
@@ -7491,11 +9429,21 @@ class DatabaseManager:
         swap_used = metric.get('swap_used', 0) or 0
         swap_total = metric.get('swap_total', 0) or 0
         
+        # 网络指标
+        net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+        net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+        
         # 计算关键指标
         cpu_total = cpu_usr + cpu_sys + cpu_iow
         mem_used = mem_total - mem_free - mem_buff - mem_cache
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
+        # 1000 Mbps = 125,000 KB/s
+        max_bandwidth_kbps = 125000
+        total_network_usage = net_rx_kbps + net_tx_kbps
+        network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
         # 状态评估
         status_level = "正常"
@@ -7538,6 +9486,15 @@ class DatabaseManager:
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
+        # 网络使用率检查
+        if network_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
+        elif network_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
+        
         # 数据时效性检查（超过1小时无数据视为异常）
         import time
         current_timestamp = int(time.time())
@@ -7562,17 +9519,18 @@ class DatabaseManager:
                 "memory_usage_percent": round(mem_usage_percent, 2),
                 "disk_usage_percent": round(disk_used_percent, 2),
                 "swap_usage_percent": round(swap_usage_percent, 2),
+                "network_usage_percent": round(network_usage_percent, 2),
                 "data_freshness_hours": round(time_diff_hours, 2)
             },
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -7581,18 +9539,20 @@ class DatabaseManager:
             mem_usage: 内存使用率
             disk_usage: 磁盘使用率
             swap_usage: Swap使用率
+            network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重
+        # 各项指标的权重（调整为5维评分）
         weights = {
-            'cpu': 0.25,
-            'memory': 0.25,
+            'cpu': 0.20,
+            'memory': 0.20,
             'disk': 0.20,
             'swap': 0.15,
-            'freshness': 0.15
+            'network': 0.15,
+            'freshness': 0.10
         }
         
         # 计算各项得分（0-100分）
@@ -7600,6 +9560,13 @@ class DatabaseManager:
         mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
         disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
         swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+        # 网络使用率越高得分越高，但超过80%开始扣分
+        if network_usage <= 80:
+            network_score = 100
+        else:
+            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
         
         # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
         freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
@@ -7610,6 +9577,7 @@ class DatabaseManager:
             mem_score * weights['memory'] +
             disk_score * weights['disk'] +
             swap_score * weights['swap'] +
+            network_score * weights['network'] +
             freshness_score * weights['freshness']
         )
         
@@ -7681,6 +9649,7 @@ class DatabaseManager:
             - 告警和提示信息汇总
             - 关键指标统计
             - 性能趋势分析
+            - 五维健康度评分
         """
         # 获取所有机器的状态评估
         status_list = self.get_all_machines_status(time_window_hours)
@@ -7717,6 +9686,9 @@ class DatabaseManager:
         # 6. 系统健康评分
         overall_health_score = self._calculate_system_health_score(status_list)
         
+        # 7. 五维健康度评分
+        five_dimension_scores = self._calculate_five_dimension_scores(status_list)
+        
         # 构建总体概览信息
         overview = {
             "timestamp": int(time.time()),
@@ -7728,7 +9700,8 @@ class DatabaseManager:
             "health_status": {
                 "distribution": status_distribution,
                 "overall_score": overall_health_score,
-                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0,
+                "five_dimension_scores": five_dimension_scores
             },
             "alerts_summary": {
                 "critical_issues": len(all_issues),
@@ -7753,13 +9726,15 @@ class DatabaseManager:
                 "cpu_usage": {"max": 0, "avg": 0, "min": 0},
                 "memory_usage": {"max": 0, "avg": 0, "min": 0},
                 "disk_usage": {"max": 0, "avg": 0, "min": 0},
-                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+                "swap_usage": {"max": 0, "avg": 0, "min": 0},
+                "network_usage": {"max": 0, "avg": 0, "min": 0}
             }
         
         cpu_usages = []
         memory_usages = []
         disk_usages = []
         swap_usages = []
+        network_usages = []
         
         for metric in metrics:
             # 计算各项指标
@@ -7781,10 +9756,18 @@ class DatabaseManager:
             swap_total = metric.get('swap_total', 0) or 0
             swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
             
+            # 计算网络使用率
+            net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+            net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+            max_bandwidth_kbps = 125000  # 1000 Mbps = 125,000 KB/s
+            total_network_usage = net_rx_kbps + net_tx_kbps
+            network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
+            
             cpu_usages.append(cpu_total)
             memory_usages.append(mem_usage_percent)
             disk_usages.append(disk_usage)
             swap_usages.append(swap_usage_percent)
+            network_usages.append(network_usage_percent)
         
         return {
             "cpu_usage": {
@@ -7806,6 +9789,11 @@ class DatabaseManager:
                 "max": round(max(swap_usages), 2) if swap_usages else 0,
                 "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
                 "min": round(min(swap_usages), 2) if swap_usages else 0
+            },
+            "network_usage": {
+                "max": round(max(network_usages), 2) if network_usages else 0,
+                "avg": round(sum(network_usages) / len(network_usages), 2) if network_usages else 0,
+                "min": round(min(network_usages), 2) if network_usages else 0
             }
         }
 
@@ -7827,6 +9815,70 @@ class DatabaseManager:
         
         total_score = sum(status['overall_score'] for status in status_list)
         return round(total_score / len(status_list), 2)
+
+    def _calculate_five_dimension_scores(self, status_list: List[Dict]) -> Dict:
+        """
+        计算五维健康度评分
+        
+        Args:
+            status_list: 机器状态列表
+            
+        Returns:
+            五维健康度评分字典，包含CPU、内存、Swap、磁盘、网络五个维度的平均评分
+        """
+        if not status_list:
+            return {
+                "cpu_score": 0.0,
+                "memory_score": 0.0,
+                "swap_score": 0.0,
+                "disk_score": 0.0,
+                "network_score": 0.0
+            }
+        
+        # 收集每个维度的评分
+        cpu_scores = []
+        memory_scores = []
+        swap_scores = []
+        disk_scores = []
+        network_scores = []
+        
+        for status in status_list:
+            key_metrics = status.get('key_metrics', {})
+            
+            # 计算每个维度的评分（基于使用率，使用率越低评分越高）
+            cpu_usage = key_metrics.get('cpu_usage_percent', 0)
+            cpu_score = max(0, 100 - cpu_usage)
+            cpu_scores.append(cpu_score)
+            
+            memory_usage = key_metrics.get('memory_usage_percent', 0)
+            memory_score = max(0, 100 - memory_usage)
+            memory_scores.append(memory_score)
+            
+            swap_usage = key_metrics.get('swap_usage_percent', 0)
+            swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+            swap_scores.append(swap_score)
+            
+            disk_usage = key_metrics.get('disk_usage_percent', 0)
+            disk_score = max(0, 100 - disk_usage)
+            disk_scores.append(disk_score)
+            
+            network_usage = key_metrics.get('network_usage_percent', 0)
+            # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+            # 网络使用率越高得分越高，但超过80%开始扣分
+            if network_usage <= 80:
+                network_score = 100
+            else:
+                network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_scores.append(network_score)
+        
+        # 计算平均评分
+        return {
+            "cpu_score": round(sum(cpu_scores) / len(cpu_scores), 2) if cpu_scores else 0.0,
+            "memory_score": round(sum(memory_scores) / len(memory_scores), 2) if memory_scores else 0.0,
+            "swap_score": round(sum(swap_scores) / len(swap_scores), 2) if swap_scores else 0.0,
+            "disk_score": round(sum(disk_scores) / len(disk_scores), 2) if disk_scores else 0.0,
+            "network_score": round(sum(network_scores) / len(network_scores), 2) if network_scores else 0.0
+        }
 
     def _categorize_issues(self, issues: List[Dict]) -> Dict:
         """分类汇总问题"""
@@ -7935,11 +9987,21 @@ class DatabaseManager:
         swap_used = metric.get('swap_used', 0) or 0
         swap_total = metric.get('swap_total', 0) or 0
         
+        # 网络指标
+        net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+        net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+        
         # 计算关键指标
         cpu_total = cpu_usr + cpu_sys + cpu_iow
         mem_used = mem_total - mem_free - mem_buff - mem_cache
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
+        # 1000 Mbps = 125,000 KB/s
+        max_bandwidth_kbps = 125000
+        total_network_usage = net_rx_kbps + net_tx_kbps
+        network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
         # 状态评估
         status_level = "正常"
@@ -7982,6 +10044,15 @@ class DatabaseManager:
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
+        # 网络使用率检查
+        if network_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
+        elif network_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
+        
         # 数据时效性检查（超过1小时无数据视为异常）
         import time
         current_timestamp = int(time.time())
@@ -8006,17 +10077,18 @@ class DatabaseManager:
                 "memory_usage_percent": round(mem_usage_percent, 2),
                 "disk_usage_percent": round(disk_used_percent, 2),
                 "swap_usage_percent": round(swap_usage_percent, 2),
+                "network_usage_percent": round(network_usage_percent, 2),
                 "data_freshness_hours": round(time_diff_hours, 2)
             },
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -8025,18 +10097,20 @@ class DatabaseManager:
             mem_usage: 内存使用率
             disk_usage: 磁盘使用率
             swap_usage: Swap使用率
+            network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重
+        # 各项指标的权重（调整为5维评分）
         weights = {
-            'cpu': 0.25,
-            'memory': 0.25,
+            'cpu': 0.20,
+            'memory': 0.20,
             'disk': 0.20,
             'swap': 0.15,
-            'freshness': 0.15
+            'network': 0.15,
+            'freshness': 0.10
         }
         
         # 计算各项得分（0-100分）
@@ -8044,6 +10118,13 @@ class DatabaseManager:
         mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
         disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
         swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+        # 网络使用率越高得分越高，但超过80%开始扣分
+        if network_usage <= 80:
+            network_score = 100
+        else:
+            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
         
         # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
         freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
@@ -8054,6 +10135,7 @@ class DatabaseManager:
             mem_score * weights['memory'] +
             disk_score * weights['disk'] +
             swap_score * weights['swap'] +
+            network_score * weights['network'] +
             freshness_score * weights['freshness']
         )
         
@@ -8125,6 +10207,7 @@ class DatabaseManager:
             - 告警和提示信息汇总
             - 关键指标统计
             - 性能趋势分析
+            - 五维健康度评分
         """
         # 获取所有机器的状态评估
         status_list = self.get_all_machines_status(time_window_hours)
@@ -8161,6 +10244,9 @@ class DatabaseManager:
         # 6. 系统健康评分
         overall_health_score = self._calculate_system_health_score(status_list)
         
+        # 7. 五维健康度评分
+        five_dimension_scores = self._calculate_five_dimension_scores(status_list)
+        
         # 构建总体概览信息
         overview = {
             "timestamp": int(time.time()),
@@ -8172,7 +10258,8 @@ class DatabaseManager:
             "health_status": {
                 "distribution": status_distribution,
                 "overall_score": overall_health_score,
-                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0,
+                "five_dimension_scores": five_dimension_scores
             },
             "alerts_summary": {
                 "critical_issues": len(all_issues),
@@ -8197,13 +10284,15 @@ class DatabaseManager:
                 "cpu_usage": {"max": 0, "avg": 0, "min": 0},
                 "memory_usage": {"max": 0, "avg": 0, "min": 0},
                 "disk_usage": {"max": 0, "avg": 0, "min": 0},
-                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+                "swap_usage": {"max": 0, "avg": 0, "min": 0},
+                "network_usage": {"max": 0, "avg": 0, "min": 0}
             }
         
         cpu_usages = []
         memory_usages = []
         disk_usages = []
         swap_usages = []
+        network_usages = []
         
         for metric in metrics:
             # 计算各项指标
@@ -8225,10 +10314,18 @@ class DatabaseManager:
             swap_total = metric.get('swap_total', 0) or 0
             swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
             
+            # 计算网络使用率
+            net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+            net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+            max_bandwidth_kbps = 125000  # 1000 Mbps = 125,000 KB/s
+            total_network_usage = net_rx_kbps + net_tx_kbps
+            network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
+            
             cpu_usages.append(cpu_total)
             memory_usages.append(mem_usage_percent)
             disk_usages.append(disk_usage)
             swap_usages.append(swap_usage_percent)
+            network_usages.append(network_usage_percent)
         
         return {
             "cpu_usage": {
@@ -8250,6 +10347,11 @@ class DatabaseManager:
                 "max": round(max(swap_usages), 2) if swap_usages else 0,
                 "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
                 "min": round(min(swap_usages), 2) if swap_usages else 0
+            },
+            "network_usage": {
+                "max": round(max(network_usages), 2) if network_usages else 0,
+                "avg": round(sum(network_usages) / len(network_usages), 2) if network_usages else 0,
+                "min": round(min(network_usages), 2) if network_usages else 0
             }
         }
 
@@ -8271,6 +10373,70 @@ class DatabaseManager:
         
         total_score = sum(status['overall_score'] for status in status_list)
         return round(total_score / len(status_list), 2)
+
+    def _calculate_five_dimension_scores(self, status_list: List[Dict]) -> Dict:
+        """
+        计算五维健康度评分
+        
+        Args:
+            status_list: 机器状态列表
+            
+        Returns:
+            五维健康度评分字典，包含CPU、内存、Swap、磁盘、网络五个维度的平均评分
+        """
+        if not status_list:
+            return {
+                "cpu_score": 0.0,
+                "memory_score": 0.0,
+                "swap_score": 0.0,
+                "disk_score": 0.0,
+                "network_score": 0.0
+            }
+        
+        # 收集每个维度的评分
+        cpu_scores = []
+        memory_scores = []
+        swap_scores = []
+        disk_scores = []
+        network_scores = []
+        
+        for status in status_list:
+            key_metrics = status.get('key_metrics', {})
+            
+            # 计算每个维度的评分（基于使用率，使用率越低评分越高）
+            cpu_usage = key_metrics.get('cpu_usage_percent', 0)
+            cpu_score = max(0, 100 - cpu_usage)
+            cpu_scores.append(cpu_score)
+            
+            memory_usage = key_metrics.get('memory_usage_percent', 0)
+            memory_score = max(0, 100 - memory_usage)
+            memory_scores.append(memory_score)
+            
+            swap_usage = key_metrics.get('swap_usage_percent', 0)
+            swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+            swap_scores.append(swap_score)
+            
+            disk_usage = key_metrics.get('disk_usage_percent', 0)
+            disk_score = max(0, 100 - disk_usage)
+            disk_scores.append(disk_score)
+            
+            network_usage = key_metrics.get('network_usage_percent', 0)
+            # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+            # 网络使用率越高得分越高，但超过80%开始扣分
+            if network_usage <= 80:
+                network_score = 100
+            else:
+                network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_scores.append(network_score)
+        
+        # 计算平均评分
+        return {
+            "cpu_score": round(sum(cpu_scores) / len(cpu_scores), 2) if cpu_scores else 0.0,
+            "memory_score": round(sum(memory_scores) / len(memory_scores), 2) if memory_scores else 0.0,
+            "swap_score": round(sum(swap_scores) / len(swap_scores), 2) if swap_scores else 0.0,
+            "disk_score": round(sum(disk_scores) / len(disk_scores), 2) if disk_scores else 0.0,
+            "network_score": round(sum(network_scores) / len(network_scores), 2) if network_scores else 0.0
+        }
 
     def _categorize_issues(self, issues: List[Dict]) -> Dict:
         """分类汇总问题"""
@@ -8382,11 +10548,21 @@ class DatabaseManager:
         swap_used = metric.get('swap_used', 0) or 0
         swap_total = metric.get('swap_total', 0) or 0
         
+        # 网络指标
+        net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+        net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+        
         # 计算关键指标
         cpu_total = cpu_usr + cpu_sys + cpu_iow
         mem_used = mem_total - mem_free - mem_buff - mem_cache
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
+        # 1000 Mbps = 125,000 KB/s
+        max_bandwidth_kbps = 125000
+        total_network_usage = net_rx_kbps + net_tx_kbps
+        network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
         # 状态评估
         status_level = "正常"
@@ -8429,6 +10605,15 @@ class DatabaseManager:
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
+        # 网络使用率检查
+        if network_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
+        elif network_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
+        
         # 数据时效性检查（超过1小时无数据视为异常）
         import time
         current_timestamp = int(time.time())
@@ -8453,17 +10638,18 @@ class DatabaseManager:
                 "memory_usage_percent": round(mem_usage_percent, 2),
                 "disk_usage_percent": round(disk_used_percent, 2),
                 "swap_usage_percent": round(swap_usage_percent, 2),
+                "network_usage_percent": round(network_usage_percent, 2),
                 "data_freshness_hours": round(time_diff_hours, 2)
             },
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -8472,18 +10658,20 @@ class DatabaseManager:
             mem_usage: 内存使用率
             disk_usage: 磁盘使用率
             swap_usage: Swap使用率
+            network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重
+        # 各项指标的权重（调整为5维评分）
         weights = {
-            'cpu': 0.25,
-            'memory': 0.25,
+            'cpu': 0.20,
+            'memory': 0.20,
             'disk': 0.20,
             'swap': 0.15,
-            'freshness': 0.15
+            'network': 0.15,
+            'freshness': 0.10
         }
         
         # 计算各项得分（0-100分）
@@ -8491,6 +10679,13 @@ class DatabaseManager:
         mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
         disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
         swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+        # 网络使用率越高得分越高，但超过80%开始扣分
+        if network_usage <= 80:
+            network_score = 100
+        else:
+            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
         
         # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
         freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
@@ -8501,6 +10696,7 @@ class DatabaseManager:
             mem_score * weights['memory'] +
             disk_score * weights['disk'] +
             swap_score * weights['swap'] +
+            network_score * weights['network'] +
             freshness_score * weights['freshness']
         )
         
@@ -8572,6 +10768,7 @@ class DatabaseManager:
             - 告警和提示信息汇总
             - 关键指标统计
             - 性能趋势分析
+            - 五维健康度评分
         """
         # 获取所有机器的状态评估
         status_list = self.get_all_machines_status(time_window_hours)
@@ -8608,6 +10805,9 @@ class DatabaseManager:
         # 6. 系统健康评分
         overall_health_score = self._calculate_system_health_score(status_list)
         
+        # 7. 五维健康度评分
+        five_dimension_scores = self._calculate_five_dimension_scores(status_list)
+        
         # 构建总体概览信息
         overview = {
             "timestamp": int(time.time()),
@@ -8619,7 +10819,8 @@ class DatabaseManager:
             "health_status": {
                 "distribution": status_distribution,
                 "overall_score": overall_health_score,
-                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0,
+                "five_dimension_scores": five_dimension_scores
             },
             "alerts_summary": {
                 "critical_issues": len(all_issues),
@@ -8644,13 +10845,15 @@ class DatabaseManager:
                 "cpu_usage": {"max": 0, "avg": 0, "min": 0},
                 "memory_usage": {"max": 0, "avg": 0, "min": 0},
                 "disk_usage": {"max": 0, "avg": 0, "min": 0},
-                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+                "swap_usage": {"max": 0, "avg": 0, "min": 0},
+                "network_usage": {"max": 0, "avg": 0, "min": 0}
             }
         
         cpu_usages = []
         memory_usages = []
         disk_usages = []
         swap_usages = []
+        network_usages = []
         
         for metric in metrics:
             # 计算各项指标
@@ -8672,10 +10875,18 @@ class DatabaseManager:
             swap_total = metric.get('swap_total', 0) or 0
             swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
             
+            # 计算网络使用率
+            net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+            net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+            max_bandwidth_kbps = 125000  # 1000 Mbps = 125,000 KB/s
+            total_network_usage = net_rx_kbps + net_tx_kbps
+            network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
+            
             cpu_usages.append(cpu_total)
             memory_usages.append(mem_usage_percent)
             disk_usages.append(disk_usage)
             swap_usages.append(swap_usage_percent)
+            network_usages.append(network_usage_percent)
         
         return {
             "cpu_usage": {
@@ -8697,6 +10908,11 @@ class DatabaseManager:
                 "max": round(max(swap_usages), 2) if swap_usages else 0,
                 "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
                 "min": round(min(swap_usages), 2) if swap_usages else 0
+            },
+            "network_usage": {
+                "max": round(max(network_usages), 2) if network_usages else 0,
+                "avg": round(sum(network_usages) / len(network_usages), 2) if network_usages else 0,
+                "min": round(min(network_usages), 2) if network_usages else 0
             }
         }
 
@@ -8718,6 +10934,70 @@ class DatabaseManager:
         
         total_score = sum(status['overall_score'] for status in status_list)
         return round(total_score / len(status_list), 2)
+
+    def _calculate_five_dimension_scores(self, status_list: List[Dict]) -> Dict:
+        """
+        计算五维健康度评分
+        
+        Args:
+            status_list: 机器状态列表
+            
+        Returns:
+            五维健康度评分字典，包含CPU、内存、Swap、磁盘、网络五个维度的平均评分
+        """
+        if not status_list:
+            return {
+                "cpu_score": 0.0,
+                "memory_score": 0.0,
+                "swap_score": 0.0,
+                "disk_score": 0.0,
+                "network_score": 0.0
+            }
+        
+        # 收集每个维度的评分
+        cpu_scores = []
+        memory_scores = []
+        swap_scores = []
+        disk_scores = []
+        network_scores = []
+        
+        for status in status_list:
+            key_metrics = status.get('key_metrics', {})
+            
+            # 计算每个维度的评分（基于使用率，使用率越低评分越高）
+            cpu_usage = key_metrics.get('cpu_usage_percent', 0)
+            cpu_score = max(0, 100 - cpu_usage)
+            cpu_scores.append(cpu_score)
+            
+            memory_usage = key_metrics.get('memory_usage_percent', 0)
+            memory_score = max(0, 100 - memory_usage)
+            memory_scores.append(memory_score)
+            
+            swap_usage = key_metrics.get('swap_usage_percent', 0)
+            swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+            swap_scores.append(swap_score)
+            
+            disk_usage = key_metrics.get('disk_usage_percent', 0)
+            disk_score = max(0, 100 - disk_usage)
+            disk_scores.append(disk_score)
+            
+            network_usage = key_metrics.get('network_usage_percent', 0)
+            # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+            # 网络使用率越高得分越高，但超过80%开始扣分
+            if network_usage <= 80:
+                network_score = 100
+            else:
+                network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_scores.append(network_score)
+        
+        # 计算平均评分
+        return {
+            "cpu_score": round(sum(cpu_scores) / len(cpu_scores), 2) if cpu_scores else 0.0,
+            "memory_score": round(sum(memory_scores) / len(memory_scores), 2) if memory_scores else 0.0,
+            "swap_score": round(sum(swap_scores) / len(swap_scores), 2) if swap_scores else 0.0,
+            "disk_score": round(sum(disk_scores) / len(disk_scores), 2) if disk_scores else 0.0,
+            "network_score": round(sum(network_scores) / len(network_scores), 2) if network_scores else 0.0
+        }
 
     def _categorize_issues(self, issues: List[Dict]) -> Dict:
         """分类汇总问题"""
@@ -8847,11 +11127,21 @@ class DatabaseManager:
         swap_used = metric.get('swap_used', 0) or 0
         swap_total = metric.get('swap_total', 0) or 0
         
+        # 网络指标
+        net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+        net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+        
         # 计算关键指标
         cpu_total = cpu_usr + cpu_sys + cpu_iow
         mem_used = mem_total - mem_free - mem_buff - mem_cache
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
+        # 1000 Mbps = 125,000 KB/s
+        max_bandwidth_kbps = 125000
+        total_network_usage = net_rx_kbps + net_tx_kbps
+        network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
         # 状态评估
         status_level = "正常"
@@ -8894,6 +11184,15 @@ class DatabaseManager:
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
+        # 网络使用率检查
+        if network_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
+        elif network_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
+        
         # 数据时效性检查（超过1小时无数据视为异常）
         import time
         current_timestamp = int(time.time())
@@ -8918,17 +11217,18 @@ class DatabaseManager:
                 "memory_usage_percent": round(mem_usage_percent, 2),
                 "disk_usage_percent": round(disk_used_percent, 2),
                 "swap_usage_percent": round(swap_usage_percent, 2),
+                "network_usage_percent": round(network_usage_percent, 2),
                 "data_freshness_hours": round(time_diff_hours, 2)
             },
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -8937,18 +11237,20 @@ class DatabaseManager:
             mem_usage: 内存使用率
             disk_usage: 磁盘使用率
             swap_usage: Swap使用率
+            network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重
+        # 各项指标的权重（调整为5维评分）
         weights = {
-            'cpu': 0.25,
-            'memory': 0.25,
+            'cpu': 0.20,
+            'memory': 0.20,
             'disk': 0.20,
             'swap': 0.15,
-            'freshness': 0.15
+            'network': 0.15,
+            'freshness': 0.10
         }
         
         # 计算各项得分（0-100分）
@@ -8956,6 +11258,13 @@ class DatabaseManager:
         mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
         disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
         swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+        # 网络使用率越高得分越高，但超过80%开始扣分
+        if network_usage <= 80:
+            network_score = 100
+        else:
+            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
         
         # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
         freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
@@ -8966,6 +11275,7 @@ class DatabaseManager:
             mem_score * weights['memory'] +
             disk_score * weights['disk'] +
             swap_score * weights['swap'] +
+            network_score * weights['network'] +
             freshness_score * weights['freshness']
         )
         
@@ -9037,6 +11347,7 @@ class DatabaseManager:
             - 告警和提示信息汇总
             - 关键指标统计
             - 性能趋势分析
+            - 五维健康度评分
         """
         # 获取所有机器的状态评估
         status_list = self.get_all_machines_status(time_window_hours)
@@ -9073,6 +11384,9 @@ class DatabaseManager:
         # 6. 系统健康评分
         overall_health_score = self._calculate_system_health_score(status_list)
         
+        # 7. 五维健康度评分
+        five_dimension_scores = self._calculate_five_dimension_scores(status_list)
+        
         # 构建总体概览信息
         overview = {
             "timestamp": int(time.time()),
@@ -9084,7 +11398,8 @@ class DatabaseManager:
             "health_status": {
                 "distribution": status_distribution,
                 "overall_score": overall_health_score,
-                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0,
+                "five_dimension_scores": five_dimension_scores
             },
             "alerts_summary": {
                 "critical_issues": len(all_issues),
@@ -9109,13 +11424,15 @@ class DatabaseManager:
                 "cpu_usage": {"max": 0, "avg": 0, "min": 0},
                 "memory_usage": {"max": 0, "avg": 0, "min": 0},
                 "disk_usage": {"max": 0, "avg": 0, "min": 0},
-                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+                "swap_usage": {"max": 0, "avg": 0, "min": 0},
+                "network_usage": {"max": 0, "avg": 0, "min": 0}
             }
         
         cpu_usages = []
         memory_usages = []
         disk_usages = []
         swap_usages = []
+        network_usages = []
         
         for metric in metrics:
             # 计算各项指标
@@ -9137,10 +11454,18 @@ class DatabaseManager:
             swap_total = metric.get('swap_total', 0) or 0
             swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
             
+            # 计算网络使用率
+            net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+            net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+            max_bandwidth_kbps = 125000  # 1000 Mbps = 125,000 KB/s
+            total_network_usage = net_rx_kbps + net_tx_kbps
+            network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
+            
             cpu_usages.append(cpu_total)
             memory_usages.append(mem_usage_percent)
             disk_usages.append(disk_usage)
             swap_usages.append(swap_usage_percent)
+            network_usages.append(network_usage_percent)
         
         return {
             "cpu_usage": {
@@ -9162,6 +11487,11 @@ class DatabaseManager:
                 "max": round(max(swap_usages), 2) if swap_usages else 0,
                 "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
                 "min": round(min(swap_usages), 2) if swap_usages else 0
+            },
+            "network_usage": {
+                "max": round(max(network_usages), 2) if network_usages else 0,
+                "avg": round(sum(network_usages) / len(network_usages), 2) if network_usages else 0,
+                "min": round(min(network_usages), 2) if network_usages else 0
             }
         }
 
@@ -9183,6 +11513,70 @@ class DatabaseManager:
         
         total_score = sum(status['overall_score'] for status in status_list)
         return round(total_score / len(status_list), 2)
+
+    def _calculate_five_dimension_scores(self, status_list: List[Dict]) -> Dict:
+        """
+        计算五维健康度评分
+        
+        Args:
+            status_list: 机器状态列表
+            
+        Returns:
+            五维健康度评分字典，包含CPU、内存、Swap、磁盘、网络五个维度的平均评分
+        """
+        if not status_list:
+            return {
+                "cpu_score": 0.0,
+                "memory_score": 0.0,
+                "swap_score": 0.0,
+                "disk_score": 0.0,
+                "network_score": 0.0
+            }
+        
+        # 收集每个维度的评分
+        cpu_scores = []
+        memory_scores = []
+        swap_scores = []
+        disk_scores = []
+        network_scores = []
+        
+        for status in status_list:
+            key_metrics = status.get('key_metrics', {})
+            
+            # 计算每个维度的评分（基于使用率，使用率越低评分越高）
+            cpu_usage = key_metrics.get('cpu_usage_percent', 0)
+            cpu_score = max(0, 100 - cpu_usage)
+            cpu_scores.append(cpu_score)
+            
+            memory_usage = key_metrics.get('memory_usage_percent', 0)
+            memory_score = max(0, 100 - memory_usage)
+            memory_scores.append(memory_score)
+            
+            swap_usage = key_metrics.get('swap_usage_percent', 0)
+            swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+            swap_scores.append(swap_score)
+            
+            disk_usage = key_metrics.get('disk_usage_percent', 0)
+            disk_score = max(0, 100 - disk_usage)
+            disk_scores.append(disk_score)
+            
+            network_usage = key_metrics.get('network_usage_percent', 0)
+            # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+            # 网络使用率越高得分越高，但超过80%开始扣分
+            if network_usage <= 80:
+                network_score = 100
+            else:
+                network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_scores.append(network_score)
+        
+        # 计算平均评分
+        return {
+            "cpu_score": round(sum(cpu_scores) / len(cpu_scores), 2) if cpu_scores else 0.0,
+            "memory_score": round(sum(memory_scores) / len(memory_scores), 2) if memory_scores else 0.0,
+            "swap_score": round(sum(swap_scores) / len(swap_scores), 2) if swap_scores else 0.0,
+            "disk_score": round(sum(disk_scores) / len(disk_scores), 2) if disk_scores else 0.0,
+            "network_score": round(sum(network_scores) / len(network_scores), 2) if network_scores else 0.0
+        }
 
     def _categorize_issues(self, issues: List[Dict]) -> Dict:
         """分类汇总问题"""
@@ -9300,11 +11694,21 @@ class DatabaseManager:
         swap_used = metric.get('swap_used', 0) or 0
         swap_total = metric.get('swap_total', 0) or 0
         
+        # 网络指标
+        net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+        net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+        
         # 计算关键指标
         cpu_total = cpu_usr + cpu_sys + cpu_iow
         mem_used = mem_total - mem_free - mem_buff - mem_cache
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
+        # 1000 Mbps = 125,000 KB/s
+        max_bandwidth_kbps = 125000
+        total_network_usage = net_rx_kbps + net_tx_kbps
+        network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
         # 状态评估
         status_level = "正常"
@@ -9347,6 +11751,15 @@ class DatabaseManager:
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
+        # 网络使用率检查
+        if network_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
+        elif network_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
+        
         # 数据时效性检查（超过1小时无数据视为异常）
         import time
         current_timestamp = int(time.time())
@@ -9371,17 +11784,18 @@ class DatabaseManager:
                 "memory_usage_percent": round(mem_usage_percent, 2),
                 "disk_usage_percent": round(disk_used_percent, 2),
                 "swap_usage_percent": round(swap_usage_percent, 2),
+                "network_usage_percent": round(network_usage_percent, 2),
                 "data_freshness_hours": round(time_diff_hours, 2)
             },
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -9390,18 +11804,20 @@ class DatabaseManager:
             mem_usage: 内存使用率
             disk_usage: 磁盘使用率
             swap_usage: Swap使用率
+            network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重
+        # 各项指标的权重（调整为5维评分）
         weights = {
-            'cpu': 0.25,
-            'memory': 0.25,
+            'cpu': 0.20,
+            'memory': 0.20,
             'disk': 0.20,
             'swap': 0.15,
-            'freshness': 0.15
+            'network': 0.15,
+            'freshness': 0.10
         }
         
         # 计算各项得分（0-100分）
@@ -9409,6 +11825,13 @@ class DatabaseManager:
         mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
         disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
         swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+        # 网络使用率越高得分越高，但超过80%开始扣分
+        if network_usage <= 80:
+            network_score = 100
+        else:
+            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
         
         # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
         freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
@@ -9419,6 +11842,7 @@ class DatabaseManager:
             mem_score * weights['memory'] +
             disk_score * weights['disk'] +
             swap_score * weights['swap'] +
+            network_score * weights['network'] +
             freshness_score * weights['freshness']
         )
         
@@ -9490,6 +11914,7 @@ class DatabaseManager:
             - 告警和提示信息汇总
             - 关键指标统计
             - 性能趋势分析
+            - 五维健康度评分
         """
         # 获取所有机器的状态评估
         status_list = self.get_all_machines_status(time_window_hours)
@@ -9526,6 +11951,9 @@ class DatabaseManager:
         # 6. 系统健康评分
         overall_health_score = self._calculate_system_health_score(status_list)
         
+        # 7. 五维健康度评分
+        five_dimension_scores = self._calculate_five_dimension_scores(status_list)
+        
         # 构建总体概览信息
         overview = {
             "timestamp": int(time.time()),
@@ -9537,7 +11965,8 @@ class DatabaseManager:
             "health_status": {
                 "distribution": status_distribution,
                 "overall_score": overall_health_score,
-                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0,
+                "five_dimension_scores": five_dimension_scores
             },
             "alerts_summary": {
                 "critical_issues": len(all_issues),
@@ -9562,13 +11991,15 @@ class DatabaseManager:
                 "cpu_usage": {"max": 0, "avg": 0, "min": 0},
                 "memory_usage": {"max": 0, "avg": 0, "min": 0},
                 "disk_usage": {"max": 0, "avg": 0, "min": 0},
-                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+                "swap_usage": {"max": 0, "avg": 0, "min": 0},
+                "network_usage": {"max": 0, "avg": 0, "min": 0}
             }
         
         cpu_usages = []
         memory_usages = []
         disk_usages = []
         swap_usages = []
+        network_usages = []
         
         for metric in metrics:
             # 计算各项指标
@@ -9590,10 +12021,18 @@ class DatabaseManager:
             swap_total = metric.get('swap_total', 0) or 0
             swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
             
+            # 计算网络使用率
+            net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+            net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+            max_bandwidth_kbps = 125000  # 1000 Mbps = 125,000 KB/s
+            total_network_usage = net_rx_kbps + net_tx_kbps
+            network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
+            
             cpu_usages.append(cpu_total)
             memory_usages.append(mem_usage_percent)
             disk_usages.append(disk_usage)
             swap_usages.append(swap_usage_percent)
+            network_usages.append(network_usage_percent)
         
         return {
             "cpu_usage": {
@@ -9615,6 +12054,11 @@ class DatabaseManager:
                 "max": round(max(swap_usages), 2) if swap_usages else 0,
                 "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
                 "min": round(min(swap_usages), 2) if swap_usages else 0
+            },
+            "network_usage": {
+                "max": round(max(network_usages), 2) if network_usages else 0,
+                "avg": round(sum(network_usages) / len(network_usages), 2) if network_usages else 0,
+                "min": round(min(network_usages), 2) if network_usages else 0
             }
         }
 
@@ -9636,6 +12080,70 @@ class DatabaseManager:
         
         total_score = sum(status['overall_score'] for status in status_list)
         return round(total_score / len(status_list), 2)
+
+    def _calculate_five_dimension_scores(self, status_list: List[Dict]) -> Dict:
+        """
+        计算五维健康度评分
+        
+        Args:
+            status_list: 机器状态列表
+            
+        Returns:
+            五维健康度评分字典，包含CPU、内存、Swap、磁盘、网络五个维度的平均评分
+        """
+        if not status_list:
+            return {
+                "cpu_score": 0.0,
+                "memory_score": 0.0,
+                "swap_score": 0.0,
+                "disk_score": 0.0,
+                "network_score": 0.0
+            }
+        
+        # 收集每个维度的评分
+        cpu_scores = []
+        memory_scores = []
+        swap_scores = []
+        disk_scores = []
+        network_scores = []
+        
+        for status in status_list:
+            key_metrics = status.get('key_metrics', {})
+            
+            # 计算每个维度的评分（基于使用率，使用率越低评分越高）
+            cpu_usage = key_metrics.get('cpu_usage_percent', 0)
+            cpu_score = max(0, 100 - cpu_usage)
+            cpu_scores.append(cpu_score)
+            
+            memory_usage = key_metrics.get('memory_usage_percent', 0)
+            memory_score = max(0, 100 - memory_usage)
+            memory_scores.append(memory_score)
+            
+            swap_usage = key_metrics.get('swap_usage_percent', 0)
+            swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+            swap_scores.append(swap_score)
+            
+            disk_usage = key_metrics.get('disk_usage_percent', 0)
+            disk_score = max(0, 100 - disk_usage)
+            disk_scores.append(disk_score)
+            
+            network_usage = key_metrics.get('network_usage_percent', 0)
+            # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+            # 网络使用率越高得分越高，但超过80%开始扣分
+            if network_usage <= 80:
+                network_score = 100
+            else:
+                network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_scores.append(network_score)
+        
+        # 计算平均评分
+        return {
+            "cpu_score": round(sum(cpu_scores) / len(cpu_scores), 2) if cpu_scores else 0.0,
+            "memory_score": round(sum(memory_scores) / len(memory_scores), 2) if memory_scores else 0.0,
+            "swap_score": round(sum(swap_scores) / len(swap_scores), 2) if swap_scores else 0.0,
+            "disk_score": round(sum(disk_scores) / len(disk_scores), 2) if disk_scores else 0.0,
+            "network_score": round(sum(network_scores) / len(network_scores), 2) if network_scores else 0.0
+        }
 
     def _categorize_issues(self, issues: List[Dict]) -> Dict:
         """分类汇总问题"""
@@ -9772,11 +12280,21 @@ class DatabaseManager:
         swap_used = metric.get('swap_used', 0) or 0
         swap_total = metric.get('swap_total', 0) or 0
         
+        # 网络指标
+        net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+        net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+        
         # 计算关键指标
         cpu_total = cpu_usr + cpu_sys + cpu_iow
         mem_used = mem_total - mem_free - mem_buff - mem_cache
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
+        # 1000 Mbps = 125,000 KB/s
+        max_bandwidth_kbps = 125000
+        total_network_usage = net_rx_kbps + net_tx_kbps
+        network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
         # 状态评估
         status_level = "正常"
@@ -9819,6 +12337,15 @@ class DatabaseManager:
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
+        # 网络使用率检查
+        if network_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
+        elif network_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
+        
         # 数据时效性检查（超过1小时无数据视为异常）
         import time
         current_timestamp = int(time.time())
@@ -9843,17 +12370,18 @@ class DatabaseManager:
                 "memory_usage_percent": round(mem_usage_percent, 2),
                 "disk_usage_percent": round(disk_used_percent, 2),
                 "swap_usage_percent": round(swap_usage_percent, 2),
+                "network_usage_percent": round(network_usage_percent, 2),
                 "data_freshness_hours": round(time_diff_hours, 2)
             },
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -9862,18 +12390,20 @@ class DatabaseManager:
             mem_usage: 内存使用率
             disk_usage: 磁盘使用率
             swap_usage: Swap使用率
+            network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重
+        # 各项指标的权重（调整为5维评分）
         weights = {
-            'cpu': 0.25,
-            'memory': 0.25,
+            'cpu': 0.20,
+            'memory': 0.20,
             'disk': 0.20,
             'swap': 0.15,
-            'freshness': 0.15
+            'network': 0.15,
+            'freshness': 0.10
         }
         
         # 计算各项得分（0-100分）
@@ -9881,6 +12411,13 @@ class DatabaseManager:
         mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
         disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
         swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+        # 网络使用率越高得分越高，但超过80%开始扣分
+        if network_usage <= 80:
+            network_score = 100
+        else:
+            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
         
         # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
         freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
@@ -9891,6 +12428,7 @@ class DatabaseManager:
             mem_score * weights['memory'] +
             disk_score * weights['disk'] +
             swap_score * weights['swap'] +
+            network_score * weights['network'] +
             freshness_score * weights['freshness']
         )
         
@@ -9962,6 +12500,7 @@ class DatabaseManager:
             - 告警和提示信息汇总
             - 关键指标统计
             - 性能趋势分析
+            - 五维健康度评分
         """
         # 获取所有机器的状态评估
         status_list = self.get_all_machines_status(time_window_hours)
@@ -9998,6 +12537,9 @@ class DatabaseManager:
         # 6. 系统健康评分
         overall_health_score = self._calculate_system_health_score(status_list)
         
+        # 7. 五维健康度评分
+        five_dimension_scores = self._calculate_five_dimension_scores(status_list)
+        
         # 构建总体概览信息
         overview = {
             "timestamp": int(time.time()),
@@ -10009,7 +12551,8 @@ class DatabaseManager:
             "health_status": {
                 "distribution": status_distribution,
                 "overall_score": overall_health_score,
-                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0,
+                "five_dimension_scores": five_dimension_scores
             },
             "alerts_summary": {
                 "critical_issues": len(all_issues),
@@ -10034,13 +12577,15 @@ class DatabaseManager:
                 "cpu_usage": {"max": 0, "avg": 0, "min": 0},
                 "memory_usage": {"max": 0, "avg": 0, "min": 0},
                 "disk_usage": {"max": 0, "avg": 0, "min": 0},
-                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+                "swap_usage": {"max": 0, "avg": 0, "min": 0},
+                "network_usage": {"max": 0, "avg": 0, "min": 0}
             }
         
         cpu_usages = []
         memory_usages = []
         disk_usages = []
         swap_usages = []
+        network_usages = []
         
         for metric in metrics:
             # 计算各项指标
@@ -10062,10 +12607,18 @@ class DatabaseManager:
             swap_total = metric.get('swap_total', 0) or 0
             swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
             
+            # 计算网络使用率
+            net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+            net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+            max_bandwidth_kbps = 125000  # 1000 Mbps = 125,000 KB/s
+            total_network_usage = net_rx_kbps + net_tx_kbps
+            network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
+            
             cpu_usages.append(cpu_total)
             memory_usages.append(mem_usage_percent)
             disk_usages.append(disk_usage)
             swap_usages.append(swap_usage_percent)
+            network_usages.append(network_usage_percent)
         
         return {
             "cpu_usage": {
@@ -10087,6 +12640,11 @@ class DatabaseManager:
                 "max": round(max(swap_usages), 2) if swap_usages else 0,
                 "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
                 "min": round(min(swap_usages), 2) if swap_usages else 0
+            },
+            "network_usage": {
+                "max": round(max(network_usages), 2) if network_usages else 0,
+                "avg": round(sum(network_usages) / len(network_usages), 2) if network_usages else 0,
+                "min": round(min(network_usages), 2) if network_usages else 0
             }
         }
 
@@ -10108,6 +12666,70 @@ class DatabaseManager:
         
         total_score = sum(status['overall_score'] for status in status_list)
         return round(total_score / len(status_list), 2)
+
+    def _calculate_five_dimension_scores(self, status_list: List[Dict]) -> Dict:
+        """
+        计算五维健康度评分
+        
+        Args:
+            status_list: 机器状态列表
+            
+        Returns:
+            五维健康度评分字典，包含CPU、内存、Swap、磁盘、网络五个维度的平均评分
+        """
+        if not status_list:
+            return {
+                "cpu_score": 0.0,
+                "memory_score": 0.0,
+                "swap_score": 0.0,
+                "disk_score": 0.0,
+                "network_score": 0.0
+            }
+        
+        # 收集每个维度的评分
+        cpu_scores = []
+        memory_scores = []
+        swap_scores = []
+        disk_scores = []
+        network_scores = []
+        
+        for status in status_list:
+            key_metrics = status.get('key_metrics', {})
+            
+            # 计算每个维度的评分（基于使用率，使用率越低评分越高）
+            cpu_usage = key_metrics.get('cpu_usage_percent', 0)
+            cpu_score = max(0, 100 - cpu_usage)
+            cpu_scores.append(cpu_score)
+            
+            memory_usage = key_metrics.get('memory_usage_percent', 0)
+            memory_score = max(0, 100 - memory_usage)
+            memory_scores.append(memory_score)
+            
+            swap_usage = key_metrics.get('swap_usage_percent', 0)
+            swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+            swap_scores.append(swap_score)
+            
+            disk_usage = key_metrics.get('disk_usage_percent', 0)
+            disk_score = max(0, 100 - disk_usage)
+            disk_scores.append(disk_score)
+            
+            network_usage = key_metrics.get('network_usage_percent', 0)
+            # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+            # 网络使用率越高得分越高，但超过80%开始扣分
+            if network_usage <= 80:
+                network_score = 100
+            else:
+                network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_scores.append(network_score)
+        
+        # 计算平均评分
+        return {
+            "cpu_score": round(sum(cpu_scores) / len(cpu_scores), 2) if cpu_scores else 0.0,
+            "memory_score": round(sum(memory_scores) / len(memory_scores), 2) if memory_scores else 0.0,
+            "swap_score": round(sum(swap_scores) / len(swap_scores), 2) if swap_scores else 0.0,
+            "disk_score": round(sum(disk_scores) / len(disk_scores), 2) if disk_scores else 0.0,
+            "network_score": round(sum(network_scores) / len(network_scores), 2) if network_scores else 0.0
+        }
 
     def _categorize_issues(self, issues: List[Dict]) -> Dict:
         """分类汇总问题"""
@@ -10223,11 +12845,21 @@ class DatabaseManager:
         swap_used = metric.get('swap_used', 0) or 0
         swap_total = metric.get('swap_total', 0) or 0
         
+        # 网络指标
+        net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+        net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+        
         # 计算关键指标
         cpu_total = cpu_usr + cpu_sys + cpu_iow
         mem_used = mem_total - mem_free - mem_buff - mem_cache
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
+        # 1000 Mbps = 125,000 KB/s
+        max_bandwidth_kbps = 125000
+        total_network_usage = net_rx_kbps + net_tx_kbps
+        network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
         # 状态评估
         status_level = "正常"
@@ -10270,6 +12902,15 @@ class DatabaseManager:
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
+        # 网络使用率检查
+        if network_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
+        elif network_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
+        
         # 数据时效性检查（超过1小时无数据视为异常）
         import time
         current_timestamp = int(time.time())
@@ -10294,17 +12935,18 @@ class DatabaseManager:
                 "memory_usage_percent": round(mem_usage_percent, 2),
                 "disk_usage_percent": round(disk_used_percent, 2),
                 "swap_usage_percent": round(swap_usage_percent, 2),
+                "network_usage_percent": round(network_usage_percent, 2),
                 "data_freshness_hours": round(time_diff_hours, 2)
             },
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -10313,18 +12955,20 @@ class DatabaseManager:
             mem_usage: 内存使用率
             disk_usage: 磁盘使用率
             swap_usage: Swap使用率
+            network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重
+        # 各项指标的权重（调整为5维评分）
         weights = {
-            'cpu': 0.25,
-            'memory': 0.25,
+            'cpu': 0.20,
+            'memory': 0.20,
             'disk': 0.20,
             'swap': 0.15,
-            'freshness': 0.15
+            'network': 0.15,
+            'freshness': 0.10
         }
         
         # 计算各项得分（0-100分）
@@ -10332,6 +12976,13 @@ class DatabaseManager:
         mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
         disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
         swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+        # 网络使用率越高得分越高，但超过80%开始扣分
+        if network_usage <= 80:
+            network_score = 100
+        else:
+            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
         
         # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
         freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
@@ -10342,6 +12993,7 @@ class DatabaseManager:
             mem_score * weights['memory'] +
             disk_score * weights['disk'] +
             swap_score * weights['swap'] +
+            network_score * weights['network'] +
             freshness_score * weights['freshness']
         )
         
@@ -10413,6 +13065,7 @@ class DatabaseManager:
             - 告警和提示信息汇总
             - 关键指标统计
             - 性能趋势分析
+            - 五维健康度评分
         """
         # 获取所有机器的状态评估
         status_list = self.get_all_machines_status(time_window_hours)
@@ -10449,6 +13102,9 @@ class DatabaseManager:
         # 6. 系统健康评分
         overall_health_score = self._calculate_system_health_score(status_list)
         
+        # 7. 五维健康度评分
+        five_dimension_scores = self._calculate_five_dimension_scores(status_list)
+        
         # 构建总体概览信息
         overview = {
             "timestamp": int(time.time()),
@@ -10460,7 +13116,8 @@ class DatabaseManager:
             "health_status": {
                 "distribution": status_distribution,
                 "overall_score": overall_health_score,
-                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0,
+                "five_dimension_scores": five_dimension_scores
             },
             "alerts_summary": {
                 "critical_issues": len(all_issues),
@@ -10485,13 +13142,15 @@ class DatabaseManager:
                 "cpu_usage": {"max": 0, "avg": 0, "min": 0},
                 "memory_usage": {"max": 0, "avg": 0, "min": 0},
                 "disk_usage": {"max": 0, "avg": 0, "min": 0},
-                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+                "swap_usage": {"max": 0, "avg": 0, "min": 0},
+                "network_usage": {"max": 0, "avg": 0, "min": 0}
             }
         
         cpu_usages = []
         memory_usages = []
         disk_usages = []
         swap_usages = []
+        network_usages = []
         
         for metric in metrics:
             # 计算各项指标
@@ -10513,10 +13172,18 @@ class DatabaseManager:
             swap_total = metric.get('swap_total', 0) or 0
             swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
             
+            # 计算网络使用率
+            net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+            net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+            max_bandwidth_kbps = 125000  # 1000 Mbps = 125,000 KB/s
+            total_network_usage = net_rx_kbps + net_tx_kbps
+            network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
+            
             cpu_usages.append(cpu_total)
             memory_usages.append(mem_usage_percent)
             disk_usages.append(disk_usage)
             swap_usages.append(swap_usage_percent)
+            network_usages.append(network_usage_percent)
         
         return {
             "cpu_usage": {
@@ -10538,6 +13205,11 @@ class DatabaseManager:
                 "max": round(max(swap_usages), 2) if swap_usages else 0,
                 "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
                 "min": round(min(swap_usages), 2) if swap_usages else 0
+            },
+            "network_usage": {
+                "max": round(max(network_usages), 2) if network_usages else 0,
+                "avg": round(sum(network_usages) / len(network_usages), 2) if network_usages else 0,
+                "min": round(min(network_usages), 2) if network_usages else 0
             }
         }
 
@@ -10559,6 +13231,70 @@ class DatabaseManager:
         
         total_score = sum(status['overall_score'] for status in status_list)
         return round(total_score / len(status_list), 2)
+
+    def _calculate_five_dimension_scores(self, status_list: List[Dict]) -> Dict:
+        """
+        计算五维健康度评分
+        
+        Args:
+            status_list: 机器状态列表
+            
+        Returns:
+            五维健康度评分字典，包含CPU、内存、Swap、磁盘、网络五个维度的平均评分
+        """
+        if not status_list:
+            return {
+                "cpu_score": 0.0,
+                "memory_score": 0.0,
+                "swap_score": 0.0,
+                "disk_score": 0.0,
+                "network_score": 0.0
+            }
+        
+        # 收集每个维度的评分
+        cpu_scores = []
+        memory_scores = []
+        swap_scores = []
+        disk_scores = []
+        network_scores = []
+        
+        for status in status_list:
+            key_metrics = status.get('key_metrics', {})
+            
+            # 计算每个维度的评分（基于使用率，使用率越低评分越高）
+            cpu_usage = key_metrics.get('cpu_usage_percent', 0)
+            cpu_score = max(0, 100 - cpu_usage)
+            cpu_scores.append(cpu_score)
+            
+            memory_usage = key_metrics.get('memory_usage_percent', 0)
+            memory_score = max(0, 100 - memory_usage)
+            memory_scores.append(memory_score)
+            
+            swap_usage = key_metrics.get('swap_usage_percent', 0)
+            swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+            swap_scores.append(swap_score)
+            
+            disk_usage = key_metrics.get('disk_usage_percent', 0)
+            disk_score = max(0, 100 - disk_usage)
+            disk_scores.append(disk_score)
+            
+            network_usage = key_metrics.get('network_usage_percent', 0)
+            # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+            # 网络使用率越高得分越高，但超过80%开始扣分
+            if network_usage <= 80:
+                network_score = 100
+            else:
+                network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_scores.append(network_score)
+        
+        # 计算平均评分
+        return {
+            "cpu_score": round(sum(cpu_scores) / len(cpu_scores), 2) if cpu_scores else 0.0,
+            "memory_score": round(sum(memory_scores) / len(memory_scores), 2) if memory_scores else 0.0,
+            "swap_score": round(sum(swap_scores) / len(swap_scores), 2) if swap_scores else 0.0,
+            "disk_score": round(sum(disk_scores) / len(disk_scores), 2) if disk_scores else 0.0,
+            "network_score": round(sum(network_scores) / len(network_scores), 2) if network_scores else 0.0
+        }
 
     def _categorize_issues(self, issues: List[Dict]) -> Dict:
         """分类汇总问题"""
@@ -10688,11 +13424,21 @@ class DatabaseManager:
         swap_used = metric.get('swap_used', 0) or 0
         swap_total = metric.get('swap_total', 0) or 0
         
+        # 网络指标
+        net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+        net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+        
         # 计算关键指标
         cpu_total = cpu_usr + cpu_sys + cpu_iow
         mem_used = mem_total - mem_free - mem_buff - mem_cache
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
+        # 1000 Mbps = 125,000 KB/s
+        max_bandwidth_kbps = 125000
+        total_network_usage = net_rx_kbps + net_tx_kbps
+        network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
         # 状态评估
         status_level = "正常"
@@ -10735,6 +13481,15 @@ class DatabaseManager:
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
+        # 网络使用率检查
+        if network_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
+        elif network_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
+        
         # 数据时效性检查（超过1小时无数据视为异常）
         import time
         current_timestamp = int(time.time())
@@ -10759,17 +13514,18 @@ class DatabaseManager:
                 "memory_usage_percent": round(mem_usage_percent, 2),
                 "disk_usage_percent": round(disk_used_percent, 2),
                 "swap_usage_percent": round(swap_usage_percent, 2),
+                "network_usage_percent": round(network_usage_percent, 2),
                 "data_freshness_hours": round(time_diff_hours, 2)
             },
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -10778,18 +13534,20 @@ class DatabaseManager:
             mem_usage: 内存使用率
             disk_usage: 磁盘使用率
             swap_usage: Swap使用率
+            network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重
+        # 各项指标的权重（调整为5维评分）
         weights = {
-            'cpu': 0.25,
-            'memory': 0.25,
+            'cpu': 0.20,
+            'memory': 0.20,
             'disk': 0.20,
             'swap': 0.15,
-            'freshness': 0.15
+            'network': 0.15,
+            'freshness': 0.10
         }
         
         # 计算各项得分（0-100分）
@@ -10797,6 +13555,13 @@ class DatabaseManager:
         mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
         disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
         swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+        # 网络使用率越高得分越高，但超过80%开始扣分
+        if network_usage <= 80:
+            network_score = 100
+        else:
+            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
         
         # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
         freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
@@ -10807,6 +13572,7 @@ class DatabaseManager:
             mem_score * weights['memory'] +
             disk_score * weights['disk'] +
             swap_score * weights['swap'] +
+            network_score * weights['network'] +
             freshness_score * weights['freshness']
         )
         
@@ -10878,6 +13644,7 @@ class DatabaseManager:
             - 告警和提示信息汇总
             - 关键指标统计
             - 性能趋势分析
+            - 五维健康度评分
         """
         # 获取所有机器的状态评估
         status_list = self.get_all_machines_status(time_window_hours)
@@ -10914,6 +13681,9 @@ class DatabaseManager:
         # 6. 系统健康评分
         overall_health_score = self._calculate_system_health_score(status_list)
         
+        # 7. 五维健康度评分
+        five_dimension_scores = self._calculate_five_dimension_scores(status_list)
+        
         # 构建总体概览信息
         overview = {
             "timestamp": int(time.time()),
@@ -10925,7 +13695,8 @@ class DatabaseManager:
             "health_status": {
                 "distribution": status_distribution,
                 "overall_score": overall_health_score,
-                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0,
+                "five_dimension_scores": five_dimension_scores
             },
             "alerts_summary": {
                 "critical_issues": len(all_issues),
@@ -10950,13 +13721,15 @@ class DatabaseManager:
                 "cpu_usage": {"max": 0, "avg": 0, "min": 0},
                 "memory_usage": {"max": 0, "avg": 0, "min": 0},
                 "disk_usage": {"max": 0, "avg": 0, "min": 0},
-                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+                "swap_usage": {"max": 0, "avg": 0, "min": 0},
+                "network_usage": {"max": 0, "avg": 0, "min": 0}
             }
         
         cpu_usages = []
         memory_usages = []
         disk_usages = []
         swap_usages = []
+        network_usages = []
         
         for metric in metrics:
             # 计算各项指标
@@ -10978,10 +13751,18 @@ class DatabaseManager:
             swap_total = metric.get('swap_total', 0) or 0
             swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
             
+            # 计算网络使用率
+            net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+            net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+            max_bandwidth_kbps = 125000  # 1000 Mbps = 125,000 KB/s
+            total_network_usage = net_rx_kbps + net_tx_kbps
+            network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
+            
             cpu_usages.append(cpu_total)
             memory_usages.append(mem_usage_percent)
             disk_usages.append(disk_usage)
             swap_usages.append(swap_usage_percent)
+            network_usages.append(network_usage_percent)
         
         return {
             "cpu_usage": {
@@ -11003,6 +13784,11 @@ class DatabaseManager:
                 "max": round(max(swap_usages), 2) if swap_usages else 0,
                 "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
                 "min": round(min(swap_usages), 2) if swap_usages else 0
+            },
+            "network_usage": {
+                "max": round(max(network_usages), 2) if network_usages else 0,
+                "avg": round(sum(network_usages) / len(network_usages), 2) if network_usages else 0,
+                "min": round(min(network_usages), 2) if network_usages else 0
             }
         }
 
@@ -11024,6 +13810,70 @@ class DatabaseManager:
         
         total_score = sum(status['overall_score'] for status in status_list)
         return round(total_score / len(status_list), 2)
+
+    def _calculate_five_dimension_scores(self, status_list: List[Dict]) -> Dict:
+        """
+        计算五维健康度评分
+        
+        Args:
+            status_list: 机器状态列表
+            
+        Returns:
+            五维健康度评分字典，包含CPU、内存、Swap、磁盘、网络五个维度的平均评分
+        """
+        if not status_list:
+            return {
+                "cpu_score": 0.0,
+                "memory_score": 0.0,
+                "swap_score": 0.0,
+                "disk_score": 0.0,
+                "network_score": 0.0
+            }
+        
+        # 收集每个维度的评分
+        cpu_scores = []
+        memory_scores = []
+        swap_scores = []
+        disk_scores = []
+        network_scores = []
+        
+        for status in status_list:
+            key_metrics = status.get('key_metrics', {})
+            
+            # 计算每个维度的评分（基于使用率，使用率越低评分越高）
+            cpu_usage = key_metrics.get('cpu_usage_percent', 0)
+            cpu_score = max(0, 100 - cpu_usage)
+            cpu_scores.append(cpu_score)
+            
+            memory_usage = key_metrics.get('memory_usage_percent', 0)
+            memory_score = max(0, 100 - memory_usage)
+            memory_scores.append(memory_score)
+            
+            swap_usage = key_metrics.get('swap_usage_percent', 0)
+            swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+            swap_scores.append(swap_score)
+            
+            disk_usage = key_metrics.get('disk_usage_percent', 0)
+            disk_score = max(0, 100 - disk_usage)
+            disk_scores.append(disk_score)
+            
+            network_usage = key_metrics.get('network_usage_percent', 0)
+            # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+            # 网络使用率越高得分越高，但超过80%开始扣分
+            if network_usage <= 80:
+                network_score = 100
+            else:
+                network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_scores.append(network_score)
+        
+        # 计算平均评分
+        return {
+            "cpu_score": round(sum(cpu_scores) / len(cpu_scores), 2) if cpu_scores else 0.0,
+            "memory_score": round(sum(memory_scores) / len(memory_scores), 2) if memory_scores else 0.0,
+            "swap_score": round(sum(swap_scores) / len(swap_scores), 2) if swap_scores else 0.0,
+            "disk_score": round(sum(disk_scores) / len(disk_scores), 2) if disk_scores else 0.0,
+            "network_score": round(sum(network_scores) / len(network_scores), 2) if network_scores else 0.0
+        }
 
     def _categorize_issues(self, issues: List[Dict]) -> Dict:
         """分类汇总问题"""
@@ -11125,11 +13975,21 @@ class DatabaseManager:
         swap_used = metric.get('swap_used', 0) or 0
         swap_total = metric.get('swap_total', 0) or 0
         
+        # 网络指标
+        net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+        net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+        
         # 计算关键指标
         cpu_total = cpu_usr + cpu_sys + cpu_iow
         mem_used = mem_total - mem_free - mem_buff - mem_cache
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
+        # 1000 Mbps = 125,000 KB/s
+        max_bandwidth_kbps = 125000
+        total_network_usage = net_rx_kbps + net_tx_kbps
+        network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
         # 状态评估
         status_level = "正常"
@@ -11172,6 +14032,15 @@ class DatabaseManager:
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
+        # 网络使用率检查
+        if network_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
+        elif network_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
+        
         # 数据时效性检查（超过1小时无数据视为异常）
         import time
         current_timestamp = int(time.time())
@@ -11196,17 +14065,18 @@ class DatabaseManager:
                 "memory_usage_percent": round(mem_usage_percent, 2),
                 "disk_usage_percent": round(disk_used_percent, 2),
                 "swap_usage_percent": round(swap_usage_percent, 2),
+                "network_usage_percent": round(network_usage_percent, 2),
                 "data_freshness_hours": round(time_diff_hours, 2)
             },
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -11215,18 +14085,20 @@ class DatabaseManager:
             mem_usage: 内存使用率
             disk_usage: 磁盘使用率
             swap_usage: Swap使用率
+            network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重
+        # 各项指标的权重（调整为5维评分）
         weights = {
-            'cpu': 0.25,
-            'memory': 0.25,
+            'cpu': 0.20,
+            'memory': 0.20,
             'disk': 0.20,
             'swap': 0.15,
-            'freshness': 0.15
+            'network': 0.15,
+            'freshness': 0.10
         }
         
         # 计算各项得分（0-100分）
@@ -11234,6 +14106,13 @@ class DatabaseManager:
         mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
         disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
         swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+        # 网络使用率越高得分越高，但超过80%开始扣分
+        if network_usage <= 80:
+            network_score = 100
+        else:
+            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
         
         # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
         freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
@@ -11244,6 +14123,7 @@ class DatabaseManager:
             mem_score * weights['memory'] +
             disk_score * weights['disk'] +
             swap_score * weights['swap'] +
+            network_score * weights['network'] +
             freshness_score * weights['freshness']
         )
         
@@ -11315,6 +14195,7 @@ class DatabaseManager:
             - 告警和提示信息汇总
             - 关键指标统计
             - 性能趋势分析
+            - 五维健康度评分
         """
         # 获取所有机器的状态评估
         status_list = self.get_all_machines_status(time_window_hours)
@@ -11351,6 +14232,9 @@ class DatabaseManager:
         # 6. 系统健康评分
         overall_health_score = self._calculate_system_health_score(status_list)
         
+        # 7. 五维健康度评分
+        five_dimension_scores = self._calculate_five_dimension_scores(status_list)
+        
         # 构建总体概览信息
         overview = {
             "timestamp": int(time.time()),
@@ -11362,7 +14246,8 @@ class DatabaseManager:
             "health_status": {
                 "distribution": status_distribution,
                 "overall_score": overall_health_score,
-                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0,
+                "five_dimension_scores": five_dimension_scores
             },
             "alerts_summary": {
                 "critical_issues": len(all_issues),
@@ -11387,13 +14272,15 @@ class DatabaseManager:
                 "cpu_usage": {"max": 0, "avg": 0, "min": 0},
                 "memory_usage": {"max": 0, "avg": 0, "min": 0},
                 "disk_usage": {"max": 0, "avg": 0, "min": 0},
-                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+                "swap_usage": {"max": 0, "avg": 0, "min": 0},
+                "network_usage": {"max": 0, "avg": 0, "min": 0}
             }
         
         cpu_usages = []
         memory_usages = []
         disk_usages = []
         swap_usages = []
+        network_usages = []
         
         for metric in metrics:
             # 计算各项指标
@@ -11415,10 +14302,18 @@ class DatabaseManager:
             swap_total = metric.get('swap_total', 0) or 0
             swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
             
+            # 计算网络使用率
+            net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+            net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+            max_bandwidth_kbps = 125000  # 1000 Mbps = 125,000 KB/s
+            total_network_usage = net_rx_kbps + net_tx_kbps
+            network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
+            
             cpu_usages.append(cpu_total)
             memory_usages.append(mem_usage_percent)
             disk_usages.append(disk_usage)
             swap_usages.append(swap_usage_percent)
+            network_usages.append(network_usage_percent)
         
         return {
             "cpu_usage": {
@@ -11440,6 +14335,11 @@ class DatabaseManager:
                 "max": round(max(swap_usages), 2) if swap_usages else 0,
                 "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
                 "min": round(min(swap_usages), 2) if swap_usages else 0
+            },
+            "network_usage": {
+                "max": round(max(network_usages), 2) if network_usages else 0,
+                "avg": round(sum(network_usages) / len(network_usages), 2) if network_usages else 0,
+                "min": round(min(network_usages), 2) if network_usages else 0
             }
         }
 
@@ -11461,6 +14361,70 @@ class DatabaseManager:
         
         total_score = sum(status['overall_score'] for status in status_list)
         return round(total_score / len(status_list), 2)
+
+    def _calculate_five_dimension_scores(self, status_list: List[Dict]) -> Dict:
+        """
+        计算五维健康度评分
+        
+        Args:
+            status_list: 机器状态列表
+            
+        Returns:
+            五维健康度评分字典，包含CPU、内存、Swap、磁盘、网络五个维度的平均评分
+        """
+        if not status_list:
+            return {
+                "cpu_score": 0.0,
+                "memory_score": 0.0,
+                "swap_score": 0.0,
+                "disk_score": 0.0,
+                "network_score": 0.0
+            }
+        
+        # 收集每个维度的评分
+        cpu_scores = []
+        memory_scores = []
+        swap_scores = []
+        disk_scores = []
+        network_scores = []
+        
+        for status in status_list:
+            key_metrics = status.get('key_metrics', {})
+            
+            # 计算每个维度的评分（基于使用率，使用率越低评分越高）
+            cpu_usage = key_metrics.get('cpu_usage_percent', 0)
+            cpu_score = max(0, 100 - cpu_usage)
+            cpu_scores.append(cpu_score)
+            
+            memory_usage = key_metrics.get('memory_usage_percent', 0)
+            memory_score = max(0, 100 - memory_usage)
+            memory_scores.append(memory_score)
+            
+            swap_usage = key_metrics.get('swap_usage_percent', 0)
+            swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+            swap_scores.append(swap_score)
+            
+            disk_usage = key_metrics.get('disk_usage_percent', 0)
+            disk_score = max(0, 100 - disk_usage)
+            disk_scores.append(disk_score)
+            
+            network_usage = key_metrics.get('network_usage_percent', 0)
+            # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+            # 网络使用率越高得分越高，但超过80%开始扣分
+            if network_usage <= 80:
+                network_score = 100
+            else:
+                network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_scores.append(network_score)
+        
+        # 计算平均评分
+        return {
+            "cpu_score": round(sum(cpu_scores) / len(cpu_scores), 2) if cpu_scores else 0.0,
+            "memory_score": round(sum(memory_scores) / len(memory_scores), 2) if memory_scores else 0.0,
+            "swap_score": round(sum(swap_scores) / len(swap_scores), 2) if swap_scores else 0.0,
+            "disk_score": round(sum(disk_scores) / len(disk_scores), 2) if disk_scores else 0.0,
+            "network_score": round(sum(network_scores) / len(network_scores), 2) if network_scores else 0.0
+        }
 
     def _categorize_issues(self, issues: List[Dict]) -> Dict:
         """分类汇总问题"""
@@ -11639,11 +14603,21 @@ class DatabaseManager:
         swap_used = metric.get('swap_used', 0) or 0
         swap_total = metric.get('swap_total', 0) or 0
         
+        # 网络指标
+        net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+        net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+        
         # 计算关键指标
         cpu_total = cpu_usr + cpu_sys + cpu_iow
         mem_used = mem_total - mem_free - mem_buff - mem_cache
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
+        # 1000 Mbps = 125,000 KB/s
+        max_bandwidth_kbps = 125000
+        total_network_usage = net_rx_kbps + net_tx_kbps
+        network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
         # 状态评估
         status_level = "正常"
@@ -11686,6 +14660,15 @@ class DatabaseManager:
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
+        # 网络使用率检查
+        if network_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
+        elif network_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
+        
         # 数据时效性检查（超过1小时无数据视为异常）
         import time
         current_timestamp = int(time.time())
@@ -11710,17 +14693,18 @@ class DatabaseManager:
                 "memory_usage_percent": round(mem_usage_percent, 2),
                 "disk_usage_percent": round(disk_used_percent, 2),
                 "swap_usage_percent": round(swap_usage_percent, 2),
+                "network_usage_percent": round(network_usage_percent, 2),
                 "data_freshness_hours": round(time_diff_hours, 2)
             },
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -11729,18 +14713,20 @@ class DatabaseManager:
             mem_usage: 内存使用率
             disk_usage: 磁盘使用率
             swap_usage: Swap使用率
+            network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重
+        # 各项指标的权重（调整为5维评分）
         weights = {
-            'cpu': 0.25,
-            'memory': 0.25,
+            'cpu': 0.20,
+            'memory': 0.20,
             'disk': 0.20,
             'swap': 0.15,
-            'freshness': 0.15
+            'network': 0.15,
+            'freshness': 0.10
         }
         
         # 计算各项得分（0-100分）
@@ -11748,6 +14734,13 @@ class DatabaseManager:
         mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
         disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
         swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+        # 网络使用率越高得分越高，但超过80%开始扣分
+        if network_usage <= 80:
+            network_score = 100
+        else:
+            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
         
         # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
         freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
@@ -11758,6 +14751,7 @@ class DatabaseManager:
             mem_score * weights['memory'] +
             disk_score * weights['disk'] +
             swap_score * weights['swap'] +
+            network_score * weights['network'] +
             freshness_score * weights['freshness']
         )
         
@@ -11829,6 +14823,7 @@ class DatabaseManager:
             - 告警和提示信息汇总
             - 关键指标统计
             - 性能趋势分析
+            - 五维健康度评分
         """
         # 获取所有机器的状态评估
         status_list = self.get_all_machines_status(time_window_hours)
@@ -11865,6 +14860,9 @@ class DatabaseManager:
         # 6. 系统健康评分
         overall_health_score = self._calculate_system_health_score(status_list)
         
+        # 7. 五维健康度评分
+        five_dimension_scores = self._calculate_five_dimension_scores(status_list)
+        
         # 构建总体概览信息
         overview = {
             "timestamp": int(time.time()),
@@ -11876,7 +14874,8 @@ class DatabaseManager:
             "health_status": {
                 "distribution": status_distribution,
                 "overall_score": overall_health_score,
-                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0,
+                "five_dimension_scores": five_dimension_scores
             },
             "alerts_summary": {
                 "critical_issues": len(all_issues),
@@ -11901,13 +14900,15 @@ class DatabaseManager:
                 "cpu_usage": {"max": 0, "avg": 0, "min": 0},
                 "memory_usage": {"max": 0, "avg": 0, "min": 0},
                 "disk_usage": {"max": 0, "avg": 0, "min": 0},
-                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+                "swap_usage": {"max": 0, "avg": 0, "min": 0},
+                "network_usage": {"max": 0, "avg": 0, "min": 0}
             }
         
         cpu_usages = []
         memory_usages = []
         disk_usages = []
         swap_usages = []
+        network_usages = []
         
         for metric in metrics:
             # 计算各项指标
@@ -11929,10 +14930,18 @@ class DatabaseManager:
             swap_total = metric.get('swap_total', 0) or 0
             swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
             
+            # 计算网络使用率
+            net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+            net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+            max_bandwidth_kbps = 125000  # 1000 Mbps = 125,000 KB/s
+            total_network_usage = net_rx_kbps + net_tx_kbps
+            network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
+            
             cpu_usages.append(cpu_total)
             memory_usages.append(mem_usage_percent)
             disk_usages.append(disk_usage)
             swap_usages.append(swap_usage_percent)
+            network_usages.append(network_usage_percent)
         
         return {
             "cpu_usage": {
@@ -11954,6 +14963,11 @@ class DatabaseManager:
                 "max": round(max(swap_usages), 2) if swap_usages else 0,
                 "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
                 "min": round(min(swap_usages), 2) if swap_usages else 0
+            },
+            "network_usage": {
+                "max": round(max(network_usages), 2) if network_usages else 0,
+                "avg": round(sum(network_usages) / len(network_usages), 2) if network_usages else 0,
+                "min": round(min(network_usages), 2) if network_usages else 0
             }
         }
 
@@ -11975,6 +14989,70 @@ class DatabaseManager:
         
         total_score = sum(status['overall_score'] for status in status_list)
         return round(total_score / len(status_list), 2)
+
+    def _calculate_five_dimension_scores(self, status_list: List[Dict]) -> Dict:
+        """
+        计算五维健康度评分
+        
+        Args:
+            status_list: 机器状态列表
+            
+        Returns:
+            五维健康度评分字典，包含CPU、内存、Swap、磁盘、网络五个维度的平均评分
+        """
+        if not status_list:
+            return {
+                "cpu_score": 0.0,
+                "memory_score": 0.0,
+                "swap_score": 0.0,
+                "disk_score": 0.0,
+                "network_score": 0.0
+            }
+        
+        # 收集每个维度的评分
+        cpu_scores = []
+        memory_scores = []
+        swap_scores = []
+        disk_scores = []
+        network_scores = []
+        
+        for status in status_list:
+            key_metrics = status.get('key_metrics', {})
+            
+            # 计算每个维度的评分（基于使用率，使用率越低评分越高）
+            cpu_usage = key_metrics.get('cpu_usage_percent', 0)
+            cpu_score = max(0, 100 - cpu_usage)
+            cpu_scores.append(cpu_score)
+            
+            memory_usage = key_metrics.get('memory_usage_percent', 0)
+            memory_score = max(0, 100 - memory_usage)
+            memory_scores.append(memory_score)
+            
+            swap_usage = key_metrics.get('swap_usage_percent', 0)
+            swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+            swap_scores.append(swap_score)
+            
+            disk_usage = key_metrics.get('disk_usage_percent', 0)
+            disk_score = max(0, 100 - disk_usage)
+            disk_scores.append(disk_score)
+            
+            network_usage = key_metrics.get('network_usage_percent', 0)
+            # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+            # 网络使用率越高得分越高，但超过80%开始扣分
+            if network_usage <= 80:
+                network_score = 100
+            else:
+                network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_scores.append(network_score)
+        
+        # 计算平均评分
+        return {
+            "cpu_score": round(sum(cpu_scores) / len(cpu_scores), 2) if cpu_scores else 0.0,
+            "memory_score": round(sum(memory_scores) / len(memory_scores), 2) if memory_scores else 0.0,
+            "swap_score": round(sum(swap_scores) / len(swap_scores), 2) if swap_scores else 0.0,
+            "disk_score": round(sum(disk_scores) / len(disk_scores), 2) if disk_scores else 0.0,
+            "network_score": round(sum(network_scores) / len(network_scores), 2) if network_scores else 0.0
+        }
 
     def _categorize_issues(self, issues: List[Dict]) -> Dict:
         """分类汇总问题"""
@@ -12104,11 +15182,21 @@ class DatabaseManager:
         swap_used = metric.get('swap_used', 0) or 0
         swap_total = metric.get('swap_total', 0) or 0
         
+        # 网络指标
+        net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+        net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+        
         # 计算关键指标
         cpu_total = cpu_usr + cpu_sys + cpu_iow
         mem_used = mem_total - mem_free - mem_buff - mem_cache
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
+        # 1000 Mbps = 125,000 KB/s
+        max_bandwidth_kbps = 125000
+        total_network_usage = net_rx_kbps + net_tx_kbps
+        network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
         # 状态评估
         status_level = "正常"
@@ -12151,6 +15239,15 @@ class DatabaseManager:
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
+        # 网络使用率检查
+        if network_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
+        elif network_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
+        
         # 数据时效性检查（超过1小时无数据视为异常）
         import time
         current_timestamp = int(time.time())
@@ -12175,17 +15272,18 @@ class DatabaseManager:
                 "memory_usage_percent": round(mem_usage_percent, 2),
                 "disk_usage_percent": round(disk_used_percent, 2),
                 "swap_usage_percent": round(swap_usage_percent, 2),
+                "network_usage_percent": round(network_usage_percent, 2),
                 "data_freshness_hours": round(time_diff_hours, 2)
             },
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -12194,18 +15292,20 @@ class DatabaseManager:
             mem_usage: 内存使用率
             disk_usage: 磁盘使用率
             swap_usage: Swap使用率
+            network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重
+        # 各项指标的权重（调整为5维评分）
         weights = {
-            'cpu': 0.25,
-            'memory': 0.25,
+            'cpu': 0.20,
+            'memory': 0.20,
             'disk': 0.20,
             'swap': 0.15,
-            'freshness': 0.15
+            'network': 0.15,
+            'freshness': 0.10
         }
         
         # 计算各项得分（0-100分）
@@ -12213,6 +15313,13 @@ class DatabaseManager:
         mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
         disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
         swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+        # 网络使用率越高得分越高，但超过80%开始扣分
+        if network_usage <= 80:
+            network_score = 100
+        else:
+            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
         
         # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
         freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
@@ -12223,6 +15330,7 @@ class DatabaseManager:
             mem_score * weights['memory'] +
             disk_score * weights['disk'] +
             swap_score * weights['swap'] +
+            network_score * weights['network'] +
             freshness_score * weights['freshness']
         )
         
@@ -12294,6 +15402,7 @@ class DatabaseManager:
             - 告警和提示信息汇总
             - 关键指标统计
             - 性能趋势分析
+            - 五维健康度评分
         """
         # 获取所有机器的状态评估
         status_list = self.get_all_machines_status(time_window_hours)
@@ -12330,6 +15439,9 @@ class DatabaseManager:
         # 6. 系统健康评分
         overall_health_score = self._calculate_system_health_score(status_list)
         
+        # 7. 五维健康度评分
+        five_dimension_scores = self._calculate_five_dimension_scores(status_list)
+        
         # 构建总体概览信息
         overview = {
             "timestamp": int(time.time()),
@@ -12341,7 +15453,8 @@ class DatabaseManager:
             "health_status": {
                 "distribution": status_distribution,
                 "overall_score": overall_health_score,
-                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0,
+                "five_dimension_scores": five_dimension_scores
             },
             "alerts_summary": {
                 "critical_issues": len(all_issues),
@@ -12366,13 +15479,15 @@ class DatabaseManager:
                 "cpu_usage": {"max": 0, "avg": 0, "min": 0},
                 "memory_usage": {"max": 0, "avg": 0, "min": 0},
                 "disk_usage": {"max": 0, "avg": 0, "min": 0},
-                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+                "swap_usage": {"max": 0, "avg": 0, "min": 0},
+                "network_usage": {"max": 0, "avg": 0, "min": 0}
             }
         
         cpu_usages = []
         memory_usages = []
         disk_usages = []
         swap_usages = []
+        network_usages = []
         
         for metric in metrics:
             # 计算各项指标
@@ -12394,10 +15509,18 @@ class DatabaseManager:
             swap_total = metric.get('swap_total', 0) or 0
             swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
             
+            # 计算网络使用率
+            net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+            net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+            max_bandwidth_kbps = 125000  # 1000 Mbps = 125,000 KB/s
+            total_network_usage = net_rx_kbps + net_tx_kbps
+            network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
+            
             cpu_usages.append(cpu_total)
             memory_usages.append(mem_usage_percent)
             disk_usages.append(disk_usage)
             swap_usages.append(swap_usage_percent)
+            network_usages.append(network_usage_percent)
         
         return {
             "cpu_usage": {
@@ -12419,6 +15542,11 @@ class DatabaseManager:
                 "max": round(max(swap_usages), 2) if swap_usages else 0,
                 "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
                 "min": round(min(swap_usages), 2) if swap_usages else 0
+            },
+            "network_usage": {
+                "max": round(max(network_usages), 2) if network_usages else 0,
+                "avg": round(sum(network_usages) / len(network_usages), 2) if network_usages else 0,
+                "min": round(min(network_usages), 2) if network_usages else 0
             }
         }
 
@@ -12440,6 +15568,70 @@ class DatabaseManager:
         
         total_score = sum(status['overall_score'] for status in status_list)
         return round(total_score / len(status_list), 2)
+
+    def _calculate_five_dimension_scores(self, status_list: List[Dict]) -> Dict:
+        """
+        计算五维健康度评分
+        
+        Args:
+            status_list: 机器状态列表
+            
+        Returns:
+            五维健康度评分字典，包含CPU、内存、Swap、磁盘、网络五个维度的平均评分
+        """
+        if not status_list:
+            return {
+                "cpu_score": 0.0,
+                "memory_score": 0.0,
+                "swap_score": 0.0,
+                "disk_score": 0.0,
+                "network_score": 0.0
+            }
+        
+        # 收集每个维度的评分
+        cpu_scores = []
+        memory_scores = []
+        swap_scores = []
+        disk_scores = []
+        network_scores = []
+        
+        for status in status_list:
+            key_metrics = status.get('key_metrics', {})
+            
+            # 计算每个维度的评分（基于使用率，使用率越低评分越高）
+            cpu_usage = key_metrics.get('cpu_usage_percent', 0)
+            cpu_score = max(0, 100 - cpu_usage)
+            cpu_scores.append(cpu_score)
+            
+            memory_usage = key_metrics.get('memory_usage_percent', 0)
+            memory_score = max(0, 100 - memory_usage)
+            memory_scores.append(memory_score)
+            
+            swap_usage = key_metrics.get('swap_usage_percent', 0)
+            swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+            swap_scores.append(swap_score)
+            
+            disk_usage = key_metrics.get('disk_usage_percent', 0)
+            disk_score = max(0, 100 - disk_usage)
+            disk_scores.append(disk_score)
+            
+            network_usage = key_metrics.get('network_usage_percent', 0)
+            # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+            # 网络使用率越高得分越高，但超过80%开始扣分
+            if network_usage <= 80:
+                network_score = 100
+            else:
+                network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_scores.append(network_score)
+        
+        # 计算平均评分
+        return {
+            "cpu_score": round(sum(cpu_scores) / len(cpu_scores), 2) if cpu_scores else 0.0,
+            "memory_score": round(sum(memory_scores) / len(memory_scores), 2) if memory_scores else 0.0,
+            "swap_score": round(sum(swap_scores) / len(swap_scores), 2) if swap_scores else 0.0,
+            "disk_score": round(sum(disk_scores) / len(disk_scores), 2) if disk_scores else 0.0,
+            "network_score": round(sum(network_scores) / len(network_scores), 2) if network_scores else 0.0
+        }
 
     def _categorize_issues(self, issues: List[Dict]) -> Dict:
         """分类汇总问题"""
@@ -12557,11 +15749,21 @@ class DatabaseManager:
         swap_used = metric.get('swap_used', 0) or 0
         swap_total = metric.get('swap_total', 0) or 0
         
+        # 网络指标
+        net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+        net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+        
         # 计算关键指标
         cpu_total = cpu_usr + cpu_sys + cpu_iow
         mem_used = mem_total - mem_free - mem_buff - mem_cache
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
+        # 1000 Mbps = 125,000 KB/s
+        max_bandwidth_kbps = 125000
+        total_network_usage = net_rx_kbps + net_tx_kbps
+        network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
         # 状态评估
         status_level = "正常"
@@ -12604,6 +15806,15 @@ class DatabaseManager:
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
+        # 网络使用率检查
+        if network_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
+        elif network_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
+        
         # 数据时效性检查（超过1小时无数据视为异常）
         import time
         current_timestamp = int(time.time())
@@ -12628,17 +15839,18 @@ class DatabaseManager:
                 "memory_usage_percent": round(mem_usage_percent, 2),
                 "disk_usage_percent": round(disk_used_percent, 2),
                 "swap_usage_percent": round(swap_usage_percent, 2),
+                "network_usage_percent": round(network_usage_percent, 2),
                 "data_freshness_hours": round(time_diff_hours, 2)
             },
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -12647,18 +15859,20 @@ class DatabaseManager:
             mem_usage: 内存使用率
             disk_usage: 磁盘使用率
             swap_usage: Swap使用率
+            network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重
+        # 各项指标的权重（调整为5维评分）
         weights = {
-            'cpu': 0.25,
-            'memory': 0.25,
+            'cpu': 0.20,
+            'memory': 0.20,
             'disk': 0.20,
             'swap': 0.15,
-            'freshness': 0.15
+            'network': 0.15,
+            'freshness': 0.10
         }
         
         # 计算各项得分（0-100分）
@@ -12666,6 +15880,13 @@ class DatabaseManager:
         mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
         disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
         swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+        # 网络使用率越高得分越高，但超过80%开始扣分
+        if network_usage <= 80:
+            network_score = 100
+        else:
+            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
         
         # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
         freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
@@ -12676,6 +15897,7 @@ class DatabaseManager:
             mem_score * weights['memory'] +
             disk_score * weights['disk'] +
             swap_score * weights['swap'] +
+            network_score * weights['network'] +
             freshness_score * weights['freshness']
         )
         
@@ -12747,6 +15969,7 @@ class DatabaseManager:
             - 告警和提示信息汇总
             - 关键指标统计
             - 性能趋势分析
+            - 五维健康度评分
         """
         # 获取所有机器的状态评估
         status_list = self.get_all_machines_status(time_window_hours)
@@ -12783,6 +16006,9 @@ class DatabaseManager:
         # 6. 系统健康评分
         overall_health_score = self._calculate_system_health_score(status_list)
         
+        # 7. 五维健康度评分
+        five_dimension_scores = self._calculate_five_dimension_scores(status_list)
+        
         # 构建总体概览信息
         overview = {
             "timestamp": int(time.time()),
@@ -12794,7 +16020,8 @@ class DatabaseManager:
             "health_status": {
                 "distribution": status_distribution,
                 "overall_score": overall_health_score,
-                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0,
+                "five_dimension_scores": five_dimension_scores
             },
             "alerts_summary": {
                 "critical_issues": len(all_issues),
@@ -12819,13 +16046,15 @@ class DatabaseManager:
                 "cpu_usage": {"max": 0, "avg": 0, "min": 0},
                 "memory_usage": {"max": 0, "avg": 0, "min": 0},
                 "disk_usage": {"max": 0, "avg": 0, "min": 0},
-                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+                "swap_usage": {"max": 0, "avg": 0, "min": 0},
+                "network_usage": {"max": 0, "avg": 0, "min": 0}
             }
         
         cpu_usages = []
         memory_usages = []
         disk_usages = []
         swap_usages = []
+        network_usages = []
         
         for metric in metrics:
             # 计算各项指标
@@ -12847,10 +16076,18 @@ class DatabaseManager:
             swap_total = metric.get('swap_total', 0) or 0
             swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
             
+            # 计算网络使用率
+            net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+            net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+            max_bandwidth_kbps = 125000  # 1000 Mbps = 125,000 KB/s
+            total_network_usage = net_rx_kbps + net_tx_kbps
+            network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
+            
             cpu_usages.append(cpu_total)
             memory_usages.append(mem_usage_percent)
             disk_usages.append(disk_usage)
             swap_usages.append(swap_usage_percent)
+            network_usages.append(network_usage_percent)
         
         return {
             "cpu_usage": {
@@ -12872,6 +16109,11 @@ class DatabaseManager:
                 "max": round(max(swap_usages), 2) if swap_usages else 0,
                 "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
                 "min": round(min(swap_usages), 2) if swap_usages else 0
+            },
+            "network_usage": {
+                "max": round(max(network_usages), 2) if network_usages else 0,
+                "avg": round(sum(network_usages) / len(network_usages), 2) if network_usages else 0,
+                "min": round(min(network_usages), 2) if network_usages else 0
             }
         }
 
@@ -12893,6 +16135,70 @@ class DatabaseManager:
         
         total_score = sum(status['overall_score'] for status in status_list)
         return round(total_score / len(status_list), 2)
+
+    def _calculate_five_dimension_scores(self, status_list: List[Dict]) -> Dict:
+        """
+        计算五维健康度评分
+        
+        Args:
+            status_list: 机器状态列表
+            
+        Returns:
+            五维健康度评分字典，包含CPU、内存、Swap、磁盘、网络五个维度的平均评分
+        """
+        if not status_list:
+            return {
+                "cpu_score": 0.0,
+                "memory_score": 0.0,
+                "swap_score": 0.0,
+                "disk_score": 0.0,
+                "network_score": 0.0
+            }
+        
+        # 收集每个维度的评分
+        cpu_scores = []
+        memory_scores = []
+        swap_scores = []
+        disk_scores = []
+        network_scores = []
+        
+        for status in status_list:
+            key_metrics = status.get('key_metrics', {})
+            
+            # 计算每个维度的评分（基于使用率，使用率越低评分越高）
+            cpu_usage = key_metrics.get('cpu_usage_percent', 0)
+            cpu_score = max(0, 100 - cpu_usage)
+            cpu_scores.append(cpu_score)
+            
+            memory_usage = key_metrics.get('memory_usage_percent', 0)
+            memory_score = max(0, 100 - memory_usage)
+            memory_scores.append(memory_score)
+            
+            swap_usage = key_metrics.get('swap_usage_percent', 0)
+            swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+            swap_scores.append(swap_score)
+            
+            disk_usage = key_metrics.get('disk_usage_percent', 0)
+            disk_score = max(0, 100 - disk_usage)
+            disk_scores.append(disk_score)
+            
+            network_usage = key_metrics.get('network_usage_percent', 0)
+            # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+            # 网络使用率越高得分越高，但超过80%开始扣分
+            if network_usage <= 80:
+                network_score = 100
+            else:
+                network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_scores.append(network_score)
+        
+        # 计算平均评分
+        return {
+            "cpu_score": round(sum(cpu_scores) / len(cpu_scores), 2) if cpu_scores else 0.0,
+            "memory_score": round(sum(memory_scores) / len(memory_scores), 2) if memory_scores else 0.0,
+            "swap_score": round(sum(swap_scores) / len(swap_scores), 2) if swap_scores else 0.0,
+            "disk_score": round(sum(disk_scores) / len(disk_scores), 2) if disk_scores else 0.0,
+            "network_score": round(sum(network_scores) / len(network_scores), 2) if network_scores else 0.0
+        }
 
     def _categorize_issues(self, issues: List[Dict]) -> Dict:
         """分类汇总问题"""
@@ -13029,11 +16335,21 @@ class DatabaseManager:
         swap_used = metric.get('swap_used', 0) or 0
         swap_total = metric.get('swap_total', 0) or 0
         
+        # 网络指标
+        net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+        net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+        
         # 计算关键指标
         cpu_total = cpu_usr + cpu_sys + cpu_iow
         mem_used = mem_total - mem_free - mem_buff - mem_cache
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
+        # 1000 Mbps = 125,000 KB/s
+        max_bandwidth_kbps = 125000
+        total_network_usage = net_rx_kbps + net_tx_kbps
+        network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
         # 状态评估
         status_level = "正常"
@@ -13076,6 +16392,15 @@ class DatabaseManager:
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
+        # 网络使用率检查
+        if network_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
+        elif network_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
+        
         # 数据时效性检查（超过1小时无数据视为异常）
         import time
         current_timestamp = int(time.time())
@@ -13100,17 +16425,18 @@ class DatabaseManager:
                 "memory_usage_percent": round(mem_usage_percent, 2),
                 "disk_usage_percent": round(disk_used_percent, 2),
                 "swap_usage_percent": round(swap_usage_percent, 2),
+                "network_usage_percent": round(network_usage_percent, 2),
                 "data_freshness_hours": round(time_diff_hours, 2)
             },
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -13119,18 +16445,20 @@ class DatabaseManager:
             mem_usage: 内存使用率
             disk_usage: 磁盘使用率
             swap_usage: Swap使用率
+            network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重
+        # 各项指标的权重（调整为5维评分）
         weights = {
-            'cpu': 0.25,
-            'memory': 0.25,
+            'cpu': 0.20,
+            'memory': 0.20,
             'disk': 0.20,
             'swap': 0.15,
-            'freshness': 0.15
+            'network': 0.15,
+            'freshness': 0.10
         }
         
         # 计算各项得分（0-100分）
@@ -13138,6 +16466,13 @@ class DatabaseManager:
         mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
         disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
         swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+        # 网络使用率越高得分越高，但超过80%开始扣分
+        if network_usage <= 80:
+            network_score = 100
+        else:
+            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
         
         # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
         freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
@@ -13148,6 +16483,7 @@ class DatabaseManager:
             mem_score * weights['memory'] +
             disk_score * weights['disk'] +
             swap_score * weights['swap'] +
+            network_score * weights['network'] +
             freshness_score * weights['freshness']
         )
         
@@ -13219,6 +16555,7 @@ class DatabaseManager:
             - 告警和提示信息汇总
             - 关键指标统计
             - 性能趋势分析
+            - 五维健康度评分
         """
         # 获取所有机器的状态评估
         status_list = self.get_all_machines_status(time_window_hours)
@@ -13255,6 +16592,9 @@ class DatabaseManager:
         # 6. 系统健康评分
         overall_health_score = self._calculate_system_health_score(status_list)
         
+        # 7. 五维健康度评分
+        five_dimension_scores = self._calculate_five_dimension_scores(status_list)
+        
         # 构建总体概览信息
         overview = {
             "timestamp": int(time.time()),
@@ -13266,7 +16606,8 @@ class DatabaseManager:
             "health_status": {
                 "distribution": status_distribution,
                 "overall_score": overall_health_score,
-                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0,
+                "five_dimension_scores": five_dimension_scores
             },
             "alerts_summary": {
                 "critical_issues": len(all_issues),
@@ -13291,13 +16632,15 @@ class DatabaseManager:
                 "cpu_usage": {"max": 0, "avg": 0, "min": 0},
                 "memory_usage": {"max": 0, "avg": 0, "min": 0},
                 "disk_usage": {"max": 0, "avg": 0, "min": 0},
-                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+                "swap_usage": {"max": 0, "avg": 0, "min": 0},
+                "network_usage": {"max": 0, "avg": 0, "min": 0}
             }
         
         cpu_usages = []
         memory_usages = []
         disk_usages = []
         swap_usages = []
+        network_usages = []
         
         for metric in metrics:
             # 计算各项指标
@@ -13319,10 +16662,18 @@ class DatabaseManager:
             swap_total = metric.get('swap_total', 0) or 0
             swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
             
+            # 计算网络使用率
+            net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+            net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+            max_bandwidth_kbps = 125000  # 1000 Mbps = 125,000 KB/s
+            total_network_usage = net_rx_kbps + net_tx_kbps
+            network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
+            
             cpu_usages.append(cpu_total)
             memory_usages.append(mem_usage_percent)
             disk_usages.append(disk_usage)
             swap_usages.append(swap_usage_percent)
+            network_usages.append(network_usage_percent)
         
         return {
             "cpu_usage": {
@@ -13344,6 +16695,11 @@ class DatabaseManager:
                 "max": round(max(swap_usages), 2) if swap_usages else 0,
                 "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
                 "min": round(min(swap_usages), 2) if swap_usages else 0
+            },
+            "network_usage": {
+                "max": round(max(network_usages), 2) if network_usages else 0,
+                "avg": round(sum(network_usages) / len(network_usages), 2) if network_usages else 0,
+                "min": round(min(network_usages), 2) if network_usages else 0
             }
         }
 
@@ -13365,6 +16721,70 @@ class DatabaseManager:
         
         total_score = sum(status['overall_score'] for status in status_list)
         return round(total_score / len(status_list), 2)
+
+    def _calculate_five_dimension_scores(self, status_list: List[Dict]) -> Dict:
+        """
+        计算五维健康度评分
+        
+        Args:
+            status_list: 机器状态列表
+            
+        Returns:
+            五维健康度评分字典，包含CPU、内存、Swap、磁盘、网络五个维度的平均评分
+        """
+        if not status_list:
+            return {
+                "cpu_score": 0.0,
+                "memory_score": 0.0,
+                "swap_score": 0.0,
+                "disk_score": 0.0,
+                "network_score": 0.0
+            }
+        
+        # 收集每个维度的评分
+        cpu_scores = []
+        memory_scores = []
+        swap_scores = []
+        disk_scores = []
+        network_scores = []
+        
+        for status in status_list:
+            key_metrics = status.get('key_metrics', {})
+            
+            # 计算每个维度的评分（基于使用率，使用率越低评分越高）
+            cpu_usage = key_metrics.get('cpu_usage_percent', 0)
+            cpu_score = max(0, 100 - cpu_usage)
+            cpu_scores.append(cpu_score)
+            
+            memory_usage = key_metrics.get('memory_usage_percent', 0)
+            memory_score = max(0, 100 - memory_usage)
+            memory_scores.append(memory_score)
+            
+            swap_usage = key_metrics.get('swap_usage_percent', 0)
+            swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+            swap_scores.append(swap_score)
+            
+            disk_usage = key_metrics.get('disk_usage_percent', 0)
+            disk_score = max(0, 100 - disk_usage)
+            disk_scores.append(disk_score)
+            
+            network_usage = key_metrics.get('network_usage_percent', 0)
+            # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+            # 网络使用率越高得分越高，但超过80%开始扣分
+            if network_usage <= 80:
+                network_score = 100
+            else:
+                network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_scores.append(network_score)
+        
+        # 计算平均评分
+        return {
+            "cpu_score": round(sum(cpu_scores) / len(cpu_scores), 2) if cpu_scores else 0.0,
+            "memory_score": round(sum(memory_scores) / len(memory_scores), 2) if memory_scores else 0.0,
+            "swap_score": round(sum(swap_scores) / len(swap_scores), 2) if swap_scores else 0.0,
+            "disk_score": round(sum(disk_scores) / len(disk_scores), 2) if disk_scores else 0.0,
+            "network_score": round(sum(network_scores) / len(network_scores), 2) if network_scores else 0.0
+        }
 
     def _categorize_issues(self, issues: List[Dict]) -> Dict:
         """分类汇总问题"""
@@ -13480,11 +16900,21 @@ class DatabaseManager:
         swap_used = metric.get('swap_used', 0) or 0
         swap_total = metric.get('swap_total', 0) or 0
         
+        # 网络指标
+        net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+        net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+        
         # 计算关键指标
         cpu_total = cpu_usr + cpu_sys + cpu_iow
         mem_used = mem_total - mem_free - mem_buff - mem_cache
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
+        # 1000 Mbps = 125,000 KB/s
+        max_bandwidth_kbps = 125000
+        total_network_usage = net_rx_kbps + net_tx_kbps
+        network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
         # 状态评估
         status_level = "正常"
@@ -13527,6 +16957,15 @@ class DatabaseManager:
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
+        # 网络使用率检查
+        if network_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
+        elif network_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
+        
         # 数据时效性检查（超过1小时无数据视为异常）
         import time
         current_timestamp = int(time.time())
@@ -13551,17 +16990,18 @@ class DatabaseManager:
                 "memory_usage_percent": round(mem_usage_percent, 2),
                 "disk_usage_percent": round(disk_used_percent, 2),
                 "swap_usage_percent": round(swap_usage_percent, 2),
+                "network_usage_percent": round(network_usage_percent, 2),
                 "data_freshness_hours": round(time_diff_hours, 2)
             },
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -13570,18 +17010,20 @@ class DatabaseManager:
             mem_usage: 内存使用率
             disk_usage: 磁盘使用率
             swap_usage: Swap使用率
+            network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重
+        # 各项指标的权重（调整为5维评分）
         weights = {
-            'cpu': 0.25,
-            'memory': 0.25,
+            'cpu': 0.20,
+            'memory': 0.20,
             'disk': 0.20,
             'swap': 0.15,
-            'freshness': 0.15
+            'network': 0.15,
+            'freshness': 0.10
         }
         
         # 计算各项得分（0-100分）
@@ -13589,6 +17031,13 @@ class DatabaseManager:
         mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
         disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
         swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+        # 网络使用率越高得分越高，但超过80%开始扣分
+        if network_usage <= 80:
+            network_score = 100
+        else:
+            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
         
         # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
         freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
@@ -13599,6 +17048,7 @@ class DatabaseManager:
             mem_score * weights['memory'] +
             disk_score * weights['disk'] +
             swap_score * weights['swap'] +
+            network_score * weights['network'] +
             freshness_score * weights['freshness']
         )
         
@@ -13670,6 +17120,7 @@ class DatabaseManager:
             - 告警和提示信息汇总
             - 关键指标统计
             - 性能趋势分析
+            - 五维健康度评分
         """
         # 获取所有机器的状态评估
         status_list = self.get_all_machines_status(time_window_hours)
@@ -13706,6 +17157,9 @@ class DatabaseManager:
         # 6. 系统健康评分
         overall_health_score = self._calculate_system_health_score(status_list)
         
+        # 7. 五维健康度评分
+        five_dimension_scores = self._calculate_five_dimension_scores(status_list)
+        
         # 构建总体概览信息
         overview = {
             "timestamp": int(time.time()),
@@ -13717,7 +17171,8 @@ class DatabaseManager:
             "health_status": {
                 "distribution": status_distribution,
                 "overall_score": overall_health_score,
-                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0,
+                "five_dimension_scores": five_dimension_scores
             },
             "alerts_summary": {
                 "critical_issues": len(all_issues),
@@ -13742,13 +17197,15 @@ class DatabaseManager:
                 "cpu_usage": {"max": 0, "avg": 0, "min": 0},
                 "memory_usage": {"max": 0, "avg": 0, "min": 0},
                 "disk_usage": {"max": 0, "avg": 0, "min": 0},
-                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+                "swap_usage": {"max": 0, "avg": 0, "min": 0},
+                "network_usage": {"max": 0, "avg": 0, "min": 0}
             }
         
         cpu_usages = []
         memory_usages = []
         disk_usages = []
         swap_usages = []
+        network_usages = []
         
         for metric in metrics:
             # 计算各项指标
@@ -13770,10 +17227,18 @@ class DatabaseManager:
             swap_total = metric.get('swap_total', 0) or 0
             swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
             
+            # 计算网络使用率
+            net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+            net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+            max_bandwidth_kbps = 125000  # 1000 Mbps = 125,000 KB/s
+            total_network_usage = net_rx_kbps + net_tx_kbps
+            network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
+            
             cpu_usages.append(cpu_total)
             memory_usages.append(mem_usage_percent)
             disk_usages.append(disk_usage)
             swap_usages.append(swap_usage_percent)
+            network_usages.append(network_usage_percent)
         
         return {
             "cpu_usage": {
@@ -13795,6 +17260,11 @@ class DatabaseManager:
                 "max": round(max(swap_usages), 2) if swap_usages else 0,
                 "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
                 "min": round(min(swap_usages), 2) if swap_usages else 0
+            },
+            "network_usage": {
+                "max": round(max(network_usages), 2) if network_usages else 0,
+                "avg": round(sum(network_usages) / len(network_usages), 2) if network_usages else 0,
+                "min": round(min(network_usages), 2) if network_usages else 0
             }
         }
 
@@ -13816,6 +17286,70 @@ class DatabaseManager:
         
         total_score = sum(status['overall_score'] for status in status_list)
         return round(total_score / len(status_list), 2)
+
+    def _calculate_five_dimension_scores(self, status_list: List[Dict]) -> Dict:
+        """
+        计算五维健康度评分
+        
+        Args:
+            status_list: 机器状态列表
+            
+        Returns:
+            五维健康度评分字典，包含CPU、内存、Swap、磁盘、网络五个维度的平均评分
+        """
+        if not status_list:
+            return {
+                "cpu_score": 0.0,
+                "memory_score": 0.0,
+                "swap_score": 0.0,
+                "disk_score": 0.0,
+                "network_score": 0.0
+            }
+        
+        # 收集每个维度的评分
+        cpu_scores = []
+        memory_scores = []
+        swap_scores = []
+        disk_scores = []
+        network_scores = []
+        
+        for status in status_list:
+            key_metrics = status.get('key_metrics', {})
+            
+            # 计算每个维度的评分（基于使用率，使用率越低评分越高）
+            cpu_usage = key_metrics.get('cpu_usage_percent', 0)
+            cpu_score = max(0, 100 - cpu_usage)
+            cpu_scores.append(cpu_score)
+            
+            memory_usage = key_metrics.get('memory_usage_percent', 0)
+            memory_score = max(0, 100 - memory_usage)
+            memory_scores.append(memory_score)
+            
+            swap_usage = key_metrics.get('swap_usage_percent', 0)
+            swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+            swap_scores.append(swap_score)
+            
+            disk_usage = key_metrics.get('disk_usage_percent', 0)
+            disk_score = max(0, 100 - disk_usage)
+            disk_scores.append(disk_score)
+            
+            network_usage = key_metrics.get('network_usage_percent', 0)
+            # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+            # 网络使用率越高得分越高，但超过80%开始扣分
+            if network_usage <= 80:
+                network_score = 100
+            else:
+                network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_scores.append(network_score)
+        
+        # 计算平均评分
+        return {
+            "cpu_score": round(sum(cpu_scores) / len(cpu_scores), 2) if cpu_scores else 0.0,
+            "memory_score": round(sum(memory_scores) / len(memory_scores), 2) if memory_scores else 0.0,
+            "swap_score": round(sum(swap_scores) / len(swap_scores), 2) if swap_scores else 0.0,
+            "disk_score": round(sum(disk_scores) / len(disk_scores), 2) if disk_scores else 0.0,
+            "network_score": round(sum(network_scores) / len(network_scores), 2) if network_scores else 0.0
+        }
 
     def _categorize_issues(self, issues: List[Dict]) -> Dict:
         """分类汇总问题"""
@@ -13945,11 +17479,21 @@ class DatabaseManager:
         swap_used = metric.get('swap_used', 0) or 0
         swap_total = metric.get('swap_total', 0) or 0
         
+        # 网络指标
+        net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+        net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+        
         # 计算关键指标
         cpu_total = cpu_usr + cpu_sys + cpu_iow
         mem_used = mem_total - mem_free - mem_buff - mem_cache
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
+        # 1000 Mbps = 125,000 KB/s
+        max_bandwidth_kbps = 125000
+        total_network_usage = net_rx_kbps + net_tx_kbps
+        network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
         # 状态评估
         status_level = "正常"
@@ -13992,6 +17536,15 @@ class DatabaseManager:
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
+        # 网络使用率检查
+        if network_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
+        elif network_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
+        
         # 数据时效性检查（超过1小时无数据视为异常）
         import time
         current_timestamp = int(time.time())
@@ -14016,17 +17569,18 @@ class DatabaseManager:
                 "memory_usage_percent": round(mem_usage_percent, 2),
                 "disk_usage_percent": round(disk_used_percent, 2),
                 "swap_usage_percent": round(swap_usage_percent, 2),
+                "network_usage_percent": round(network_usage_percent, 2),
                 "data_freshness_hours": round(time_diff_hours, 2)
             },
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -14035,18 +17589,20 @@ class DatabaseManager:
             mem_usage: 内存使用率
             disk_usage: 磁盘使用率
             swap_usage: Swap使用率
+            network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重
+        # 各项指标的权重（调整为5维评分）
         weights = {
-            'cpu': 0.25,
-            'memory': 0.25,
+            'cpu': 0.20,
+            'memory': 0.20,
             'disk': 0.20,
             'swap': 0.15,
-            'freshness': 0.15
+            'network': 0.15,
+            'freshness': 0.10
         }
         
         # 计算各项得分（0-100分）
@@ -14054,6 +17610,13 @@ class DatabaseManager:
         mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
         disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
         swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+        # 网络使用率越高得分越高，但超过80%开始扣分
+        if network_usage <= 80:
+            network_score = 100
+        else:
+            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
         
         # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
         freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
@@ -14064,6 +17627,7 @@ class DatabaseManager:
             mem_score * weights['memory'] +
             disk_score * weights['disk'] +
             swap_score * weights['swap'] +
+            network_score * weights['network'] +
             freshness_score * weights['freshness']
         )
         
@@ -14135,6 +17699,7 @@ class DatabaseManager:
             - 告警和提示信息汇总
             - 关键指标统计
             - 性能趋势分析
+            - 五维健康度评分
         """
         # 获取所有机器的状态评估
         status_list = self.get_all_machines_status(time_window_hours)
@@ -14171,6 +17736,9 @@ class DatabaseManager:
         # 6. 系统健康评分
         overall_health_score = self._calculate_system_health_score(status_list)
         
+        # 7. 五维健康度评分
+        five_dimension_scores = self._calculate_five_dimension_scores(status_list)
+        
         # 构建总体概览信息
         overview = {
             "timestamp": int(time.time()),
@@ -14182,7 +17750,8 @@ class DatabaseManager:
             "health_status": {
                 "distribution": status_distribution,
                 "overall_score": overall_health_score,
-                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0,
+                "five_dimension_scores": five_dimension_scores
             },
             "alerts_summary": {
                 "critical_issues": len(all_issues),
@@ -14207,13 +17776,15 @@ class DatabaseManager:
                 "cpu_usage": {"max": 0, "avg": 0, "min": 0},
                 "memory_usage": {"max": 0, "avg": 0, "min": 0},
                 "disk_usage": {"max": 0, "avg": 0, "min": 0},
-                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+                "swap_usage": {"max": 0, "avg": 0, "min": 0},
+                "network_usage": {"max": 0, "avg": 0, "min": 0}
             }
         
         cpu_usages = []
         memory_usages = []
         disk_usages = []
         swap_usages = []
+        network_usages = []
         
         for metric in metrics:
             # 计算各项指标
@@ -14235,10 +17806,18 @@ class DatabaseManager:
             swap_total = metric.get('swap_total', 0) or 0
             swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
             
+            # 计算网络使用率
+            net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+            net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+            max_bandwidth_kbps = 125000  # 1000 Mbps = 125,000 KB/s
+            total_network_usage = net_rx_kbps + net_tx_kbps
+            network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
+            
             cpu_usages.append(cpu_total)
             memory_usages.append(mem_usage_percent)
             disk_usages.append(disk_usage)
             swap_usages.append(swap_usage_percent)
+            network_usages.append(network_usage_percent)
         
         return {
             "cpu_usage": {
@@ -14260,6 +17839,11 @@ class DatabaseManager:
                 "max": round(max(swap_usages), 2) if swap_usages else 0,
                 "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
                 "min": round(min(swap_usages), 2) if swap_usages else 0
+            },
+            "network_usage": {
+                "max": round(max(network_usages), 2) if network_usages else 0,
+                "avg": round(sum(network_usages) / len(network_usages), 2) if network_usages else 0,
+                "min": round(min(network_usages), 2) if network_usages else 0
             }
         }
 
@@ -14281,6 +17865,70 @@ class DatabaseManager:
         
         total_score = sum(status['overall_score'] for status in status_list)
         return round(total_score / len(status_list), 2)
+
+    def _calculate_five_dimension_scores(self, status_list: List[Dict]) -> Dict:
+        """
+        计算五维健康度评分
+        
+        Args:
+            status_list: 机器状态列表
+            
+        Returns:
+            五维健康度评分字典，包含CPU、内存、Swap、磁盘、网络五个维度的平均评分
+        """
+        if not status_list:
+            return {
+                "cpu_score": 0.0,
+                "memory_score": 0.0,
+                "swap_score": 0.0,
+                "disk_score": 0.0,
+                "network_score": 0.0
+            }
+        
+        # 收集每个维度的评分
+        cpu_scores = []
+        memory_scores = []
+        swap_scores = []
+        disk_scores = []
+        network_scores = []
+        
+        for status in status_list:
+            key_metrics = status.get('key_metrics', {})
+            
+            # 计算每个维度的评分（基于使用率，使用率越低评分越高）
+            cpu_usage = key_metrics.get('cpu_usage_percent', 0)
+            cpu_score = max(0, 100 - cpu_usage)
+            cpu_scores.append(cpu_score)
+            
+            memory_usage = key_metrics.get('memory_usage_percent', 0)
+            memory_score = max(0, 100 - memory_usage)
+            memory_scores.append(memory_score)
+            
+            swap_usage = key_metrics.get('swap_usage_percent', 0)
+            swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+            swap_scores.append(swap_score)
+            
+            disk_usage = key_metrics.get('disk_usage_percent', 0)
+            disk_score = max(0, 100 - disk_usage)
+            disk_scores.append(disk_score)
+            
+            network_usage = key_metrics.get('network_usage_percent', 0)
+            # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+            # 网络使用率越高得分越高，但超过80%开始扣分
+            if network_usage <= 80:
+                network_score = 100
+            else:
+                network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_scores.append(network_score)
+        
+        # 计算平均评分
+        return {
+            "cpu_score": round(sum(cpu_scores) / len(cpu_scores), 2) if cpu_scores else 0.0,
+            "memory_score": round(sum(memory_scores) / len(memory_scores), 2) if memory_scores else 0.0,
+            "swap_score": round(sum(swap_scores) / len(swap_scores), 2) if swap_scores else 0.0,
+            "disk_score": round(sum(disk_scores) / len(disk_scores), 2) if disk_scores else 0.0,
+            "network_score": round(sum(network_scores) / len(network_scores), 2) if network_scores else 0.0
+        }
 
     def _categorize_issues(self, issues: List[Dict]) -> Dict:
         """分类汇总问题"""
@@ -14382,11 +18030,21 @@ class DatabaseManager:
         swap_used = metric.get('swap_used', 0) or 0
         swap_total = metric.get('swap_total', 0) or 0
         
+        # 网络指标
+        net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+        net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+        
         # 计算关键指标
         cpu_total = cpu_usr + cpu_sys + cpu_iow
         mem_used = mem_total - mem_free - mem_buff - mem_cache
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
+        
+        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
+        # 1000 Mbps = 125,000 KB/s
+        max_bandwidth_kbps = 125000
+        total_network_usage = net_rx_kbps + net_tx_kbps
+        network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
         # 状态评估
         status_level = "正常"
@@ -14429,6 +18087,15 @@ class DatabaseManager:
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
+        # 网络使用率检查
+        if network_usage_percent >= 90:
+            status_level = "警告"
+            issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
+        elif network_usage_percent >= 70:
+            if status_level != "警告":
+                status_level = "提示"
+            warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
+        
         # 数据时效性检查（超过1小时无数据视为异常）
         import time
         current_timestamp = int(time.time())
@@ -14453,17 +18120,18 @@ class DatabaseManager:
                 "memory_usage_percent": round(mem_usage_percent, 2),
                 "disk_usage_percent": round(disk_used_percent, 2),
                 "swap_usage_percent": round(swap_usage_percent, 2),
+                "network_usage_percent": round(network_usage_percent, 2),
                 "data_freshness_hours": round(time_diff_hours, 2)
             },
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -14472,18 +18140,20 @@ class DatabaseManager:
             mem_usage: 内存使用率
             disk_usage: 磁盘使用率
             swap_usage: Swap使用率
+            network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重
+        # 各项指标的权重（调整为5维评分）
         weights = {
-            'cpu': 0.25,
-            'memory': 0.25,
+            'cpu': 0.20,
+            'memory': 0.20,
             'disk': 0.20,
             'swap': 0.15,
-            'freshness': 0.15
+            'network': 0.15,
+            'freshness': 0.10
         }
         
         # 计算各项得分（0-100分）
@@ -14491,6 +18161,13 @@ class DatabaseManager:
         mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
         disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
         swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        
+        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+        # 网络使用率越高得分越高，但超过80%开始扣分
+        if network_usage <= 80:
+            network_score = 100
+        else:
+            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
         
         # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
         freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
@@ -14501,6 +18178,7 @@ class DatabaseManager:
             mem_score * weights['memory'] +
             disk_score * weights['disk'] +
             swap_score * weights['swap'] +
+            network_score * weights['network'] +
             freshness_score * weights['freshness']
         )
         
@@ -14572,6 +18250,7 @@ class DatabaseManager:
             - 告警和提示信息汇总
             - 关键指标统计
             - 性能趋势分析
+            - 五维健康度评分
         """
         # 获取所有机器的状态评估
         status_list = self.get_all_machines_status(time_window_hours)
@@ -14608,6 +18287,9 @@ class DatabaseManager:
         # 6. 系统健康评分
         overall_health_score = self._calculate_system_health_score(status_list)
         
+        # 7. 五维健康度评分
+        five_dimension_scores = self._calculate_five_dimension_scores(status_list)
+        
         # 构建总体概览信息
         overview = {
             "timestamp": int(time.time()),
@@ -14619,7 +18301,8 @@ class DatabaseManager:
             "health_status": {
                 "distribution": status_distribution,
                 "overall_score": overall_health_score,
-                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0
+                "health_percentage": round((status_distribution["正常"] / active_machines * 100), 2) if active_machines > 0 else 0,
+                "five_dimension_scores": five_dimension_scores
             },
             "alerts_summary": {
                 "critical_issues": len(all_issues),
@@ -14644,13 +18327,15 @@ class DatabaseManager:
                 "cpu_usage": {"max": 0, "avg": 0, "min": 0},
                 "memory_usage": {"max": 0, "avg": 0, "min": 0},
                 "disk_usage": {"max": 0, "avg": 0, "min": 0},
-                "swap_usage": {"max": 0, "avg": 0, "min": 0}
+                "swap_usage": {"max": 0, "avg": 0, "min": 0},
+                "network_usage": {"max": 0, "avg": 0, "min": 0}
             }
         
         cpu_usages = []
         memory_usages = []
         disk_usages = []
         swap_usages = []
+        network_usages = []
         
         for metric in metrics:
             # 计算各项指标
@@ -14672,10 +18357,18 @@ class DatabaseManager:
             swap_total = metric.get('swap_total', 0) or 0
             swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
             
+            # 计算网络使用率
+            net_rx_kbps = metric.get('net_rx_kbps', 0) or 0
+            net_tx_kbps = metric.get('net_tx_kbps', 0) or 0
+            max_bandwidth_kbps = 125000  # 1000 Mbps = 125,000 KB/s
+            total_network_usage = net_rx_kbps + net_tx_kbps
+            network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
+            
             cpu_usages.append(cpu_total)
             memory_usages.append(mem_usage_percent)
             disk_usages.append(disk_usage)
             swap_usages.append(swap_usage_percent)
+            network_usages.append(network_usage_percent)
         
         return {
             "cpu_usage": {
@@ -14697,6 +18390,11 @@ class DatabaseManager:
                 "max": round(max(swap_usages), 2) if swap_usages else 0,
                 "avg": round(sum(swap_usages) / len(swap_usages), 2) if swap_usages else 0,
                 "min": round(min(swap_usages), 2) if swap_usages else 0
+            },
+            "network_usage": {
+                "max": round(max(network_usages), 2) if network_usages else 0,
+                "avg": round(sum(network_usages) / len(network_usages), 2) if network_usages else 0,
+                "min": round(min(network_usages), 2) if network_usages else 0
             }
         }
 
@@ -14718,6 +18416,70 @@ class DatabaseManager:
         
         total_score = sum(status['overall_score'] for status in status_list)
         return round(total_score / len(status_list), 2)
+
+    def _calculate_five_dimension_scores(self, status_list: List[Dict]) -> Dict:
+        """
+        计算五维健康度评分
+        
+        Args:
+            status_list: 机器状态列表
+            
+        Returns:
+            五维健康度评分字典，包含CPU、内存、Swap、磁盘、网络五个维度的平均评分
+        """
+        if not status_list:
+            return {
+                "cpu_score": 0.0,
+                "memory_score": 0.0,
+                "swap_score": 0.0,
+                "disk_score": 0.0,
+                "network_score": 0.0
+            }
+        
+        # 收集每个维度的评分
+        cpu_scores = []
+        memory_scores = []
+        swap_scores = []
+        disk_scores = []
+        network_scores = []
+        
+        for status in status_list:
+            key_metrics = status.get('key_metrics', {})
+            
+            # 计算每个维度的评分（基于使用率，使用率越低评分越高）
+            cpu_usage = key_metrics.get('cpu_usage_percent', 0)
+            cpu_score = max(0, 100 - cpu_usage)
+            cpu_scores.append(cpu_score)
+            
+            memory_usage = key_metrics.get('memory_usage_percent', 0)
+            memory_score = max(0, 100 - memory_usage)
+            memory_scores.append(memory_score)
+            
+            swap_usage = key_metrics.get('swap_usage_percent', 0)
+            swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+            swap_scores.append(swap_score)
+            
+            disk_usage = key_metrics.get('disk_usage_percent', 0)
+            disk_score = max(0, 100 - disk_usage)
+            disk_scores.append(disk_score)
+            
+            network_usage = key_metrics.get('network_usage_percent', 0)
+            # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
+            # 网络使用率越高得分越高，但超过80%开始扣分
+            if network_usage <= 80:
+                network_score = 100
+            else:
+                network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_scores.append(network_score)
+        
+        # 计算平均评分
+        return {
+            "cpu_score": round(sum(cpu_scores) / len(cpu_scores), 2) if cpu_scores else 0.0,
+            "memory_score": round(sum(memory_scores) / len(memory_scores), 2) if memory_scores else 0.0,
+            "swap_score": round(sum(swap_scores) / len(swap_scores), 2) if swap_scores else 0.0,
+            "disk_score": round(sum(disk_scores) / len(disk_scores), 2) if disk_scores else 0.0,
+            "network_score": round(sum(network_scores) / len(network_scores), 2) if network_scores else 0.0
+        }
 
     def _categorize_issues(self, issues: List[Dict]) -> Dict:
         """分类汇总问题"""
