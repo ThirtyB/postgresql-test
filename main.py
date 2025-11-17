@@ -1062,3 +1062,146 @@ async def get_all_users(
             code=ErrorCode.DATABASE_ERROR,
             message=f"获取用户列表失败: {str(e)}"
         )
+
+
+# 健康度配置管理API（不需要管理员权限，所有认证用户都可以访问）
+class HealthConfigUpdate(BaseModel):
+    config_key: str
+    config_value: float
+
+
+@app.get("/health/config", response_model=SuccessResponse)
+async def get_health_config(current_user: UserResponse = Depends(allow_all)):
+    """
+    获取健康度配置（所有认证用户可用）
+    
+    Args:
+        current_user: 当前认证用户
+        
+    Returns:
+        健康度配置信息
+    """
+    try:
+        config = db_manager.get_health_config()
+        return SuccessResponse(
+            data=config,
+            message="成功获取健康度配置"
+        )
+        
+    except Exception as e:
+        return ErrorResponse(
+            code=ErrorCode.DATABASE_ERROR,
+            message=f"获取健康度配置失败: {str(e)}"
+        )
+
+
+@app.put("/health/config", response_model=SuccessResponse)
+async def update_health_config(
+    config_update: HealthConfigUpdate,
+    current_user: UserResponse = Depends(allow_all)
+):
+    """
+    更新健康度配置（所有认证用户可用）
+    
+    Args:
+        config_update: 配置更新信息
+        current_user: 当前认证用户
+        
+    Returns:
+        更新结果
+    """
+    try:
+        # 验证配置键是否有效
+        valid_keys = [
+            'cpu_warning_threshold', 'cpu_alert_threshold',
+            'memory_warning_threshold', 'memory_alert_threshold',
+            'disk_warning_threshold', 'disk_alert_threshold',
+            'swap_warning_threshold', 'swap_alert_threshold',
+            'network_warning_threshold', 'network_alert_threshold',
+            'data_freshness_warning_hours', 'data_freshness_alert_hours',
+            'cpu_weight', 'memory_weight', 'disk_weight', 'swap_weight',
+            'network_weight', 'freshness_weight',
+            'network_base_bandwidth_mbps', 'network_score_threshold',
+            'freshness_score_decay_rate'
+        ]
+        
+        if config_update.config_key not in valid_keys:
+            return ErrorResponse(
+                code=ErrorCode.VALIDATION_ERROR,
+                message=f"无效的配置键: {config_update.config_key}"
+            )
+        
+        # 验证配置值范围
+        if config_update.config_value < 0:
+            return ErrorResponse(
+                code=ErrorCode.VALIDATION_ERROR,
+                message="配置值不能为负数"
+            )
+        
+        # 更新配置
+        success = db_manager.update_health_config(config_update.config_key, config_update.config_value)
+        
+        if success:
+            return SuccessResponse(
+                data={"config_key": config_update.config_key, "config_value": config_update.config_value},
+                message="健康度配置更新成功"
+            )
+        else:
+            return ErrorResponse(
+                code=ErrorCode.DATABASE_ERROR,
+                message="健康度配置更新失败"
+            )
+        
+    except Exception as e:
+        return ErrorResponse(
+            code=ErrorCode.INTERNAL_ERROR,
+            message=f"更新健康度配置失败: {str(e)}"
+        )
+
+
+@app.get("/health/config/descriptions", response_model=SuccessResponse)
+async def get_health_config_descriptions(current_user: UserResponse = Depends(allow_all)):
+    """
+    获取健康度配置项描述（所有认证用户可用）
+    
+    Args:
+        current_user: 当前认证用户
+        
+    Returns:
+        配置项描述信息
+    """
+    try:
+        descriptions = {
+            'cpu_warning_threshold': 'CPU使用率警告阈值（%），达到此值将标记为警告状态',
+            'cpu_alert_threshold': 'CPU使用率提示阈值（%），达到此值将标记为提示状态',
+            'memory_warning_threshold': '内存使用率警告阈值（%），达到此值将标记为警告状态',
+            'memory_alert_threshold': '内存使用率提示阈值（%），达到此值将标记为提示状态',
+            'disk_warning_threshold': '磁盘使用率警告阈值（%），达到此值将标记为警告状态',
+            'disk_alert_threshold': '磁盘使用率提示阈值（%），达到此值将标记为提示状态',
+            'swap_warning_threshold': 'Swap使用率警告阈值（%），达到此值将标记为警告状态',
+            'swap_alert_threshold': 'Swap使用率提示阈值（%），达到此值将标记为提示状态',
+            'network_warning_threshold': '网络使用率警告阈值（%），达到此值将标记为警告状态',
+            'network_alert_threshold': '网络使用率提示阈值（%），达到此值将标记为提示状态',
+            'data_freshness_warning_hours': '数据新鲜度警告阈值（小时），超过此时间将标记为警告状态',
+            'data_freshness_alert_hours': '数据新鲜度提示阈值（小时），超过此时间将标记为提示状态',
+            'cpu_weight': 'CPU权重，影响健康评分的计算（0-1之间）',
+            'memory_weight': '内存权重，影响健康评分的计算（0-1之间）',
+            'disk_weight': '磁盘权重，影响健康评分的计算（0-1之间）',
+            'swap_weight': 'Swap权重，影响健康评分的计算（0-1之间）',
+            'network_weight': '网络权重，影响健康评分的计算（0-1之间）',
+            'freshness_weight': '数据新鲜度权重，影响健康评分的计算（0-1之间）',
+            'network_base_bandwidth_mbps': '基准网络带宽（Mbps），用于计算网络使用率',
+            'network_score_threshold': '网络评分阈值（%），低于此值开始扣分',
+            'freshness_score_decay_rate': '数据新鲜度评分衰减率（分/小时），每超过1小时减多少分'
+        }
+        
+        return SuccessResponse(
+            data=descriptions,
+            message="成功获取健康度配置描述"
+        )
+        
+    except Exception as e:
+        return ErrorResponse(
+            code=ErrorCode.INTERNAL_ERROR,
+            message=f"获取健康度配置描述失败: {str(e)}"
+        )

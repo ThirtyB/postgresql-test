@@ -30,6 +30,10 @@ class DatabaseManager:
             maxconn=10,
             **self.db_config
         )
+        # 健康度配置缓存
+        self._health_config_cache = None
+        self._health_config_cache_time = 0
+        self._health_config_cache_ttl = 60  # 缓存60秒
         print("数据库连接池初始化成功!")
     
     def get_connection(self):
@@ -82,6 +86,114 @@ class DatabaseManager:
         finally:
             self.return_connection(connection)
 
+    def get_health_config(self, force_refresh: bool = False) -> Dict[str, float]:
+        """获取健康度配置"""
+        import time
+        
+        # 检查缓存是否有效
+        current_time = time.time()
+        if (not force_refresh and 
+            self._health_config_cache is not None and 
+            current_time - self._health_config_cache_time < self._health_config_cache_ttl):
+            return self._health_config_cache
+        
+        connection = self.get_connection()
+        if not connection:
+            return self._get_default_health_config()
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT config_key, config_value FROM health_config")
+                config_data = cursor.fetchall()
+                
+                config_dict = {}
+                for row in config_data:
+                    # 修复：使用索引而不是字典键访问
+                    config_dict[row[0]] = float(row[1])
+                
+                # 确保所有必要的配置项都存在
+                default_config = self._get_default_health_config()
+                for key, value in default_config.items():
+                    if key not in config_dict:
+                        config_dict[key] = value
+                
+                # 更新缓存
+                self._health_config_cache = config_dict
+                self._health_config_cache_time = current_time
+                
+                return config_dict
+                
+        except Exception as e:
+            print(f"获取健康度配置失败: {e}")
+            return self._get_default_health_config()
+        finally:
+            self.return_connection(connection)
+    
+    def _get_default_health_config(self) -> Dict[str, float]:
+        """获取默认健康度配置"""
+        return {
+            'cpu_warning_threshold': 90.0,
+            'cpu_alert_threshold': 70.0,
+            'memory_warning_threshold': 90.0,
+            'memory_alert_threshold': 70.0,
+            'disk_warning_threshold': 90.0,
+            'disk_alert_threshold': 70.0,
+            'swap_warning_threshold': 50.0,
+            'swap_alert_threshold': 20.0,
+            'network_warning_threshold': 90.0,
+            'network_alert_threshold': 70.0,
+            'data_freshness_warning_hours': 1.0,
+            'data_freshness_alert_hours': 0.3,
+            'cpu_weight': 0.20,
+            'memory_weight': 0.20,
+            'disk_weight': 0.20,
+            'swap_weight': 0.15,
+            'network_weight': 0.15,
+            'freshness_weight': 0.10,
+            'network_base_bandwidth_mbps': 1000.0,
+            'network_score_threshold': 80.0,
+            'freshness_score_decay_rate': 20.0,
+            # 新增评分配置参数
+            'normal_range_score_base': 80.0,
+            'alert_range_score_base': 50.0,
+            'warning_range_score_base': 20.0,
+            'normal_range_penalty_rate': 0.20,
+            'alert_range_penalty_rate': 0.30,
+            'warning_range_penalty_rate': 0.50,
+            'swap_multiplier': 2.0,
+            'network_penalty_multiplier': 2.0
+        }
+    
+    def update_health_config(self, config_key: str, config_value: float) -> bool:
+        """更新健康度配置"""
+        connection = self.get_connection()
+        if not connection:
+            return False
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO health_config (config_key, config_value, updated_at) 
+                    VALUES (%s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (config_key) DO UPDATE SET 
+                    config_value = EXCLUDED.config_value,
+                    updated_at = CURRENT_TIMESTAMP
+                """, (config_key, config_value))
+                connection.commit()
+                
+                # 清除缓存，强制下次读取时刷新
+                self._health_config_cache = None
+                self._health_config_cache_time = 0
+                
+                return True
+                
+        except Exception as e:
+            print(f"更新健康度配置失败: {e}")
+            connection.rollback()
+            return False
+        finally:
+            self.return_connection(connection)
+    
     def assess_machine_status(self, metric: Dict) -> Dict:
         """
         根据监控指标评估机器运行状态
@@ -92,6 +204,9 @@ class DatabaseManager:
         Returns:
             包含状态分级和详细信息的字典
         """
+        # 获取健康度配置
+        config = self.get_health_config()
+        
         # 获取关键指标值，处理None值
         cpu_usr = metric.get('cpu_usr', 0) or 0
         cpu_sys = metric.get('cpu_sys', 0) or 0
@@ -116,9 +231,8 @@ class DatabaseManager:
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
         
-        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
-        # 1000 Mbps = 125,000 KB/s
-        max_bandwidth_kbps = 125000
+        # 计算网络使用率（使用配置的基准带宽）
+        max_bandwidth_kbps = config['network_base_bandwidth_mbps'] * 125  # Mbps转KB/s
         total_network_usage = net_rx_kbps + net_tx_kbps
         network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
@@ -128,60 +242,60 @@ class DatabaseManager:
         warnings = []
         
         # CPU使用率检查
-        if cpu_total >= 90:
+        if cpu_total >= config['cpu_warning_threshold']:
             status_level = "警告"
             issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
-        elif cpu_total >= 70:
+        elif cpu_total >= config['cpu_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
         
         # 内存使用率检查
-        if mem_usage_percent >= 90:
+        if mem_usage_percent >= config['memory_warning_threshold']:
             status_level = "警告"
             issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
-        elif mem_usage_percent >= 70:
+        elif mem_usage_percent >= config['memory_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
         
         # 磁盘使用率检查
-        if disk_used_percent >= 90:
+        if disk_used_percent >= config['disk_warning_threshold']:
             status_level = "警告"
             issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
-        elif disk_used_percent >= 70:
+        elif disk_used_percent >= config['disk_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
         
         # Swap使用率检查
-        if swap_usage_percent >= 50:
+        if swap_usage_percent >= config['swap_warning_threshold']:
             status_level = "警告"
             issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
-        elif swap_usage_percent >= 20:
+        elif swap_usage_percent >= config['swap_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
         # 网络使用率检查
-        if network_usage_percent >= 90:
+        if network_usage_percent >= config['network_warning_threshold']:
             status_level = "警告"
             issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
-        elif network_usage_percent >= 70:
+        elif network_usage_percent >= config['network_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
         
-        # 数据时效性检查（超过1小时无数据视为异常）
+        # 数据时效性检查
         import time
         current_timestamp = int(time.time())
         metric_timestamp = metric.get('ts', 0)
         time_diff_hours = (current_timestamp - metric_timestamp) / 3600
         
-        if time_diff_hours > 1:
+        if time_diff_hours > config['data_freshness_warning_hours']:
             status_level = "警告"
             issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
-        elif time_diff_hours > 0.3:
+        elif time_diff_hours > config['data_freshness_alert_hours']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
@@ -202,12 +316,12 @@ class DatabaseManager:
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours, config)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float, config: Dict[str, float] = None) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -218,35 +332,38 @@ class DatabaseManager:
             swap_usage: Swap使用率
             network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
+            config: 健康度配置字典
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重（调整为5维评分）
+        if config is None:
+            config = self.get_health_config()
+            
+        # 各项指标的权重
         weights = {
-            'cpu': 0.20,
-            'memory': 0.20,
-            'disk': 0.20,
-            'swap': 0.15,
-            'network': 0.15,
-            'freshness': 0.10
+            'cpu': config['cpu_weight'],
+            'memory': config['memory_weight'],
+            'disk': config['disk_weight'],
+            'swap': config['swap_weight'],
+            'network': config['network_weight'],
+            'freshness': config['freshness_weight']
         }
         
-        # 计算各项得分（0-100分）
-        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
-        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
-        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
-        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        # 计算各项得分（0-100分），基于配置的阈值进行动态调整
+        cpu_score = self._calculate_dimension_score(cpu_usage, config['cpu_alert_threshold'], config['cpu_warning_threshold'], 'cpu', config)
+        mem_score = self._calculate_dimension_score(mem_usage, config['memory_alert_threshold'], config['memory_warning_threshold'], 'memory', config)
+        disk_score = self._calculate_dimension_score(disk_usage, config['disk_alert_threshold'], config['disk_warning_threshold'], 'disk', config)
+        swap_score = self._calculate_dimension_score(swap_usage, config['swap_alert_threshold'], config['swap_warning_threshold'], 'swap', config)
         
-        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
-        # 网络使用率越高得分越高，但超过80%开始扣分
-        if network_usage <= 80:
+        # 网络使用率得分（基于配置的阈值）
+        if network_usage <= config['network_score_threshold']:
             network_score = 100
         else:
-            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_score = max(0, 100 - (network_usage - config['network_score_threshold']) * 2)
         
-        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
-        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        # 数据新鲜度得分（使用配置的衰减率）
+        freshness_score = max(0, 100 - (data_freshness * config['freshness_score_decay_rate']))
         
         # 加权平均
         total_score = (
@@ -259,6 +376,44 @@ class DatabaseManager:
         )
         
         return int(max(0, min(100, total_score)))
+    
+    def _calculate_dimension_score(self, usage: float, alert_threshold: float, warning_threshold: float, dimension: str, config: Dict[str, float] = None) -> float:
+        """
+        计算单个维度的健康评分（0-100分）
+        
+        Args:
+            usage: 使用率
+            alert_threshold: 提示阈值
+            warning_threshold: 警告阈值
+            dimension: 维度名称
+            config: 健康度配置字典
+            
+        Returns:
+            维度评分（0-100）
+        """
+        if config is None:
+            config = self.get_health_config()
+        
+        # 根据不同的维度调整评分策略
+        if dimension == 'swap':
+            # Swap使用率影响倍数
+            usage = min(usage * config['swap_multiplier'], 100)
+        
+        # 基于配置的阈值进行评分
+        if usage <= alert_threshold:
+            # 正常范围：基于配置的基础评分和扣分率
+            normal_penalty = usage * config['normal_range_penalty_rate']
+            return max(0, config['normal_range_score_base'] - normal_penalty)
+        elif usage <= warning_threshold:
+            # 提示范围：基于配置的基础评分和扣分率
+            alert_range = warning_threshold - alert_threshold
+            alert_penalty = (usage - alert_threshold) / alert_range * (config['normal_range_score_base'] - config['alert_range_score_base'])
+            return max(0, config['alert_range_score_base'] - alert_penalty)
+        else:
+            # 警告范围：基于配置的基础评分和扣分率
+            warning_range = 100 - warning_threshold
+            warning_penalty = (usage - warning_threshold) / warning_range * (config['alert_range_score_base'] - config['warning_range_score_base'])
+            return max(0, config['warning_range_score_base'] - warning_penalty)
 
     def get_machine_status_by_ip(self, ip: str) -> Dict:
         """
@@ -628,6 +783,114 @@ class DatabaseManager:
         finally:
             self.return_connection(connection)
 
+    def get_health_config(self, force_refresh: bool = False) -> Dict[str, float]:
+        """获取健康度配置"""
+        import time
+        
+        # 检查缓存是否有效
+        current_time = time.time()
+        if (not force_refresh and 
+            self._health_config_cache is not None and 
+            current_time - self._health_config_cache_time < self._health_config_cache_ttl):
+            return self._health_config_cache
+        
+        connection = self.get_connection()
+        if not connection:
+            return self._get_default_health_config()
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT config_key, config_value FROM health_config")
+                config_data = cursor.fetchall()
+                
+                config_dict = {}
+                for row in config_data:
+                    # 修复：使用索引而不是字典键访问
+                    config_dict[row[0]] = float(row[1])
+                
+                # 确保所有必要的配置项都存在
+                default_config = self._get_default_health_config()
+                for key, value in default_config.items():
+                    if key not in config_dict:
+                        config_dict[key] = value
+                
+                # 更新缓存
+                self._health_config_cache = config_dict
+                self._health_config_cache_time = current_time
+                
+                return config_dict
+                
+        except Exception as e:
+            print(f"获取健康度配置失败: {e}")
+            return self._get_default_health_config()
+        finally:
+            self.return_connection(connection)
+    
+    def _get_default_health_config(self) -> Dict[str, float]:
+        """获取默认健康度配置"""
+        return {
+            'cpu_warning_threshold': 90.0,
+            'cpu_alert_threshold': 70.0,
+            'memory_warning_threshold': 90.0,
+            'memory_alert_threshold': 70.0,
+            'disk_warning_threshold': 90.0,
+            'disk_alert_threshold': 70.0,
+            'swap_warning_threshold': 50.0,
+            'swap_alert_threshold': 20.0,
+            'network_warning_threshold': 90.0,
+            'network_alert_threshold': 70.0,
+            'data_freshness_warning_hours': 1.0,
+            'data_freshness_alert_hours': 0.3,
+            'cpu_weight': 0.20,
+            'memory_weight': 0.20,
+            'disk_weight': 0.20,
+            'swap_weight': 0.15,
+            'network_weight': 0.15,
+            'freshness_weight': 0.10,
+            'network_base_bandwidth_mbps': 1000.0,
+            'network_score_threshold': 80.0,
+            'freshness_score_decay_rate': 20.0,
+            # 新增评分配置参数
+            'normal_range_score_base': 80.0,
+            'alert_range_score_base': 50.0,
+            'warning_range_score_base': 20.0,
+            'normal_range_penalty_rate': 0.20,
+            'alert_range_penalty_rate': 0.30,
+            'warning_range_penalty_rate': 0.50,
+            'swap_multiplier': 2.0,
+            'network_penalty_multiplier': 2.0
+        }
+    
+    def update_health_config(self, config_key: str, config_value: float) -> bool:
+        """更新健康度配置"""
+        connection = self.get_connection()
+        if not connection:
+            return False
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO health_config (config_key, config_value, updated_at) 
+                    VALUES (%s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (config_key) DO UPDATE SET 
+                    config_value = EXCLUDED.config_value,
+                    updated_at = CURRENT_TIMESTAMP
+                """, (config_key, config_value))
+                connection.commit()
+                
+                # 清除缓存，强制下次读取时刷新
+                self._health_config_cache = None
+                self._health_config_cache_time = 0
+                
+                return True
+                
+        except Exception as e:
+            print(f"更新健康度配置失败: {e}")
+            connection.rollback()
+            return False
+        finally:
+            self.return_connection(connection)
+    
     def assess_machine_status(self, metric: Dict) -> Dict:
         """
         根据监控指标评估机器运行状态
@@ -638,6 +901,9 @@ class DatabaseManager:
         Returns:
             包含状态分级和详细信息的字典
         """
+        # 获取健康度配置
+        config = self.get_health_config()
+        
         # 获取关键指标值，处理None值
         cpu_usr = metric.get('cpu_usr', 0) or 0
         cpu_sys = metric.get('cpu_sys', 0) or 0
@@ -662,9 +928,8 @@ class DatabaseManager:
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
         
-        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
-        # 1000 Mbps = 125,000 KB/s
-        max_bandwidth_kbps = 125000
+        # 计算网络使用率（使用配置的基准带宽）
+        max_bandwidth_kbps = config['network_base_bandwidth_mbps'] * 125  # Mbps转KB/s
         total_network_usage = net_rx_kbps + net_tx_kbps
         network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
@@ -674,60 +939,60 @@ class DatabaseManager:
         warnings = []
         
         # CPU使用率检查
-        if cpu_total >= 90:
+        if cpu_total >= config['cpu_warning_threshold']:
             status_level = "警告"
             issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
-        elif cpu_total >= 70:
+        elif cpu_total >= config['cpu_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
         
         # 内存使用率检查
-        if mem_usage_percent >= 90:
+        if mem_usage_percent >= config['memory_warning_threshold']:
             status_level = "警告"
             issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
-        elif mem_usage_percent >= 70:
+        elif mem_usage_percent >= config['memory_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
         
         # 磁盘使用率检查
-        if disk_used_percent >= 90:
+        if disk_used_percent >= config['disk_warning_threshold']:
             status_level = "警告"
             issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
-        elif disk_used_percent >= 70:
+        elif disk_used_percent >= config['disk_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
         
         # Swap使用率检查
-        if swap_usage_percent >= 50:
+        if swap_usage_percent >= config['swap_warning_threshold']:
             status_level = "警告"
             issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
-        elif swap_usage_percent >= 20:
+        elif swap_usage_percent >= config['swap_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
         # 网络使用率检查
-        if network_usage_percent >= 90:
+        if network_usage_percent >= config['network_warning_threshold']:
             status_level = "警告"
             issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
-        elif network_usage_percent >= 70:
+        elif network_usage_percent >= config['network_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
         
-        # 数据时效性检查（超过1小时无数据视为异常）
+        # 数据时效性检查
         import time
         current_timestamp = int(time.time())
         metric_timestamp = metric.get('ts', 0)
         time_diff_hours = (current_timestamp - metric_timestamp) / 3600
         
-        if time_diff_hours > 1:
+        if time_diff_hours > config['data_freshness_warning_hours']:
             status_level = "警告"
             issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
-        elif time_diff_hours > 0.3:
+        elif time_diff_hours > config['data_freshness_alert_hours']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
@@ -748,12 +1013,12 @@ class DatabaseManager:
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours, config)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float, config: Dict[str, float] = None) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -764,35 +1029,38 @@ class DatabaseManager:
             swap_usage: Swap使用率
             network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
+            config: 健康度配置字典
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重（调整为5维评分）
+        if config is None:
+            config = self.get_health_config()
+            
+        # 各项指标的权重
         weights = {
-            'cpu': 0.20,
-            'memory': 0.20,
-            'disk': 0.20,
-            'swap': 0.15,
-            'network': 0.15,
-            'freshness': 0.10
+            'cpu': config['cpu_weight'],
+            'memory': config['memory_weight'],
+            'disk': config['disk_weight'],
+            'swap': config['swap_weight'],
+            'network': config['network_weight'],
+            'freshness': config['freshness_weight']
         }
         
-        # 计算各项得分（0-100分）
-        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
-        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
-        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
-        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        # 计算各项得分（0-100分），基于配置的阈值进行动态调整
+        cpu_score = self._calculate_dimension_score(cpu_usage, config['cpu_alert_threshold'], config['cpu_warning_threshold'], 'cpu', config)
+        mem_score = self._calculate_dimension_score(mem_usage, config['memory_alert_threshold'], config['memory_warning_threshold'], 'memory', config)
+        disk_score = self._calculate_dimension_score(disk_usage, config['disk_alert_threshold'], config['disk_warning_threshold'], 'disk', config)
+        swap_score = self._calculate_dimension_score(swap_usage, config['swap_alert_threshold'], config['swap_warning_threshold'], 'swap', config)
         
-        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
-        # 网络使用率越高得分越高，但超过80%开始扣分
-        if network_usage <= 80:
+        # 网络使用率得分（基于配置的阈值）
+        if network_usage <= config['network_score_threshold']:
             network_score = 100
         else:
-            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_score = max(0, 100 - (network_usage - config['network_score_threshold']) * 2)
         
-        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
-        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        # 数据新鲜度得分（使用配置的衰减率）
+        freshness_score = max(0, 100 - (data_freshness * config['freshness_score_decay_rate']))
         
         # 加权平均
         total_score = (
@@ -805,6 +1073,44 @@ class DatabaseManager:
         )
         
         return int(max(0, min(100, total_score)))
+    
+    def _calculate_dimension_score(self, usage: float, alert_threshold: float, warning_threshold: float, dimension: str, config: Dict[str, float] = None) -> float:
+        """
+        计算单个维度的健康评分（0-100分）
+        
+        Args:
+            usage: 使用率
+            alert_threshold: 提示阈值
+            warning_threshold: 警告阈值
+            dimension: 维度名称
+            config: 健康度配置字典
+            
+        Returns:
+            维度评分（0-100）
+        """
+        if config is None:
+            config = self.get_health_config()
+        
+        # 根据不同的维度调整评分策略
+        if dimension == 'swap':
+            # Swap使用率影响倍数
+            usage = min(usage * config['swap_multiplier'], 100)
+        
+        # 基于配置的阈值进行评分
+        if usage <= alert_threshold:
+            # 正常范围：基于配置的基础评分和扣分率
+            normal_penalty = usage * config['normal_range_penalty_rate']
+            return max(0, config['normal_range_score_base'] - normal_penalty)
+        elif usage <= warning_threshold:
+            # 提示范围：基于配置的基础评分和扣分率
+            alert_range = warning_threshold - alert_threshold
+            alert_penalty = (usage - alert_threshold) / alert_range * (config['normal_range_score_base'] - config['alert_range_score_base'])
+            return max(0, config['alert_range_score_base'] - alert_penalty)
+        else:
+            # 警告范围：基于配置的基础评分和扣分率
+            warning_range = 100 - warning_threshold
+            warning_penalty = (usage - warning_threshold) / warning_range * (config['alert_range_score_base'] - config['warning_range_score_base'])
+            return max(0, config['warning_range_score_base'] - warning_penalty)
 
     def get_machine_status_by_ip(self, ip: str) -> Dict:
         """
@@ -1170,6 +1476,114 @@ class DatabaseManager:
         finally:
             self.return_connection(connection)
 
+    def get_health_config(self, force_refresh: bool = False) -> Dict[str, float]:
+        """获取健康度配置"""
+        import time
+        
+        # 检查缓存是否有效
+        current_time = time.time()
+        if (not force_refresh and 
+            self._health_config_cache is not None and 
+            current_time - self._health_config_cache_time < self._health_config_cache_ttl):
+            return self._health_config_cache
+        
+        connection = self.get_connection()
+        if not connection:
+            return self._get_default_health_config()
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT config_key, config_value FROM health_config")
+                config_data = cursor.fetchall()
+                
+                config_dict = {}
+                for row in config_data:
+                    # 修复：使用索引而不是字典键访问
+                    config_dict[row[0]] = float(row[1])
+                
+                # 确保所有必要的配置项都存在
+                default_config = self._get_default_health_config()
+                for key, value in default_config.items():
+                    if key not in config_dict:
+                        config_dict[key] = value
+                
+                # 更新缓存
+                self._health_config_cache = config_dict
+                self._health_config_cache_time = current_time
+                
+                return config_dict
+                
+        except Exception as e:
+            print(f"获取健康度配置失败: {e}")
+            return self._get_default_health_config()
+        finally:
+            self.return_connection(connection)
+    
+    def _get_default_health_config(self) -> Dict[str, float]:
+        """获取默认健康度配置"""
+        return {
+            'cpu_warning_threshold': 90.0,
+            'cpu_alert_threshold': 70.0,
+            'memory_warning_threshold': 90.0,
+            'memory_alert_threshold': 70.0,
+            'disk_warning_threshold': 90.0,
+            'disk_alert_threshold': 70.0,
+            'swap_warning_threshold': 50.0,
+            'swap_alert_threshold': 20.0,
+            'network_warning_threshold': 90.0,
+            'network_alert_threshold': 70.0,
+            'data_freshness_warning_hours': 1.0,
+            'data_freshness_alert_hours': 0.3,
+            'cpu_weight': 0.20,
+            'memory_weight': 0.20,
+            'disk_weight': 0.20,
+            'swap_weight': 0.15,
+            'network_weight': 0.15,
+            'freshness_weight': 0.10,
+            'network_base_bandwidth_mbps': 1000.0,
+            'network_score_threshold': 80.0,
+            'freshness_score_decay_rate': 20.0,
+            # 新增评分配置参数
+            'normal_range_score_base': 80.0,
+            'alert_range_score_base': 50.0,
+            'warning_range_score_base': 20.0,
+            'normal_range_penalty_rate': 0.20,
+            'alert_range_penalty_rate': 0.30,
+            'warning_range_penalty_rate': 0.50,
+            'swap_multiplier': 2.0,
+            'network_penalty_multiplier': 2.0
+        }
+    
+    def update_health_config(self, config_key: str, config_value: float) -> bool:
+        """更新健康度配置"""
+        connection = self.get_connection()
+        if not connection:
+            return False
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO health_config (config_key, config_value, updated_at) 
+                    VALUES (%s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (config_key) DO UPDATE SET 
+                    config_value = EXCLUDED.config_value,
+                    updated_at = CURRENT_TIMESTAMP
+                """, (config_key, config_value))
+                connection.commit()
+                
+                # 清除缓存，强制下次读取时刷新
+                self._health_config_cache = None
+                self._health_config_cache_time = 0
+                
+                return True
+                
+        except Exception as e:
+            print(f"更新健康度配置失败: {e}")
+            connection.rollback()
+            return False
+        finally:
+            self.return_connection(connection)
+    
     def assess_machine_status(self, metric: Dict) -> Dict:
         """
         根据监控指标评估机器运行状态
@@ -1180,6 +1594,9 @@ class DatabaseManager:
         Returns:
             包含状态分级和详细信息的字典
         """
+        # 获取健康度配置
+        config = self.get_health_config()
+        
         # 获取关键指标值，处理None值
         cpu_usr = metric.get('cpu_usr', 0) or 0
         cpu_sys = metric.get('cpu_sys', 0) or 0
@@ -1204,9 +1621,8 @@ class DatabaseManager:
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
         
-        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
-        # 1000 Mbps = 125,000 KB/s
-        max_bandwidth_kbps = 125000
+        # 计算网络使用率（使用配置的基准带宽）
+        max_bandwidth_kbps = config['network_base_bandwidth_mbps'] * 125  # Mbps转KB/s
         total_network_usage = net_rx_kbps + net_tx_kbps
         network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
@@ -1216,60 +1632,60 @@ class DatabaseManager:
         warnings = []
         
         # CPU使用率检查
-        if cpu_total >= 90:
+        if cpu_total >= config['cpu_warning_threshold']:
             status_level = "警告"
             issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
-        elif cpu_total >= 70:
+        elif cpu_total >= config['cpu_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
         
         # 内存使用率检查
-        if mem_usage_percent >= 90:
+        if mem_usage_percent >= config['memory_warning_threshold']:
             status_level = "警告"
             issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
-        elif mem_usage_percent >= 70:
+        elif mem_usage_percent >= config['memory_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
         
         # 磁盘使用率检查
-        if disk_used_percent >= 90:
+        if disk_used_percent >= config['disk_warning_threshold']:
             status_level = "警告"
             issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
-        elif disk_used_percent >= 70:
+        elif disk_used_percent >= config['disk_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
         
         # Swap使用率检查
-        if swap_usage_percent >= 50:
+        if swap_usage_percent >= config['swap_warning_threshold']:
             status_level = "警告"
             issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
-        elif swap_usage_percent >= 20:
+        elif swap_usage_percent >= config['swap_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
         # 网络使用率检查
-        if network_usage_percent >= 90:
+        if network_usage_percent >= config['network_warning_threshold']:
             status_level = "警告"
             issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
-        elif network_usage_percent >= 70:
+        elif network_usage_percent >= config['network_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
         
-        # 数据时效性检查（超过1小时无数据视为异常）
+        # 数据时效性检查
         import time
         current_timestamp = int(time.time())
         metric_timestamp = metric.get('ts', 0)
         time_diff_hours = (current_timestamp - metric_timestamp) / 3600
         
-        if time_diff_hours > 1:
+        if time_diff_hours > config['data_freshness_warning_hours']:
             status_level = "警告"
             issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
-        elif time_diff_hours > 0.3:
+        elif time_diff_hours > config['data_freshness_alert_hours']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
@@ -1290,12 +1706,12 @@ class DatabaseManager:
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours, config)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float, config: Dict[str, float] = None) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -1306,35 +1722,38 @@ class DatabaseManager:
             swap_usage: Swap使用率
             network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
+            config: 健康度配置字典
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重（调整为5维评分）
+        if config is None:
+            config = self.get_health_config()
+            
+        # 各项指标的权重
         weights = {
-            'cpu': 0.20,
-            'memory': 0.20,
-            'disk': 0.20,
-            'swap': 0.15,
-            'network': 0.15,
-            'freshness': 0.10
+            'cpu': config['cpu_weight'],
+            'memory': config['memory_weight'],
+            'disk': config['disk_weight'],
+            'swap': config['swap_weight'],
+            'network': config['network_weight'],
+            'freshness': config['freshness_weight']
         }
         
-        # 计算各项得分（0-100分）
-        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
-        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
-        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
-        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        # 计算各项得分（0-100分），基于配置的阈值进行动态调整
+        cpu_score = self._calculate_dimension_score(cpu_usage, config['cpu_alert_threshold'], config['cpu_warning_threshold'], 'cpu', config)
+        mem_score = self._calculate_dimension_score(mem_usage, config['memory_alert_threshold'], config['memory_warning_threshold'], 'memory', config)
+        disk_score = self._calculate_dimension_score(disk_usage, config['disk_alert_threshold'], config['disk_warning_threshold'], 'disk', config)
+        swap_score = self._calculate_dimension_score(swap_usage, config['swap_alert_threshold'], config['swap_warning_threshold'], 'swap', config)
         
-        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
-        # 网络使用率越高得分越高，但超过80%开始扣分
-        if network_usage <= 80:
+        # 网络使用率得分（基于配置的阈值）
+        if network_usage <= config['network_score_threshold']:
             network_score = 100
         else:
-            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_score = max(0, 100 - (network_usage - config['network_score_threshold']) * 2)
         
-        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
-        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        # 数据新鲜度得分（使用配置的衰减率）
+        freshness_score = max(0, 100 - (data_freshness * config['freshness_score_decay_rate']))
         
         # 加权平均
         total_score = (
@@ -1347,6 +1766,44 @@ class DatabaseManager:
         )
         
         return int(max(0, min(100, total_score)))
+    
+    def _calculate_dimension_score(self, usage: float, alert_threshold: float, warning_threshold: float, dimension: str, config: Dict[str, float] = None) -> float:
+        """
+        计算单个维度的健康评分（0-100分）
+        
+        Args:
+            usage: 使用率
+            alert_threshold: 提示阈值
+            warning_threshold: 警告阈值
+            dimension: 维度名称
+            config: 健康度配置字典
+            
+        Returns:
+            维度评分（0-100）
+        """
+        if config is None:
+            config = self.get_health_config()
+        
+        # 根据不同的维度调整评分策略
+        if dimension == 'swap':
+            # Swap使用率影响倍数
+            usage = min(usage * config['swap_multiplier'], 100)
+        
+        # 基于配置的阈值进行评分
+        if usage <= alert_threshold:
+            # 正常范围：基于配置的基础评分和扣分率
+            normal_penalty = usage * config['normal_range_penalty_rate']
+            return max(0, config['normal_range_score_base'] - normal_penalty)
+        elif usage <= warning_threshold:
+            # 提示范围：基于配置的基础评分和扣分率
+            alert_range = warning_threshold - alert_threshold
+            alert_penalty = (usage - alert_threshold) / alert_range * (config['normal_range_score_base'] - config['alert_range_score_base'])
+            return max(0, config['alert_range_score_base'] - alert_penalty)
+        else:
+            # 警告范围：基于配置的基础评分和扣分率
+            warning_range = 100 - warning_threshold
+            warning_penalty = (usage - warning_threshold) / warning_range * (config['alert_range_score_base'] - config['warning_range_score_base'])
+            return max(0, config['warning_range_score_base'] - warning_penalty)
 
     def get_machine_status_by_ip(self, ip: str) -> Dict:
         """
@@ -1706,6 +2163,114 @@ class DatabaseManager:
         finally:
             self.return_connection(connection)
 
+    def get_health_config(self, force_refresh: bool = False) -> Dict[str, float]:
+        """获取健康度配置"""
+        import time
+        
+        # 检查缓存是否有效
+        current_time = time.time()
+        if (not force_refresh and 
+            self._health_config_cache is not None and 
+            current_time - self._health_config_cache_time < self._health_config_cache_ttl):
+            return self._health_config_cache
+        
+        connection = self.get_connection()
+        if not connection:
+            return self._get_default_health_config()
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT config_key, config_value FROM health_config")
+                config_data = cursor.fetchall()
+                
+                config_dict = {}
+                for row in config_data:
+                    # 修复：使用索引而不是字典键访问
+                    config_dict[row[0]] = float(row[1])
+                
+                # 确保所有必要的配置项都存在
+                default_config = self._get_default_health_config()
+                for key, value in default_config.items():
+                    if key not in config_dict:
+                        config_dict[key] = value
+                
+                # 更新缓存
+                self._health_config_cache = config_dict
+                self._health_config_cache_time = current_time
+                
+                return config_dict
+                
+        except Exception as e:
+            print(f"获取健康度配置失败: {e}")
+            return self._get_default_health_config()
+        finally:
+            self.return_connection(connection)
+    
+    def _get_default_health_config(self) -> Dict[str, float]:
+        """获取默认健康度配置"""
+        return {
+            'cpu_warning_threshold': 90.0,
+            'cpu_alert_threshold': 70.0,
+            'memory_warning_threshold': 90.0,
+            'memory_alert_threshold': 70.0,
+            'disk_warning_threshold': 90.0,
+            'disk_alert_threshold': 70.0,
+            'swap_warning_threshold': 50.0,
+            'swap_alert_threshold': 20.0,
+            'network_warning_threshold': 90.0,
+            'network_alert_threshold': 70.0,
+            'data_freshness_warning_hours': 1.0,
+            'data_freshness_alert_hours': 0.3,
+            'cpu_weight': 0.20,
+            'memory_weight': 0.20,
+            'disk_weight': 0.20,
+            'swap_weight': 0.15,
+            'network_weight': 0.15,
+            'freshness_weight': 0.10,
+            'network_base_bandwidth_mbps': 1000.0,
+            'network_score_threshold': 80.0,
+            'freshness_score_decay_rate': 20.0,
+            # 新增评分配置参数
+            'normal_range_score_base': 80.0,
+            'alert_range_score_base': 50.0,
+            'warning_range_score_base': 20.0,
+            'normal_range_penalty_rate': 0.20,
+            'alert_range_penalty_rate': 0.30,
+            'warning_range_penalty_rate': 0.50,
+            'swap_multiplier': 2.0,
+            'network_penalty_multiplier': 2.0
+        }
+    
+    def update_health_config(self, config_key: str, config_value: float) -> bool:
+        """更新健康度配置"""
+        connection = self.get_connection()
+        if not connection:
+            return False
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO health_config (config_key, config_value, updated_at) 
+                    VALUES (%s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (config_key) DO UPDATE SET 
+                    config_value = EXCLUDED.config_value,
+                    updated_at = CURRENT_TIMESTAMP
+                """, (config_key, config_value))
+                connection.commit()
+                
+                # 清除缓存，强制下次读取时刷新
+                self._health_config_cache = None
+                self._health_config_cache_time = 0
+                
+                return True
+                
+        except Exception as e:
+            print(f"更新健康度配置失败: {e}")
+            connection.rollback()
+            return False
+        finally:
+            self.return_connection(connection)
+    
     def assess_machine_status(self, metric: Dict) -> Dict:
         """
         根据监控指标评估机器运行状态
@@ -1716,6 +2281,9 @@ class DatabaseManager:
         Returns:
             包含状态分级和详细信息的字典
         """
+        # 获取健康度配置
+        config = self.get_health_config()
+        
         # 获取关键指标值，处理None值
         cpu_usr = metric.get('cpu_usr', 0) or 0
         cpu_sys = metric.get('cpu_sys', 0) or 0
@@ -1740,9 +2308,8 @@ class DatabaseManager:
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
         
-        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
-        # 1000 Mbps = 125,000 KB/s
-        max_bandwidth_kbps = 125000
+        # 计算网络使用率（使用配置的基准带宽）
+        max_bandwidth_kbps = config['network_base_bandwidth_mbps'] * 125  # Mbps转KB/s
         total_network_usage = net_rx_kbps + net_tx_kbps
         network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
@@ -1752,60 +2319,60 @@ class DatabaseManager:
         warnings = []
         
         # CPU使用率检查
-        if cpu_total >= 90:
+        if cpu_total >= config['cpu_warning_threshold']:
             status_level = "警告"
             issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
-        elif cpu_total >= 70:
+        elif cpu_total >= config['cpu_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
         
         # 内存使用率检查
-        if mem_usage_percent >= 90:
+        if mem_usage_percent >= config['memory_warning_threshold']:
             status_level = "警告"
             issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
-        elif mem_usage_percent >= 70:
+        elif mem_usage_percent >= config['memory_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
         
         # 磁盘使用率检查
-        if disk_used_percent >= 90:
+        if disk_used_percent >= config['disk_warning_threshold']:
             status_level = "警告"
             issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
-        elif disk_used_percent >= 70:
+        elif disk_used_percent >= config['disk_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
         
         # Swap使用率检查
-        if swap_usage_percent >= 50:
+        if swap_usage_percent >= config['swap_warning_threshold']:
             status_level = "警告"
             issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
-        elif swap_usage_percent >= 20:
+        elif swap_usage_percent >= config['swap_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
         # 网络使用率检查
-        if network_usage_percent >= 90:
+        if network_usage_percent >= config['network_warning_threshold']:
             status_level = "警告"
             issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
-        elif network_usage_percent >= 70:
+        elif network_usage_percent >= config['network_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
         
-        # 数据时效性检查（超过1小时无数据视为异常）
+        # 数据时效性检查
         import time
         current_timestamp = int(time.time())
         metric_timestamp = metric.get('ts', 0)
         time_diff_hours = (current_timestamp - metric_timestamp) / 3600
         
-        if time_diff_hours > 1:
+        if time_diff_hours > config['data_freshness_warning_hours']:
             status_level = "警告"
             issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
-        elif time_diff_hours > 0.3:
+        elif time_diff_hours > config['data_freshness_alert_hours']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
@@ -1826,12 +2393,12 @@ class DatabaseManager:
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours, config)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float, config: Dict[str, float] = None) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -1842,35 +2409,38 @@ class DatabaseManager:
             swap_usage: Swap使用率
             network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
+            config: 健康度配置字典
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重（调整为5维评分）
+        if config is None:
+            config = self.get_health_config()
+            
+        # 各项指标的权重
         weights = {
-            'cpu': 0.20,
-            'memory': 0.20,
-            'disk': 0.20,
-            'swap': 0.15,
-            'network': 0.15,
-            'freshness': 0.10
+            'cpu': config['cpu_weight'],
+            'memory': config['memory_weight'],
+            'disk': config['disk_weight'],
+            'swap': config['swap_weight'],
+            'network': config['network_weight'],
+            'freshness': config['freshness_weight']
         }
         
-        # 计算各项得分（0-100分）
-        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
-        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
-        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
-        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        # 计算各项得分（0-100分），基于配置的阈值进行动态调整
+        cpu_score = self._calculate_dimension_score(cpu_usage, config['cpu_alert_threshold'], config['cpu_warning_threshold'], 'cpu', config)
+        mem_score = self._calculate_dimension_score(mem_usage, config['memory_alert_threshold'], config['memory_warning_threshold'], 'memory', config)
+        disk_score = self._calculate_dimension_score(disk_usage, config['disk_alert_threshold'], config['disk_warning_threshold'], 'disk', config)
+        swap_score = self._calculate_dimension_score(swap_usage, config['swap_alert_threshold'], config['swap_warning_threshold'], 'swap', config)
         
-        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
-        # 网络使用率越高得分越高，但超过80%开始扣分
-        if network_usage <= 80:
+        # 网络使用率得分（基于配置的阈值）
+        if network_usage <= config['network_score_threshold']:
             network_score = 100
         else:
-            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_score = max(0, 100 - (network_usage - config['network_score_threshold']) * 2)
         
-        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
-        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        # 数据新鲜度得分（使用配置的衰减率）
+        freshness_score = max(0, 100 - (data_freshness * config['freshness_score_decay_rate']))
         
         # 加权平均
         total_score = (
@@ -1883,6 +2453,44 @@ class DatabaseManager:
         )
         
         return int(max(0, min(100, total_score)))
+    
+    def _calculate_dimension_score(self, usage: float, alert_threshold: float, warning_threshold: float, dimension: str, config: Dict[str, float] = None) -> float:
+        """
+        计算单个维度的健康评分（0-100分）
+        
+        Args:
+            usage: 使用率
+            alert_threshold: 提示阈值
+            warning_threshold: 警告阈值
+            dimension: 维度名称
+            config: 健康度配置字典
+            
+        Returns:
+            维度评分（0-100）
+        """
+        if config is None:
+            config = self.get_health_config()
+        
+        # 根据不同的维度调整评分策略
+        if dimension == 'swap':
+            # Swap使用率影响倍数
+            usage = min(usage * config['swap_multiplier'], 100)
+        
+        # 基于配置的阈值进行评分
+        if usage <= alert_threshold:
+            # 正常范围：基于配置的基础评分和扣分率
+            normal_penalty = usage * config['normal_range_penalty_rate']
+            return max(0, config['normal_range_score_base'] - normal_penalty)
+        elif usage <= warning_threshold:
+            # 提示范围：基于配置的基础评分和扣分率
+            alert_range = warning_threshold - alert_threshold
+            alert_penalty = (usage - alert_threshold) / alert_range * (config['normal_range_score_base'] - config['alert_range_score_base'])
+            return max(0, config['alert_range_score_base'] - alert_penalty)
+        else:
+            # 警告范围：基于配置的基础评分和扣分率
+            warning_range = 100 - warning_threshold
+            warning_penalty = (usage - warning_threshold) / warning_range * (config['alert_range_score_base'] - config['warning_range_score_base'])
+            return max(0, config['warning_range_score_base'] - warning_penalty)
 
     def get_machine_status_by_ip(self, ip: str) -> Dict:
         """
@@ -2244,6 +2852,114 @@ class DatabaseManager:
         finally:
             self.return_connection(connection)
 
+    def get_health_config(self, force_refresh: bool = False) -> Dict[str, float]:
+        """获取健康度配置"""
+        import time
+        
+        # 检查缓存是否有效
+        current_time = time.time()
+        if (not force_refresh and 
+            self._health_config_cache is not None and 
+            current_time - self._health_config_cache_time < self._health_config_cache_ttl):
+            return self._health_config_cache
+        
+        connection = self.get_connection()
+        if not connection:
+            return self._get_default_health_config()
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT config_key, config_value FROM health_config")
+                config_data = cursor.fetchall()
+                
+                config_dict = {}
+                for row in config_data:
+                    # 修复：使用索引而不是字典键访问
+                    config_dict[row[0]] = float(row[1])
+                
+                # 确保所有必要的配置项都存在
+                default_config = self._get_default_health_config()
+                for key, value in default_config.items():
+                    if key not in config_dict:
+                        config_dict[key] = value
+                
+                # 更新缓存
+                self._health_config_cache = config_dict
+                self._health_config_cache_time = current_time
+                
+                return config_dict
+                
+        except Exception as e:
+            print(f"获取健康度配置失败: {e}")
+            return self._get_default_health_config()
+        finally:
+            self.return_connection(connection)
+    
+    def _get_default_health_config(self) -> Dict[str, float]:
+        """获取默认健康度配置"""
+        return {
+            'cpu_warning_threshold': 90.0,
+            'cpu_alert_threshold': 70.0,
+            'memory_warning_threshold': 90.0,
+            'memory_alert_threshold': 70.0,
+            'disk_warning_threshold': 90.0,
+            'disk_alert_threshold': 70.0,
+            'swap_warning_threshold': 50.0,
+            'swap_alert_threshold': 20.0,
+            'network_warning_threshold': 90.0,
+            'network_alert_threshold': 70.0,
+            'data_freshness_warning_hours': 1.0,
+            'data_freshness_alert_hours': 0.3,
+            'cpu_weight': 0.20,
+            'memory_weight': 0.20,
+            'disk_weight': 0.20,
+            'swap_weight': 0.15,
+            'network_weight': 0.15,
+            'freshness_weight': 0.10,
+            'network_base_bandwidth_mbps': 1000.0,
+            'network_score_threshold': 80.0,
+            'freshness_score_decay_rate': 20.0,
+            # 新增评分配置参数
+            'normal_range_score_base': 80.0,
+            'alert_range_score_base': 50.0,
+            'warning_range_score_base': 20.0,
+            'normal_range_penalty_rate': 0.20,
+            'alert_range_penalty_rate': 0.30,
+            'warning_range_penalty_rate': 0.50,
+            'swap_multiplier': 2.0,
+            'network_penalty_multiplier': 2.0
+        }
+    
+    def update_health_config(self, config_key: str, config_value: float) -> bool:
+        """更新健康度配置"""
+        connection = self.get_connection()
+        if not connection:
+            return False
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO health_config (config_key, config_value, updated_at) 
+                    VALUES (%s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (config_key) DO UPDATE SET 
+                    config_value = EXCLUDED.config_value,
+                    updated_at = CURRENT_TIMESTAMP
+                """, (config_key, config_value))
+                connection.commit()
+                
+                # 清除缓存，强制下次读取时刷新
+                self._health_config_cache = None
+                self._health_config_cache_time = 0
+                
+                return True
+                
+        except Exception as e:
+            print(f"更新健康度配置失败: {e}")
+            connection.rollback()
+            return False
+        finally:
+            self.return_connection(connection)
+    
     def assess_machine_status(self, metric: Dict) -> Dict:
         """
         根据监控指标评估机器运行状态
@@ -2254,6 +2970,9 @@ class DatabaseManager:
         Returns:
             包含状态分级和详细信息的字典
         """
+        # 获取健康度配置
+        config = self.get_health_config()
+        
         # 获取关键指标值，处理None值
         cpu_usr = metric.get('cpu_usr', 0) or 0
         cpu_sys = metric.get('cpu_sys', 0) or 0
@@ -2278,9 +2997,8 @@ class DatabaseManager:
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
         
-        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
-        # 1000 Mbps = 125,000 KB/s
-        max_bandwidth_kbps = 125000
+        # 计算网络使用率（使用配置的基准带宽）
+        max_bandwidth_kbps = config['network_base_bandwidth_mbps'] * 125  # Mbps转KB/s
         total_network_usage = net_rx_kbps + net_tx_kbps
         network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
@@ -2290,60 +3008,60 @@ class DatabaseManager:
         warnings = []
         
         # CPU使用率检查
-        if cpu_total >= 90:
+        if cpu_total >= config['cpu_warning_threshold']:
             status_level = "警告"
             issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
-        elif cpu_total >= 70:
+        elif cpu_total >= config['cpu_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
         
         # 内存使用率检查
-        if mem_usage_percent >= 90:
+        if mem_usage_percent >= config['memory_warning_threshold']:
             status_level = "警告"
             issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
-        elif mem_usage_percent >= 70:
+        elif mem_usage_percent >= config['memory_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
         
         # 磁盘使用率检查
-        if disk_used_percent >= 90:
+        if disk_used_percent >= config['disk_warning_threshold']:
             status_level = "警告"
             issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
-        elif disk_used_percent >= 70:
+        elif disk_used_percent >= config['disk_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
         
         # Swap使用率检查
-        if swap_usage_percent >= 50:
+        if swap_usage_percent >= config['swap_warning_threshold']:
             status_level = "警告"
             issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
-        elif swap_usage_percent >= 20:
+        elif swap_usage_percent >= config['swap_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
         # 网络使用率检查
-        if network_usage_percent >= 90:
+        if network_usage_percent >= config['network_warning_threshold']:
             status_level = "警告"
             issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
-        elif network_usage_percent >= 70:
+        elif network_usage_percent >= config['network_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
         
-        # 数据时效性检查（超过1小时无数据视为异常）
+        # 数据时效性检查
         import time
         current_timestamp = int(time.time())
         metric_timestamp = metric.get('ts', 0)
         time_diff_hours = (current_timestamp - metric_timestamp) / 3600
         
-        if time_diff_hours > 1:
+        if time_diff_hours > config['data_freshness_warning_hours']:
             status_level = "警告"
             issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
-        elif time_diff_hours > 0.3:
+        elif time_diff_hours > config['data_freshness_alert_hours']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
@@ -2364,12 +3082,12 @@ class DatabaseManager:
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours, config)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float, config: Dict[str, float] = None) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -2380,35 +3098,38 @@ class DatabaseManager:
             swap_usage: Swap使用率
             network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
+            config: 健康度配置字典
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重（调整为5维评分）
+        if config is None:
+            config = self.get_health_config()
+            
+        # 各项指标的权重
         weights = {
-            'cpu': 0.20,
-            'memory': 0.20,
-            'disk': 0.20,
-            'swap': 0.15,
-            'network': 0.15,
-            'freshness': 0.10
+            'cpu': config['cpu_weight'],
+            'memory': config['memory_weight'],
+            'disk': config['disk_weight'],
+            'swap': config['swap_weight'],
+            'network': config['network_weight'],
+            'freshness': config['freshness_weight']
         }
         
-        # 计算各项得分（0-100分）
-        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
-        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
-        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
-        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        # 计算各项得分（0-100分），基于配置的阈值进行动态调整
+        cpu_score = self._calculate_dimension_score(cpu_usage, config['cpu_alert_threshold'], config['cpu_warning_threshold'], 'cpu', config)
+        mem_score = self._calculate_dimension_score(mem_usage, config['memory_alert_threshold'], config['memory_warning_threshold'], 'memory', config)
+        disk_score = self._calculate_dimension_score(disk_usage, config['disk_alert_threshold'], config['disk_warning_threshold'], 'disk', config)
+        swap_score = self._calculate_dimension_score(swap_usage, config['swap_alert_threshold'], config['swap_warning_threshold'], 'swap', config)
         
-        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
-        # 网络使用率越高得分越高，但超过80%开始扣分
-        if network_usage <= 80:
+        # 网络使用率得分（基于配置的阈值）
+        if network_usage <= config['network_score_threshold']:
             network_score = 100
         else:
-            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_score = max(0, 100 - (network_usage - config['network_score_threshold']) * 2)
         
-        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
-        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        # 数据新鲜度得分（使用配置的衰减率）
+        freshness_score = max(0, 100 - (data_freshness * config['freshness_score_decay_rate']))
         
         # 加权平均
         total_score = (
@@ -2421,6 +3142,44 @@ class DatabaseManager:
         )
         
         return int(max(0, min(100, total_score)))
+    
+    def _calculate_dimension_score(self, usage: float, alert_threshold: float, warning_threshold: float, dimension: str, config: Dict[str, float] = None) -> float:
+        """
+        计算单个维度的健康评分（0-100分）
+        
+        Args:
+            usage: 使用率
+            alert_threshold: 提示阈值
+            warning_threshold: 警告阈值
+            dimension: 维度名称
+            config: 健康度配置字典
+            
+        Returns:
+            维度评分（0-100）
+        """
+        if config is None:
+            config = self.get_health_config()
+        
+        # 根据不同的维度调整评分策略
+        if dimension == 'swap':
+            # Swap使用率影响倍数
+            usage = min(usage * config['swap_multiplier'], 100)
+        
+        # 基于配置的阈值进行评分
+        if usage <= alert_threshold:
+            # 正常范围：基于配置的基础评分和扣分率
+            normal_penalty = usage * config['normal_range_penalty_rate']
+            return max(0, config['normal_range_score_base'] - normal_penalty)
+        elif usage <= warning_threshold:
+            # 提示范围：基于配置的基础评分和扣分率
+            alert_range = warning_threshold - alert_threshold
+            alert_penalty = (usage - alert_threshold) / alert_range * (config['normal_range_score_base'] - config['alert_range_score_base'])
+            return max(0, config['alert_range_score_base'] - alert_penalty)
+        else:
+            # 警告范围：基于配置的基础评分和扣分率
+            warning_range = 100 - warning_threshold
+            warning_penalty = (usage - warning_threshold) / warning_range * (config['alert_range_score_base'] - config['warning_range_score_base'])
+            return max(0, config['warning_range_score_base'] - warning_penalty)
 
     def get_machine_status_by_ip(self, ip: str) -> Dict:
         """
@@ -2811,6 +3570,114 @@ class DatabaseManager:
         finally:
             self.return_connection(connection)
 
+    def get_health_config(self, force_refresh: bool = False) -> Dict[str, float]:
+        """获取健康度配置"""
+        import time
+        
+        # 检查缓存是否有效
+        current_time = time.time()
+        if (not force_refresh and 
+            self._health_config_cache is not None and 
+            current_time - self._health_config_cache_time < self._health_config_cache_ttl):
+            return self._health_config_cache
+        
+        connection = self.get_connection()
+        if not connection:
+            return self._get_default_health_config()
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT config_key, config_value FROM health_config")
+                config_data = cursor.fetchall()
+                
+                config_dict = {}
+                for row in config_data:
+                    # 修复：使用索引而不是字典键访问
+                    config_dict[row[0]] = float(row[1])
+                
+                # 确保所有必要的配置项都存在
+                default_config = self._get_default_health_config()
+                for key, value in default_config.items():
+                    if key not in config_dict:
+                        config_dict[key] = value
+                
+                # 更新缓存
+                self._health_config_cache = config_dict
+                self._health_config_cache_time = current_time
+                
+                return config_dict
+                
+        except Exception as e:
+            print(f"获取健康度配置失败: {e}")
+            return self._get_default_health_config()
+        finally:
+            self.return_connection(connection)
+    
+    def _get_default_health_config(self) -> Dict[str, float]:
+        """获取默认健康度配置"""
+        return {
+            'cpu_warning_threshold': 90.0,
+            'cpu_alert_threshold': 70.0,
+            'memory_warning_threshold': 90.0,
+            'memory_alert_threshold': 70.0,
+            'disk_warning_threshold': 90.0,
+            'disk_alert_threshold': 70.0,
+            'swap_warning_threshold': 50.0,
+            'swap_alert_threshold': 20.0,
+            'network_warning_threshold': 90.0,
+            'network_alert_threshold': 70.0,
+            'data_freshness_warning_hours': 1.0,
+            'data_freshness_alert_hours': 0.3,
+            'cpu_weight': 0.20,
+            'memory_weight': 0.20,
+            'disk_weight': 0.20,
+            'swap_weight': 0.15,
+            'network_weight': 0.15,
+            'freshness_weight': 0.10,
+            'network_base_bandwidth_mbps': 1000.0,
+            'network_score_threshold': 80.0,
+            'freshness_score_decay_rate': 20.0,
+            # 新增评分配置参数
+            'normal_range_score_base': 80.0,
+            'alert_range_score_base': 50.0,
+            'warning_range_score_base': 20.0,
+            'normal_range_penalty_rate': 0.20,
+            'alert_range_penalty_rate': 0.30,
+            'warning_range_penalty_rate': 0.50,
+            'swap_multiplier': 2.0,
+            'network_penalty_multiplier': 2.0
+        }
+    
+    def update_health_config(self, config_key: str, config_value: float) -> bool:
+        """更新健康度配置"""
+        connection = self.get_connection()
+        if not connection:
+            return False
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO health_config (config_key, config_value, updated_at) 
+                    VALUES (%s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (config_key) DO UPDATE SET 
+                    config_value = EXCLUDED.config_value,
+                    updated_at = CURRENT_TIMESTAMP
+                """, (config_key, config_value))
+                connection.commit()
+                
+                # 清除缓存，强制下次读取时刷新
+                self._health_config_cache = None
+                self._health_config_cache_time = 0
+                
+                return True
+                
+        except Exception as e:
+            print(f"更新健康度配置失败: {e}")
+            connection.rollback()
+            return False
+        finally:
+            self.return_connection(connection)
+    
     def assess_machine_status(self, metric: Dict) -> Dict:
         """
         根据监控指标评估机器运行状态
@@ -2821,6 +3688,9 @@ class DatabaseManager:
         Returns:
             包含状态分级和详细信息的字典
         """
+        # 获取健康度配置
+        config = self.get_health_config()
+        
         # 获取关键指标值，处理None值
         cpu_usr = metric.get('cpu_usr', 0) or 0
         cpu_sys = metric.get('cpu_sys', 0) or 0
@@ -2845,9 +3715,8 @@ class DatabaseManager:
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
         
-        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
-        # 1000 Mbps = 125,000 KB/s
-        max_bandwidth_kbps = 125000
+        # 计算网络使用率（使用配置的基准带宽）
+        max_bandwidth_kbps = config['network_base_bandwidth_mbps'] * 125  # Mbps转KB/s
         total_network_usage = net_rx_kbps + net_tx_kbps
         network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
@@ -2857,60 +3726,60 @@ class DatabaseManager:
         warnings = []
         
         # CPU使用率检查
-        if cpu_total >= 90:
+        if cpu_total >= config['cpu_warning_threshold']:
             status_level = "警告"
             issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
-        elif cpu_total >= 70:
+        elif cpu_total >= config['cpu_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
         
         # 内存使用率检查
-        if mem_usage_percent >= 90:
+        if mem_usage_percent >= config['memory_warning_threshold']:
             status_level = "警告"
             issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
-        elif mem_usage_percent >= 70:
+        elif mem_usage_percent >= config['memory_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
         
         # 磁盘使用率检查
-        if disk_used_percent >= 90:
+        if disk_used_percent >= config['disk_warning_threshold']:
             status_level = "警告"
             issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
-        elif disk_used_percent >= 70:
+        elif disk_used_percent >= config['disk_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
         
         # Swap使用率检查
-        if swap_usage_percent >= 50:
+        if swap_usage_percent >= config['swap_warning_threshold']:
             status_level = "警告"
             issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
-        elif swap_usage_percent >= 20:
+        elif swap_usage_percent >= config['swap_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
         # 网络使用率检查
-        if network_usage_percent >= 90:
+        if network_usage_percent >= config['network_warning_threshold']:
             status_level = "警告"
             issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
-        elif network_usage_percent >= 70:
+        elif network_usage_percent >= config['network_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
         
-        # 数据时效性检查（超过1小时无数据视为异常）
+        # 数据时效性检查
         import time
         current_timestamp = int(time.time())
         metric_timestamp = metric.get('ts', 0)
         time_diff_hours = (current_timestamp - metric_timestamp) / 3600
         
-        if time_diff_hours > 1:
+        if time_diff_hours > config['data_freshness_warning_hours']:
             status_level = "警告"
             issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
-        elif time_diff_hours > 0.3:
+        elif time_diff_hours > config['data_freshness_alert_hours']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
@@ -2931,12 +3800,12 @@ class DatabaseManager:
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours, config)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float, config: Dict[str, float] = None) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -2947,35 +3816,38 @@ class DatabaseManager:
             swap_usage: Swap使用率
             network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
+            config: 健康度配置字典
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重（调整为5维评分）
+        if config is None:
+            config = self.get_health_config()
+            
+        # 各项指标的权重
         weights = {
-            'cpu': 0.20,
-            'memory': 0.20,
-            'disk': 0.20,
-            'swap': 0.15,
-            'network': 0.15,
-            'freshness': 0.10
+            'cpu': config['cpu_weight'],
+            'memory': config['memory_weight'],
+            'disk': config['disk_weight'],
+            'swap': config['swap_weight'],
+            'network': config['network_weight'],
+            'freshness': config['freshness_weight']
         }
         
-        # 计算各项得分（0-100分）
-        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
-        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
-        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
-        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        # 计算各项得分（0-100分），基于配置的阈值进行动态调整
+        cpu_score = self._calculate_dimension_score(cpu_usage, config['cpu_alert_threshold'], config['cpu_warning_threshold'], 'cpu', config)
+        mem_score = self._calculate_dimension_score(mem_usage, config['memory_alert_threshold'], config['memory_warning_threshold'], 'memory', config)
+        disk_score = self._calculate_dimension_score(disk_usage, config['disk_alert_threshold'], config['disk_warning_threshold'], 'disk', config)
+        swap_score = self._calculate_dimension_score(swap_usage, config['swap_alert_threshold'], config['swap_warning_threshold'], 'swap', config)
         
-        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
-        # 网络使用率越高得分越高，但超过80%开始扣分
-        if network_usage <= 80:
+        # 网络使用率得分（基于配置的阈值）
+        if network_usage <= config['network_score_threshold']:
             network_score = 100
         else:
-            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_score = max(0, 100 - (network_usage - config['network_score_threshold']) * 2)
         
-        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
-        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        # 数据新鲜度得分（使用配置的衰减率）
+        freshness_score = max(0, 100 - (data_freshness * config['freshness_score_decay_rate']))
         
         # 加权平均
         total_score = (
@@ -2988,6 +3860,44 @@ class DatabaseManager:
         )
         
         return int(max(0, min(100, total_score)))
+    
+    def _calculate_dimension_score(self, usage: float, alert_threshold: float, warning_threshold: float, dimension: str, config: Dict[str, float] = None) -> float:
+        """
+        计算单个维度的健康评分（0-100分）
+        
+        Args:
+            usage: 使用率
+            alert_threshold: 提示阈值
+            warning_threshold: 警告阈值
+            dimension: 维度名称
+            config: 健康度配置字典
+            
+        Returns:
+            维度评分（0-100）
+        """
+        if config is None:
+            config = self.get_health_config()
+        
+        # 根据不同的维度调整评分策略
+        if dimension == 'swap':
+            # Swap使用率影响倍数
+            usage = min(usage * config['swap_multiplier'], 100)
+        
+        # 基于配置的阈值进行评分
+        if usage <= alert_threshold:
+            # 正常范围：基于配置的基础评分和扣分率
+            normal_penalty = usage * config['normal_range_penalty_rate']
+            return max(0, config['normal_range_score_base'] - normal_penalty)
+        elif usage <= warning_threshold:
+            # 提示范围：基于配置的基础评分和扣分率
+            alert_range = warning_threshold - alert_threshold
+            alert_penalty = (usage - alert_threshold) / alert_range * (config['normal_range_score_base'] - config['alert_range_score_base'])
+            return max(0, config['alert_range_score_base'] - alert_penalty)
+        else:
+            # 警告范围：基于配置的基础评分和扣分率
+            warning_range = 100 - warning_threshold
+            warning_penalty = (usage - warning_threshold) / warning_range * (config['alert_range_score_base'] - config['warning_range_score_base'])
+            return max(0, config['warning_range_score_base'] - warning_penalty)
 
     def get_machine_status_by_ip(self, ip: str) -> Dict:
         """
@@ -3355,6 +4265,114 @@ class DatabaseManager:
         finally:
             self.return_connection(connection)
 
+    def get_health_config(self, force_refresh: bool = False) -> Dict[str, float]:
+        """获取健康度配置"""
+        import time
+        
+        # 检查缓存是否有效
+        current_time = time.time()
+        if (not force_refresh and 
+            self._health_config_cache is not None and 
+            current_time - self._health_config_cache_time < self._health_config_cache_ttl):
+            return self._health_config_cache
+        
+        connection = self.get_connection()
+        if not connection:
+            return self._get_default_health_config()
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT config_key, config_value FROM health_config")
+                config_data = cursor.fetchall()
+                
+                config_dict = {}
+                for row in config_data:
+                    # 修复：使用索引而不是字典键访问
+                    config_dict[row[0]] = float(row[1])
+                
+                # 确保所有必要的配置项都存在
+                default_config = self._get_default_health_config()
+                for key, value in default_config.items():
+                    if key not in config_dict:
+                        config_dict[key] = value
+                
+                # 更新缓存
+                self._health_config_cache = config_dict
+                self._health_config_cache_time = current_time
+                
+                return config_dict
+                
+        except Exception as e:
+            print(f"获取健康度配置失败: {e}")
+            return self._get_default_health_config()
+        finally:
+            self.return_connection(connection)
+    
+    def _get_default_health_config(self) -> Dict[str, float]:
+        """获取默认健康度配置"""
+        return {
+            'cpu_warning_threshold': 90.0,
+            'cpu_alert_threshold': 70.0,
+            'memory_warning_threshold': 90.0,
+            'memory_alert_threshold': 70.0,
+            'disk_warning_threshold': 90.0,
+            'disk_alert_threshold': 70.0,
+            'swap_warning_threshold': 50.0,
+            'swap_alert_threshold': 20.0,
+            'network_warning_threshold': 90.0,
+            'network_alert_threshold': 70.0,
+            'data_freshness_warning_hours': 1.0,
+            'data_freshness_alert_hours': 0.3,
+            'cpu_weight': 0.20,
+            'memory_weight': 0.20,
+            'disk_weight': 0.20,
+            'swap_weight': 0.15,
+            'network_weight': 0.15,
+            'freshness_weight': 0.10,
+            'network_base_bandwidth_mbps': 1000.0,
+            'network_score_threshold': 80.0,
+            'freshness_score_decay_rate': 20.0,
+            # 新增评分配置参数
+            'normal_range_score_base': 80.0,
+            'alert_range_score_base': 50.0,
+            'warning_range_score_base': 20.0,
+            'normal_range_penalty_rate': 0.20,
+            'alert_range_penalty_rate': 0.30,
+            'warning_range_penalty_rate': 0.50,
+            'swap_multiplier': 2.0,
+            'network_penalty_multiplier': 2.0
+        }
+    
+    def update_health_config(self, config_key: str, config_value: float) -> bool:
+        """更新健康度配置"""
+        connection = self.get_connection()
+        if not connection:
+            return False
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO health_config (config_key, config_value, updated_at) 
+                    VALUES (%s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (config_key) DO UPDATE SET 
+                    config_value = EXCLUDED.config_value,
+                    updated_at = CURRENT_TIMESTAMP
+                """, (config_key, config_value))
+                connection.commit()
+                
+                # 清除缓存，强制下次读取时刷新
+                self._health_config_cache = None
+                self._health_config_cache_time = 0
+                
+                return True
+                
+        except Exception as e:
+            print(f"更新健康度配置失败: {e}")
+            connection.rollback()
+            return False
+        finally:
+            self.return_connection(connection)
+    
     def assess_machine_status(self, metric: Dict) -> Dict:
         """
         根据监控指标评估机器运行状态
@@ -3365,6 +4383,9 @@ class DatabaseManager:
         Returns:
             包含状态分级和详细信息的字典
         """
+        # 获取健康度配置
+        config = self.get_health_config()
+        
         # 获取关键指标值，处理None值
         cpu_usr = metric.get('cpu_usr', 0) or 0
         cpu_sys = metric.get('cpu_sys', 0) or 0
@@ -3389,9 +4410,8 @@ class DatabaseManager:
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
         
-        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
-        # 1000 Mbps = 125,000 KB/s
-        max_bandwidth_kbps = 125000
+        # 计算网络使用率（使用配置的基准带宽）
+        max_bandwidth_kbps = config['network_base_bandwidth_mbps'] * 125  # Mbps转KB/s
         total_network_usage = net_rx_kbps + net_tx_kbps
         network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
@@ -3401,60 +4421,60 @@ class DatabaseManager:
         warnings = []
         
         # CPU使用率检查
-        if cpu_total >= 90:
+        if cpu_total >= config['cpu_warning_threshold']:
             status_level = "警告"
             issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
-        elif cpu_total >= 70:
+        elif cpu_total >= config['cpu_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
         
         # 内存使用率检查
-        if mem_usage_percent >= 90:
+        if mem_usage_percent >= config['memory_warning_threshold']:
             status_level = "警告"
             issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
-        elif mem_usage_percent >= 70:
+        elif mem_usage_percent >= config['memory_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
         
         # 磁盘使用率检查
-        if disk_used_percent >= 90:
+        if disk_used_percent >= config['disk_warning_threshold']:
             status_level = "警告"
             issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
-        elif disk_used_percent >= 70:
+        elif disk_used_percent >= config['disk_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
         
         # Swap使用率检查
-        if swap_usage_percent >= 50:
+        if swap_usage_percent >= config['swap_warning_threshold']:
             status_level = "警告"
             issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
-        elif swap_usage_percent >= 20:
+        elif swap_usage_percent >= config['swap_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
         # 网络使用率检查
-        if network_usage_percent >= 90:
+        if network_usage_percent >= config['network_warning_threshold']:
             status_level = "警告"
             issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
-        elif network_usage_percent >= 70:
+        elif network_usage_percent >= config['network_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
         
-        # 数据时效性检查（超过1小时无数据视为异常）
+        # 数据时效性检查
         import time
         current_timestamp = int(time.time())
         metric_timestamp = metric.get('ts', 0)
         time_diff_hours = (current_timestamp - metric_timestamp) / 3600
         
-        if time_diff_hours > 1:
+        if time_diff_hours > config['data_freshness_warning_hours']:
             status_level = "警告"
             issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
-        elif time_diff_hours > 0.3:
+        elif time_diff_hours > config['data_freshness_alert_hours']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
@@ -3475,12 +4495,12 @@ class DatabaseManager:
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours, config)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float, config: Dict[str, float] = None) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -3491,35 +4511,38 @@ class DatabaseManager:
             swap_usage: Swap使用率
             network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
+            config: 健康度配置字典
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重（调整为5维评分）
+        if config is None:
+            config = self.get_health_config()
+            
+        # 各项指标的权重
         weights = {
-            'cpu': 0.20,
-            'memory': 0.20,
-            'disk': 0.20,
-            'swap': 0.15,
-            'network': 0.15,
-            'freshness': 0.10
+            'cpu': config['cpu_weight'],
+            'memory': config['memory_weight'],
+            'disk': config['disk_weight'],
+            'swap': config['swap_weight'],
+            'network': config['network_weight'],
+            'freshness': config['freshness_weight']
         }
         
-        # 计算各项得分（0-100分）
-        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
-        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
-        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
-        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        # 计算各项得分（0-100分），基于配置的阈值进行动态调整
+        cpu_score = self._calculate_dimension_score(cpu_usage, config['cpu_alert_threshold'], config['cpu_warning_threshold'], 'cpu', config)
+        mem_score = self._calculate_dimension_score(mem_usage, config['memory_alert_threshold'], config['memory_warning_threshold'], 'memory', config)
+        disk_score = self._calculate_dimension_score(disk_usage, config['disk_alert_threshold'], config['disk_warning_threshold'], 'disk', config)
+        swap_score = self._calculate_dimension_score(swap_usage, config['swap_alert_threshold'], config['swap_warning_threshold'], 'swap', config)
         
-        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
-        # 网络使用率越高得分越高，但超过80%开始扣分
-        if network_usage <= 80:
+        # 网络使用率得分（基于配置的阈值）
+        if network_usage <= config['network_score_threshold']:
             network_score = 100
         else:
-            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_score = max(0, 100 - (network_usage - config['network_score_threshold']) * 2)
         
-        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
-        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        # 数据新鲜度得分（使用配置的衰减率）
+        freshness_score = max(0, 100 - (data_freshness * config['freshness_score_decay_rate']))
         
         # 加权平均
         total_score = (
@@ -3532,6 +4555,44 @@ class DatabaseManager:
         )
         
         return int(max(0, min(100, total_score)))
+    
+    def _calculate_dimension_score(self, usage: float, alert_threshold: float, warning_threshold: float, dimension: str, config: Dict[str, float] = None) -> float:
+        """
+        计算单个维度的健康评分（0-100分）
+        
+        Args:
+            usage: 使用率
+            alert_threshold: 提示阈值
+            warning_threshold: 警告阈值
+            dimension: 维度名称
+            config: 健康度配置字典
+            
+        Returns:
+            维度评分（0-100）
+        """
+        if config is None:
+            config = self.get_health_config()
+        
+        # 根据不同的维度调整评分策略
+        if dimension == 'swap':
+            # Swap使用率影响倍数
+            usage = min(usage * config['swap_multiplier'], 100)
+        
+        # 基于配置的阈值进行评分
+        if usage <= alert_threshold:
+            # 正常范围：基于配置的基础评分和扣分率
+            normal_penalty = usage * config['normal_range_penalty_rate']
+            return max(0, config['normal_range_score_base'] - normal_penalty)
+        elif usage <= warning_threshold:
+            # 提示范围：基于配置的基础评分和扣分率
+            alert_range = warning_threshold - alert_threshold
+            alert_penalty = (usage - alert_threshold) / alert_range * (config['normal_range_score_base'] - config['alert_range_score_base'])
+            return max(0, config['alert_range_score_base'] - alert_penalty)
+        else:
+            # 警告范围：基于配置的基础评分和扣分率
+            warning_range = 100 - warning_threshold
+            warning_penalty = (usage - warning_threshold) / warning_range * (config['alert_range_score_base'] - config['warning_range_score_base'])
+            return max(0, config['warning_range_score_base'] - warning_penalty)
 
     def get_machine_status_by_ip(self, ip: str) -> Dict:
         """
@@ -3893,6 +4954,114 @@ class DatabaseManager:
         finally:
             self.return_connection(connection)
 
+    def get_health_config(self, force_refresh: bool = False) -> Dict[str, float]:
+        """获取健康度配置"""
+        import time
+        
+        # 检查缓存是否有效
+        current_time = time.time()
+        if (not force_refresh and 
+            self._health_config_cache is not None and 
+            current_time - self._health_config_cache_time < self._health_config_cache_ttl):
+            return self._health_config_cache
+        
+        connection = self.get_connection()
+        if not connection:
+            return self._get_default_health_config()
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT config_key, config_value FROM health_config")
+                config_data = cursor.fetchall()
+                
+                config_dict = {}
+                for row in config_data:
+                    # 修复：使用索引而不是字典键访问
+                    config_dict[row[0]] = float(row[1])
+                
+                # 确保所有必要的配置项都存在
+                default_config = self._get_default_health_config()
+                for key, value in default_config.items():
+                    if key not in config_dict:
+                        config_dict[key] = value
+                
+                # 更新缓存
+                self._health_config_cache = config_dict
+                self._health_config_cache_time = current_time
+                
+                return config_dict
+                
+        except Exception as e:
+            print(f"获取健康度配置失败: {e}")
+            return self._get_default_health_config()
+        finally:
+            self.return_connection(connection)
+    
+    def _get_default_health_config(self) -> Dict[str, float]:
+        """获取默认健康度配置"""
+        return {
+            'cpu_warning_threshold': 90.0,
+            'cpu_alert_threshold': 70.0,
+            'memory_warning_threshold': 90.0,
+            'memory_alert_threshold': 70.0,
+            'disk_warning_threshold': 90.0,
+            'disk_alert_threshold': 70.0,
+            'swap_warning_threshold': 50.0,
+            'swap_alert_threshold': 20.0,
+            'network_warning_threshold': 90.0,
+            'network_alert_threshold': 70.0,
+            'data_freshness_warning_hours': 1.0,
+            'data_freshness_alert_hours': 0.3,
+            'cpu_weight': 0.20,
+            'memory_weight': 0.20,
+            'disk_weight': 0.20,
+            'swap_weight': 0.15,
+            'network_weight': 0.15,
+            'freshness_weight': 0.10,
+            'network_base_bandwidth_mbps': 1000.0,
+            'network_score_threshold': 80.0,
+            'freshness_score_decay_rate': 20.0,
+            # 新增评分配置参数
+            'normal_range_score_base': 80.0,
+            'alert_range_score_base': 50.0,
+            'warning_range_score_base': 20.0,
+            'normal_range_penalty_rate': 0.20,
+            'alert_range_penalty_rate': 0.30,
+            'warning_range_penalty_rate': 0.50,
+            'swap_multiplier': 2.0,
+            'network_penalty_multiplier': 2.0
+        }
+    
+    def update_health_config(self, config_key: str, config_value: float) -> bool:
+        """更新健康度配置"""
+        connection = self.get_connection()
+        if not connection:
+            return False
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO health_config (config_key, config_value, updated_at) 
+                    VALUES (%s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (config_key) DO UPDATE SET 
+                    config_value = EXCLUDED.config_value,
+                    updated_at = CURRENT_TIMESTAMP
+                """, (config_key, config_value))
+                connection.commit()
+                
+                # 清除缓存，强制下次读取时刷新
+                self._health_config_cache = None
+                self._health_config_cache_time = 0
+                
+                return True
+                
+        except Exception as e:
+            print(f"更新健康度配置失败: {e}")
+            connection.rollback()
+            return False
+        finally:
+            self.return_connection(connection)
+    
     def assess_machine_status(self, metric: Dict) -> Dict:
         """
         根据监控指标评估机器运行状态
@@ -3903,6 +5072,9 @@ class DatabaseManager:
         Returns:
             包含状态分级和详细信息的字典
         """
+        # 获取健康度配置
+        config = self.get_health_config()
+        
         # 获取关键指标值，处理None值
         cpu_usr = metric.get('cpu_usr', 0) or 0
         cpu_sys = metric.get('cpu_sys', 0) or 0
@@ -3927,9 +5099,8 @@ class DatabaseManager:
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
         
-        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
-        # 1000 Mbps = 125,000 KB/s
-        max_bandwidth_kbps = 125000
+        # 计算网络使用率（使用配置的基准带宽）
+        max_bandwidth_kbps = config['network_base_bandwidth_mbps'] * 125  # Mbps转KB/s
         total_network_usage = net_rx_kbps + net_tx_kbps
         network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
@@ -3939,60 +5110,60 @@ class DatabaseManager:
         warnings = []
         
         # CPU使用率检查
-        if cpu_total >= 90:
+        if cpu_total >= config['cpu_warning_threshold']:
             status_level = "警告"
             issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
-        elif cpu_total >= 70:
+        elif cpu_total >= config['cpu_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
         
         # 内存使用率检查
-        if mem_usage_percent >= 90:
+        if mem_usage_percent >= config['memory_warning_threshold']:
             status_level = "警告"
             issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
-        elif mem_usage_percent >= 70:
+        elif mem_usage_percent >= config['memory_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
         
         # 磁盘使用率检查
-        if disk_used_percent >= 90:
+        if disk_used_percent >= config['disk_warning_threshold']:
             status_level = "警告"
             issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
-        elif disk_used_percent >= 70:
+        elif disk_used_percent >= config['disk_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
         
         # Swap使用率检查
-        if swap_usage_percent >= 50:
+        if swap_usage_percent >= config['swap_warning_threshold']:
             status_level = "警告"
             issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
-        elif swap_usage_percent >= 20:
+        elif swap_usage_percent >= config['swap_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
         # 网络使用率检查
-        if network_usage_percent >= 90:
+        if network_usage_percent >= config['network_warning_threshold']:
             status_level = "警告"
             issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
-        elif network_usage_percent >= 70:
+        elif network_usage_percent >= config['network_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
         
-        # 数据时效性检查（超过1小时无数据视为异常）
+        # 数据时效性检查
         import time
         current_timestamp = int(time.time())
         metric_timestamp = metric.get('ts', 0)
         time_diff_hours = (current_timestamp - metric_timestamp) / 3600
         
-        if time_diff_hours > 1:
+        if time_diff_hours > config['data_freshness_warning_hours']:
             status_level = "警告"
             issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
-        elif time_diff_hours > 0.3:
+        elif time_diff_hours > config['data_freshness_alert_hours']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
@@ -4013,12 +5184,12 @@ class DatabaseManager:
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours, config)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float, config: Dict[str, float] = None) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -4029,35 +5200,38 @@ class DatabaseManager:
             swap_usage: Swap使用率
             network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
+            config: 健康度配置字典
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重（调整为5维评分）
+        if config is None:
+            config = self.get_health_config()
+            
+        # 各项指标的权重
         weights = {
-            'cpu': 0.20,
-            'memory': 0.20,
-            'disk': 0.20,
-            'swap': 0.15,
-            'network': 0.15,
-            'freshness': 0.10
+            'cpu': config['cpu_weight'],
+            'memory': config['memory_weight'],
+            'disk': config['disk_weight'],
+            'swap': config['swap_weight'],
+            'network': config['network_weight'],
+            'freshness': config['freshness_weight']
         }
         
-        # 计算各项得分（0-100分）
-        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
-        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
-        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
-        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        # 计算各项得分（0-100分），基于配置的阈值进行动态调整
+        cpu_score = self._calculate_dimension_score(cpu_usage, config['cpu_alert_threshold'], config['cpu_warning_threshold'], 'cpu', config)
+        mem_score = self._calculate_dimension_score(mem_usage, config['memory_alert_threshold'], config['memory_warning_threshold'], 'memory', config)
+        disk_score = self._calculate_dimension_score(disk_usage, config['disk_alert_threshold'], config['disk_warning_threshold'], 'disk', config)
+        swap_score = self._calculate_dimension_score(swap_usage, config['swap_alert_threshold'], config['swap_warning_threshold'], 'swap', config)
         
-        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
-        # 网络使用率越高得分越高，但超过80%开始扣分
-        if network_usage <= 80:
+        # 网络使用率得分（基于配置的阈值）
+        if network_usage <= config['network_score_threshold']:
             network_score = 100
         else:
-            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_score = max(0, 100 - (network_usage - config['network_score_threshold']) * 2)
         
-        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
-        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        # 数据新鲜度得分（使用配置的衰减率）
+        freshness_score = max(0, 100 - (data_freshness * config['freshness_score_decay_rate']))
         
         # 加权平均
         total_score = (
@@ -4070,6 +5244,44 @@ class DatabaseManager:
         )
         
         return int(max(0, min(100, total_score)))
+    
+    def _calculate_dimension_score(self, usage: float, alert_threshold: float, warning_threshold: float, dimension: str, config: Dict[str, float] = None) -> float:
+        """
+        计算单个维度的健康评分（0-100分）
+        
+        Args:
+            usage: 使用率
+            alert_threshold: 提示阈值
+            warning_threshold: 警告阈值
+            dimension: 维度名称
+            config: 健康度配置字典
+            
+        Returns:
+            维度评分（0-100）
+        """
+        if config is None:
+            config = self.get_health_config()
+        
+        # 根据不同的维度调整评分策略
+        if dimension == 'swap':
+            # Swap使用率影响倍数
+            usage = min(usage * config['swap_multiplier'], 100)
+        
+        # 基于配置的阈值进行评分
+        if usage <= alert_threshold:
+            # 正常范围：基于配置的基础评分和扣分率
+            normal_penalty = usage * config['normal_range_penalty_rate']
+            return max(0, config['normal_range_score_base'] - normal_penalty)
+        elif usage <= warning_threshold:
+            # 提示范围：基于配置的基础评分和扣分率
+            alert_range = warning_threshold - alert_threshold
+            alert_penalty = (usage - alert_threshold) / alert_range * (config['normal_range_score_base'] - config['alert_range_score_base'])
+            return max(0, config['alert_range_score_base'] - alert_penalty)
+        else:
+            # 警告范围：基于配置的基础评分和扣分率
+            warning_range = 100 - warning_threshold
+            warning_penalty = (usage - warning_threshold) / warning_range * (config['alert_range_score_base'] - config['warning_range_score_base'])
+            return max(0, config['warning_range_score_base'] - warning_penalty)
 
     def get_machine_status_by_ip(self, ip: str) -> Dict:
         """
@@ -4435,6 +5647,114 @@ class DatabaseManager:
         finally:
             self.return_connection(connection)
 
+    def get_health_config(self, force_refresh: bool = False) -> Dict[str, float]:
+        """获取健康度配置"""
+        import time
+        
+        # 检查缓存是否有效
+        current_time = time.time()
+        if (not force_refresh and 
+            self._health_config_cache is not None and 
+            current_time - self._health_config_cache_time < self._health_config_cache_ttl):
+            return self._health_config_cache
+        
+        connection = self.get_connection()
+        if not connection:
+            return self._get_default_health_config()
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT config_key, config_value FROM health_config")
+                config_data = cursor.fetchall()
+                
+                config_dict = {}
+                for row in config_data:
+                    # 修复：使用索引而不是字典键访问
+                    config_dict[row[0]] = float(row[1])
+                
+                # 确保所有必要的配置项都存在
+                default_config = self._get_default_health_config()
+                for key, value in default_config.items():
+                    if key not in config_dict:
+                        config_dict[key] = value
+                
+                # 更新缓存
+                self._health_config_cache = config_dict
+                self._health_config_cache_time = current_time
+                
+                return config_dict
+                
+        except Exception as e:
+            print(f"获取健康度配置失败: {e}")
+            return self._get_default_health_config()
+        finally:
+            self.return_connection(connection)
+    
+    def _get_default_health_config(self) -> Dict[str, float]:
+        """获取默认健康度配置"""
+        return {
+            'cpu_warning_threshold': 90.0,
+            'cpu_alert_threshold': 70.0,
+            'memory_warning_threshold': 90.0,
+            'memory_alert_threshold': 70.0,
+            'disk_warning_threshold': 90.0,
+            'disk_alert_threshold': 70.0,
+            'swap_warning_threshold': 50.0,
+            'swap_alert_threshold': 20.0,
+            'network_warning_threshold': 90.0,
+            'network_alert_threshold': 70.0,
+            'data_freshness_warning_hours': 1.0,
+            'data_freshness_alert_hours': 0.3,
+            'cpu_weight': 0.20,
+            'memory_weight': 0.20,
+            'disk_weight': 0.20,
+            'swap_weight': 0.15,
+            'network_weight': 0.15,
+            'freshness_weight': 0.10,
+            'network_base_bandwidth_mbps': 1000.0,
+            'network_score_threshold': 80.0,
+            'freshness_score_decay_rate': 20.0,
+            # 新增评分配置参数
+            'normal_range_score_base': 80.0,
+            'alert_range_score_base': 50.0,
+            'warning_range_score_base': 20.0,
+            'normal_range_penalty_rate': 0.20,
+            'alert_range_penalty_rate': 0.30,
+            'warning_range_penalty_rate': 0.50,
+            'swap_multiplier': 2.0,
+            'network_penalty_multiplier': 2.0
+        }
+    
+    def update_health_config(self, config_key: str, config_value: float) -> bool:
+        """更新健康度配置"""
+        connection = self.get_connection()
+        if not connection:
+            return False
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO health_config (config_key, config_value, updated_at) 
+                    VALUES (%s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (config_key) DO UPDATE SET 
+                    config_value = EXCLUDED.config_value,
+                    updated_at = CURRENT_TIMESTAMP
+                """, (config_key, config_value))
+                connection.commit()
+                
+                # 清除缓存，强制下次读取时刷新
+                self._health_config_cache = None
+                self._health_config_cache_time = 0
+                
+                return True
+                
+        except Exception as e:
+            print(f"更新健康度配置失败: {e}")
+            connection.rollback()
+            return False
+        finally:
+            self.return_connection(connection)
+    
     def assess_machine_status(self, metric: Dict) -> Dict:
         """
         根据监控指标评估机器运行状态
@@ -4445,6 +5765,9 @@ class DatabaseManager:
         Returns:
             包含状态分级和详细信息的字典
         """
+        # 获取健康度配置
+        config = self.get_health_config()
+        
         # 获取关键指标值，处理None值
         cpu_usr = metric.get('cpu_usr', 0) or 0
         cpu_sys = metric.get('cpu_sys', 0) or 0
@@ -4469,9 +5792,8 @@ class DatabaseManager:
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
         
-        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
-        # 1000 Mbps = 125,000 KB/s
-        max_bandwidth_kbps = 125000
+        # 计算网络使用率（使用配置的基准带宽）
+        max_bandwidth_kbps = config['network_base_bandwidth_mbps'] * 125  # Mbps转KB/s
         total_network_usage = net_rx_kbps + net_tx_kbps
         network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
@@ -4481,60 +5803,60 @@ class DatabaseManager:
         warnings = []
         
         # CPU使用率检查
-        if cpu_total >= 90:
+        if cpu_total >= config['cpu_warning_threshold']:
             status_level = "警告"
             issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
-        elif cpu_total >= 70:
+        elif cpu_total >= config['cpu_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
         
         # 内存使用率检查
-        if mem_usage_percent >= 90:
+        if mem_usage_percent >= config['memory_warning_threshold']:
             status_level = "警告"
             issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
-        elif mem_usage_percent >= 70:
+        elif mem_usage_percent >= config['memory_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
         
         # 磁盘使用率检查
-        if disk_used_percent >= 90:
+        if disk_used_percent >= config['disk_warning_threshold']:
             status_level = "警告"
             issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
-        elif disk_used_percent >= 70:
+        elif disk_used_percent >= config['disk_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
         
         # Swap使用率检查
-        if swap_usage_percent >= 50:
+        if swap_usage_percent >= config['swap_warning_threshold']:
             status_level = "警告"
             issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
-        elif swap_usage_percent >= 20:
+        elif swap_usage_percent >= config['swap_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
         # 网络使用率检查
-        if network_usage_percent >= 90:
+        if network_usage_percent >= config['network_warning_threshold']:
             status_level = "警告"
             issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
-        elif network_usage_percent >= 70:
+        elif network_usage_percent >= config['network_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
         
-        # 数据时效性检查（超过1小时无数据视为异常）
+        # 数据时效性检查
         import time
         current_timestamp = int(time.time())
         metric_timestamp = metric.get('ts', 0)
         time_diff_hours = (current_timestamp - metric_timestamp) / 3600
         
-        if time_diff_hours > 1:
+        if time_diff_hours > config['data_freshness_warning_hours']:
             status_level = "警告"
             issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
-        elif time_diff_hours > 0.3:
+        elif time_diff_hours > config['data_freshness_alert_hours']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
@@ -4555,12 +5877,12 @@ class DatabaseManager:
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours, config)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float, config: Dict[str, float] = None) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -4571,35 +5893,38 @@ class DatabaseManager:
             swap_usage: Swap使用率
             network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
+            config: 健康度配置字典
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重（调整为5维评分）
+        if config is None:
+            config = self.get_health_config()
+            
+        # 各项指标的权重
         weights = {
-            'cpu': 0.20,
-            'memory': 0.20,
-            'disk': 0.20,
-            'swap': 0.15,
-            'network': 0.15,
-            'freshness': 0.10
+            'cpu': config['cpu_weight'],
+            'memory': config['memory_weight'],
+            'disk': config['disk_weight'],
+            'swap': config['swap_weight'],
+            'network': config['network_weight'],
+            'freshness': config['freshness_weight']
         }
         
-        # 计算各项得分（0-100分）
-        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
-        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
-        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
-        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        # 计算各项得分（0-100分），基于配置的阈值进行动态调整
+        cpu_score = self._calculate_dimension_score(cpu_usage, config['cpu_alert_threshold'], config['cpu_warning_threshold'], 'cpu', config)
+        mem_score = self._calculate_dimension_score(mem_usage, config['memory_alert_threshold'], config['memory_warning_threshold'], 'memory', config)
+        disk_score = self._calculate_dimension_score(disk_usage, config['disk_alert_threshold'], config['disk_warning_threshold'], 'disk', config)
+        swap_score = self._calculate_dimension_score(swap_usage, config['swap_alert_threshold'], config['swap_warning_threshold'], 'swap', config)
         
-        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
-        # 网络使用率越高得分越高，但超过80%开始扣分
-        if network_usage <= 80:
+        # 网络使用率得分（基于配置的阈值）
+        if network_usage <= config['network_score_threshold']:
             network_score = 100
         else:
-            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_score = max(0, 100 - (network_usage - config['network_score_threshold']) * 2)
         
-        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
-        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        # 数据新鲜度得分（使用配置的衰减率）
+        freshness_score = max(0, 100 - (data_freshness * config['freshness_score_decay_rate']))
         
         # 加权平均
         total_score = (
@@ -4612,6 +5937,44 @@ class DatabaseManager:
         )
         
         return int(max(0, min(100, total_score)))
+    
+    def _calculate_dimension_score(self, usage: float, alert_threshold: float, warning_threshold: float, dimension: str, config: Dict[str, float] = None) -> float:
+        """
+        计算单个维度的健康评分（0-100分）
+        
+        Args:
+            usage: 使用率
+            alert_threshold: 提示阈值
+            warning_threshold: 警告阈值
+            dimension: 维度名称
+            config: 健康度配置字典
+            
+        Returns:
+            维度评分（0-100）
+        """
+        if config is None:
+            config = self.get_health_config()
+        
+        # 根据不同的维度调整评分策略
+        if dimension == 'swap':
+            # Swap使用率影响倍数
+            usage = min(usage * config['swap_multiplier'], 100)
+        
+        # 基于配置的阈值进行评分
+        if usage <= alert_threshold:
+            # 正常范围：基于配置的基础评分和扣分率
+            normal_penalty = usage * config['normal_range_penalty_rate']
+            return max(0, config['normal_range_score_base'] - normal_penalty)
+        elif usage <= warning_threshold:
+            # 提示范围：基于配置的基础评分和扣分率
+            alert_range = warning_threshold - alert_threshold
+            alert_penalty = (usage - alert_threshold) / alert_range * (config['normal_range_score_base'] - config['alert_range_score_base'])
+            return max(0, config['alert_range_score_base'] - alert_penalty)
+        else:
+            # 警告范围：基于配置的基础评分和扣分率
+            warning_range = 100 - warning_threshold
+            warning_penalty = (usage - warning_threshold) / warning_range * (config['alert_range_score_base'] - config['warning_range_score_base'])
+            return max(0, config['warning_range_score_base'] - warning_penalty)
 
     def get_machine_status_by_ip(self, ip: str) -> Dict:
         """
@@ -4978,6 +6341,114 @@ class DatabaseManager:
         finally:
             self.return_connection(connection)
 
+    def get_health_config(self, force_refresh: bool = False) -> Dict[str, float]:
+        """获取健康度配置"""
+        import time
+        
+        # 检查缓存是否有效
+        current_time = time.time()
+        if (not force_refresh and 
+            self._health_config_cache is not None and 
+            current_time - self._health_config_cache_time < self._health_config_cache_ttl):
+            return self._health_config_cache
+        
+        connection = self.get_connection()
+        if not connection:
+            return self._get_default_health_config()
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT config_key, config_value FROM health_config")
+                config_data = cursor.fetchall()
+                
+                config_dict = {}
+                for row in config_data:
+                    # 修复：使用索引而不是字典键访问
+                    config_dict[row[0]] = float(row[1])
+                
+                # 确保所有必要的配置项都存在
+                default_config = self._get_default_health_config()
+                for key, value in default_config.items():
+                    if key not in config_dict:
+                        config_dict[key] = value
+                
+                # 更新缓存
+                self._health_config_cache = config_dict
+                self._health_config_cache_time = current_time
+                
+                return config_dict
+                
+        except Exception as e:
+            print(f"获取健康度配置失败: {e}")
+            return self._get_default_health_config()
+        finally:
+            self.return_connection(connection)
+    
+    def _get_default_health_config(self) -> Dict[str, float]:
+        """获取默认健康度配置"""
+        return {
+            'cpu_warning_threshold': 90.0,
+            'cpu_alert_threshold': 70.0,
+            'memory_warning_threshold': 90.0,
+            'memory_alert_threshold': 70.0,
+            'disk_warning_threshold': 90.0,
+            'disk_alert_threshold': 70.0,
+            'swap_warning_threshold': 50.0,
+            'swap_alert_threshold': 20.0,
+            'network_warning_threshold': 90.0,
+            'network_alert_threshold': 70.0,
+            'data_freshness_warning_hours': 1.0,
+            'data_freshness_alert_hours': 0.3,
+            'cpu_weight': 0.20,
+            'memory_weight': 0.20,
+            'disk_weight': 0.20,
+            'swap_weight': 0.15,
+            'network_weight': 0.15,
+            'freshness_weight': 0.10,
+            'network_base_bandwidth_mbps': 1000.0,
+            'network_score_threshold': 80.0,
+            'freshness_score_decay_rate': 20.0,
+            # 新增评分配置参数
+            'normal_range_score_base': 80.0,
+            'alert_range_score_base': 50.0,
+            'warning_range_score_base': 20.0,
+            'normal_range_penalty_rate': 0.20,
+            'alert_range_penalty_rate': 0.30,
+            'warning_range_penalty_rate': 0.50,
+            'swap_multiplier': 2.0,
+            'network_penalty_multiplier': 2.0
+        }
+    
+    def update_health_config(self, config_key: str, config_value: float) -> bool:
+        """更新健康度配置"""
+        connection = self.get_connection()
+        if not connection:
+            return False
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO health_config (config_key, config_value, updated_at) 
+                    VALUES (%s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (config_key) DO UPDATE SET 
+                    config_value = EXCLUDED.config_value,
+                    updated_at = CURRENT_TIMESTAMP
+                """, (config_key, config_value))
+                connection.commit()
+                
+                # 清除缓存，强制下次读取时刷新
+                self._health_config_cache = None
+                self._health_config_cache_time = 0
+                
+                return True
+                
+        except Exception as e:
+            print(f"更新健康度配置失败: {e}")
+            connection.rollback()
+            return False
+        finally:
+            self.return_connection(connection)
+    
     def assess_machine_status(self, metric: Dict) -> Dict:
         """
         根据监控指标评估机器运行状态
@@ -4988,6 +6459,9 @@ class DatabaseManager:
         Returns:
             包含状态分级和详细信息的字典
         """
+        # 获取健康度配置
+        config = self.get_health_config()
+        
         # 获取关键指标值，处理None值
         cpu_usr = metric.get('cpu_usr', 0) or 0
         cpu_sys = metric.get('cpu_sys', 0) or 0
@@ -5012,9 +6486,8 @@ class DatabaseManager:
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
         
-        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
-        # 1000 Mbps = 125,000 KB/s
-        max_bandwidth_kbps = 125000
+        # 计算网络使用率（使用配置的基准带宽）
+        max_bandwidth_kbps = config['network_base_bandwidth_mbps'] * 125  # Mbps转KB/s
         total_network_usage = net_rx_kbps + net_tx_kbps
         network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
@@ -5024,60 +6497,60 @@ class DatabaseManager:
         warnings = []
         
         # CPU使用率检查
-        if cpu_total >= 90:
+        if cpu_total >= config['cpu_warning_threshold']:
             status_level = "警告"
             issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
-        elif cpu_total >= 70:
+        elif cpu_total >= config['cpu_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
         
         # 内存使用率检查
-        if mem_usage_percent >= 90:
+        if mem_usage_percent >= config['memory_warning_threshold']:
             status_level = "警告"
             issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
-        elif mem_usage_percent >= 70:
+        elif mem_usage_percent >= config['memory_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
         
         # 磁盘使用率检查
-        if disk_used_percent >= 90:
+        if disk_used_percent >= config['disk_warning_threshold']:
             status_level = "警告"
             issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
-        elif disk_used_percent >= 70:
+        elif disk_used_percent >= config['disk_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
         
         # Swap使用率检查
-        if swap_usage_percent >= 50:
+        if swap_usage_percent >= config['swap_warning_threshold']:
             status_level = "警告"
             issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
-        elif swap_usage_percent >= 20:
+        elif swap_usage_percent >= config['swap_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
         # 网络使用率检查
-        if network_usage_percent >= 90:
+        if network_usage_percent >= config['network_warning_threshold']:
             status_level = "警告"
             issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
-        elif network_usage_percent >= 70:
+        elif network_usage_percent >= config['network_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
         
-        # 数据时效性检查（超过1小时无数据视为异常）
+        # 数据时效性检查
         import time
         current_timestamp = int(time.time())
         metric_timestamp = metric.get('ts', 0)
         time_diff_hours = (current_timestamp - metric_timestamp) / 3600
         
-        if time_diff_hours > 1:
+        if time_diff_hours > config['data_freshness_warning_hours']:
             status_level = "警告"
             issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
-        elif time_diff_hours > 0.3:
+        elif time_diff_hours > config['data_freshness_alert_hours']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
@@ -5098,12 +6571,12 @@ class DatabaseManager:
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours, config)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float, config: Dict[str, float] = None) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -5114,35 +6587,38 @@ class DatabaseManager:
             swap_usage: Swap使用率
             network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
+            config: 健康度配置字典
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重（调整为5维评分）
+        if config is None:
+            config = self.get_health_config()
+            
+        # 各项指标的权重
         weights = {
-            'cpu': 0.20,
-            'memory': 0.20,
-            'disk': 0.20,
-            'swap': 0.15,
-            'network': 0.15,
-            'freshness': 0.10
+            'cpu': config['cpu_weight'],
+            'memory': config['memory_weight'],
+            'disk': config['disk_weight'],
+            'swap': config['swap_weight'],
+            'network': config['network_weight'],
+            'freshness': config['freshness_weight']
         }
         
-        # 计算各项得分（0-100分）
-        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
-        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
-        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
-        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        # 计算各项得分（0-100分），基于配置的阈值进行动态调整
+        cpu_score = self._calculate_dimension_score(cpu_usage, config['cpu_alert_threshold'], config['cpu_warning_threshold'], 'cpu', config)
+        mem_score = self._calculate_dimension_score(mem_usage, config['memory_alert_threshold'], config['memory_warning_threshold'], 'memory', config)
+        disk_score = self._calculate_dimension_score(disk_usage, config['disk_alert_threshold'], config['disk_warning_threshold'], 'disk', config)
+        swap_score = self._calculate_dimension_score(swap_usage, config['swap_alert_threshold'], config['swap_warning_threshold'], 'swap', config)
         
-        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
-        # 网络使用率越高得分越高，但超过80%开始扣分
-        if network_usage <= 80:
+        # 网络使用率得分（基于配置的阈值）
+        if network_usage <= config['network_score_threshold']:
             network_score = 100
         else:
-            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_score = max(0, 100 - (network_usage - config['network_score_threshold']) * 2)
         
-        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
-        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        # 数据新鲜度得分（使用配置的衰减率）
+        freshness_score = max(0, 100 - (data_freshness * config['freshness_score_decay_rate']))
         
         # 加权平均
         total_score = (
@@ -5155,6 +6631,44 @@ class DatabaseManager:
         )
         
         return int(max(0, min(100, total_score)))
+    
+    def _calculate_dimension_score(self, usage: float, alert_threshold: float, warning_threshold: float, dimension: str, config: Dict[str, float] = None) -> float:
+        """
+        计算单个维度的健康评分（0-100分）
+        
+        Args:
+            usage: 使用率
+            alert_threshold: 提示阈值
+            warning_threshold: 警告阈值
+            dimension: 维度名称
+            config: 健康度配置字典
+            
+        Returns:
+            维度评分（0-100）
+        """
+        if config is None:
+            config = self.get_health_config()
+        
+        # 根据不同的维度调整评分策略
+        if dimension == 'swap':
+            # Swap使用率影响倍数
+            usage = min(usage * config['swap_multiplier'], 100)
+        
+        # 基于配置的阈值进行评分
+        if usage <= alert_threshold:
+            # 正常范围：基于配置的基础评分和扣分率
+            normal_penalty = usage * config['normal_range_penalty_rate']
+            return max(0, config['normal_range_score_base'] - normal_penalty)
+        elif usage <= warning_threshold:
+            # 提示范围：基于配置的基础评分和扣分率
+            alert_range = warning_threshold - alert_threshold
+            alert_penalty = (usage - alert_threshold) / alert_range * (config['normal_range_score_base'] - config['alert_range_score_base'])
+            return max(0, config['alert_range_score_base'] - alert_penalty)
+        else:
+            # 警告范围：基于配置的基础评分和扣分率
+            warning_range = 100 - warning_threshold
+            warning_penalty = (usage - warning_threshold) / warning_range * (config['alert_range_score_base'] - config['warning_range_score_base'])
+            return max(0, config['warning_range_score_base'] - warning_penalty)
 
     def get_machine_status_by_ip(self, ip: str) -> Dict:
         """
@@ -5521,6 +7035,114 @@ class DatabaseManager:
         finally:
             self.return_connection(connection)
 
+    def get_health_config(self, force_refresh: bool = False) -> Dict[str, float]:
+        """获取健康度配置"""
+        import time
+        
+        # 检查缓存是否有效
+        current_time = time.time()
+        if (not force_refresh and 
+            self._health_config_cache is not None and 
+            current_time - self._health_config_cache_time < self._health_config_cache_ttl):
+            return self._health_config_cache
+        
+        connection = self.get_connection()
+        if not connection:
+            return self._get_default_health_config()
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT config_key, config_value FROM health_config")
+                config_data = cursor.fetchall()
+                
+                config_dict = {}
+                for row in config_data:
+                    # 修复：使用索引而不是字典键访问
+                    config_dict[row[0]] = float(row[1])
+                
+                # 确保所有必要的配置项都存在
+                default_config = self._get_default_health_config()
+                for key, value in default_config.items():
+                    if key not in config_dict:
+                        config_dict[key] = value
+                
+                # 更新缓存
+                self._health_config_cache = config_dict
+                self._health_config_cache_time = current_time
+                
+                return config_dict
+                
+        except Exception as e:
+            print(f"获取健康度配置失败: {e}")
+            return self._get_default_health_config()
+        finally:
+            self.return_connection(connection)
+    
+    def _get_default_health_config(self) -> Dict[str, float]:
+        """获取默认健康度配置"""
+        return {
+            'cpu_warning_threshold': 90.0,
+            'cpu_alert_threshold': 70.0,
+            'memory_warning_threshold': 90.0,
+            'memory_alert_threshold': 70.0,
+            'disk_warning_threshold': 90.0,
+            'disk_alert_threshold': 70.0,
+            'swap_warning_threshold': 50.0,
+            'swap_alert_threshold': 20.0,
+            'network_warning_threshold': 90.0,
+            'network_alert_threshold': 70.0,
+            'data_freshness_warning_hours': 1.0,
+            'data_freshness_alert_hours': 0.3,
+            'cpu_weight': 0.20,
+            'memory_weight': 0.20,
+            'disk_weight': 0.20,
+            'swap_weight': 0.15,
+            'network_weight': 0.15,
+            'freshness_weight': 0.10,
+            'network_base_bandwidth_mbps': 1000.0,
+            'network_score_threshold': 80.0,
+            'freshness_score_decay_rate': 20.0,
+            # 新增评分配置参数
+            'normal_range_score_base': 80.0,
+            'alert_range_score_base': 50.0,
+            'warning_range_score_base': 20.0,
+            'normal_range_penalty_rate': 0.20,
+            'alert_range_penalty_rate': 0.30,
+            'warning_range_penalty_rate': 0.50,
+            'swap_multiplier': 2.0,
+            'network_penalty_multiplier': 2.0
+        }
+    
+    def update_health_config(self, config_key: str, config_value: float) -> bool:
+        """更新健康度配置"""
+        connection = self.get_connection()
+        if not connection:
+            return False
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO health_config (config_key, config_value, updated_at) 
+                    VALUES (%s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (config_key) DO UPDATE SET 
+                    config_value = EXCLUDED.config_value,
+                    updated_at = CURRENT_TIMESTAMP
+                """, (config_key, config_value))
+                connection.commit()
+                
+                # 清除缓存，强制下次读取时刷新
+                self._health_config_cache = None
+                self._health_config_cache_time = 0
+                
+                return True
+                
+        except Exception as e:
+            print(f"更新健康度配置失败: {e}")
+            connection.rollback()
+            return False
+        finally:
+            self.return_connection(connection)
+    
     def assess_machine_status(self, metric: Dict) -> Dict:
         """
         根据监控指标评估机器运行状态
@@ -5531,6 +7153,9 @@ class DatabaseManager:
         Returns:
             包含状态分级和详细信息的字典
         """
+        # 获取健康度配置
+        config = self.get_health_config()
+        
         # 获取关键指标值，处理None值
         cpu_usr = metric.get('cpu_usr', 0) or 0
         cpu_sys = metric.get('cpu_sys', 0) or 0
@@ -5555,9 +7180,8 @@ class DatabaseManager:
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
         
-        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
-        # 1000 Mbps = 125,000 KB/s
-        max_bandwidth_kbps = 125000
+        # 计算网络使用率（使用配置的基准带宽）
+        max_bandwidth_kbps = config['network_base_bandwidth_mbps'] * 125  # Mbps转KB/s
         total_network_usage = net_rx_kbps + net_tx_kbps
         network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
@@ -5567,60 +7191,60 @@ class DatabaseManager:
         warnings = []
         
         # CPU使用率检查
-        if cpu_total >= 90:
+        if cpu_total >= config['cpu_warning_threshold']:
             status_level = "警告"
             issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
-        elif cpu_total >= 70:
+        elif cpu_total >= config['cpu_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
         
         # 内存使用率检查
-        if mem_usage_percent >= 90:
+        if mem_usage_percent >= config['memory_warning_threshold']:
             status_level = "警告"
             issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
-        elif mem_usage_percent >= 70:
+        elif mem_usage_percent >= config['memory_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
         
         # 磁盘使用率检查
-        if disk_used_percent >= 90:
+        if disk_used_percent >= config['disk_warning_threshold']:
             status_level = "警告"
             issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
-        elif disk_used_percent >= 70:
+        elif disk_used_percent >= config['disk_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
         
         # Swap使用率检查
-        if swap_usage_percent >= 50:
+        if swap_usage_percent >= config['swap_warning_threshold']:
             status_level = "警告"
             issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
-        elif swap_usage_percent >= 20:
+        elif swap_usage_percent >= config['swap_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
         # 网络使用率检查
-        if network_usage_percent >= 90:
+        if network_usage_percent >= config['network_warning_threshold']:
             status_level = "警告"
             issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
-        elif network_usage_percent >= 70:
+        elif network_usage_percent >= config['network_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
         
-        # 数据时效性检查（超过1小时无数据视为异常）
+        # 数据时效性检查
         import time
         current_timestamp = int(time.time())
         metric_timestamp = metric.get('ts', 0)
         time_diff_hours = (current_timestamp - metric_timestamp) / 3600
         
-        if time_diff_hours > 1:
+        if time_diff_hours > config['data_freshness_warning_hours']:
             status_level = "警告"
             issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
-        elif time_diff_hours > 0.3:
+        elif time_diff_hours > config['data_freshness_alert_hours']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
@@ -5641,12 +7265,12 @@ class DatabaseManager:
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours, config)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float, config: Dict[str, float] = None) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -5657,35 +7281,38 @@ class DatabaseManager:
             swap_usage: Swap使用率
             network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
+            config: 健康度配置字典
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重（调整为5维评分）
+        if config is None:
+            config = self.get_health_config()
+            
+        # 各项指标的权重
         weights = {
-            'cpu': 0.20,
-            'memory': 0.20,
-            'disk': 0.20,
-            'swap': 0.15,
-            'network': 0.15,
-            'freshness': 0.10
+            'cpu': config['cpu_weight'],
+            'memory': config['memory_weight'],
+            'disk': config['disk_weight'],
+            'swap': config['swap_weight'],
+            'network': config['network_weight'],
+            'freshness': config['freshness_weight']
         }
         
-        # 计算各项得分（0-100分）
-        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
-        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
-        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
-        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        # 计算各项得分（0-100分），基于配置的阈值进行动态调整
+        cpu_score = self._calculate_dimension_score(cpu_usage, config['cpu_alert_threshold'], config['cpu_warning_threshold'], 'cpu', config)
+        mem_score = self._calculate_dimension_score(mem_usage, config['memory_alert_threshold'], config['memory_warning_threshold'], 'memory', config)
+        disk_score = self._calculate_dimension_score(disk_usage, config['disk_alert_threshold'], config['disk_warning_threshold'], 'disk', config)
+        swap_score = self._calculate_dimension_score(swap_usage, config['swap_alert_threshold'], config['swap_warning_threshold'], 'swap', config)
         
-        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
-        # 网络使用率越高得分越高，但超过80%开始扣分
-        if network_usage <= 80:
+        # 网络使用率得分（基于配置的阈值）
+        if network_usage <= config['network_score_threshold']:
             network_score = 100
         else:
-            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_score = max(0, 100 - (network_usage - config['network_score_threshold']) * 2)
         
-        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
-        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        # 数据新鲜度得分（使用配置的衰减率）
+        freshness_score = max(0, 100 - (data_freshness * config['freshness_score_decay_rate']))
         
         # 加权平均
         total_score = (
@@ -5698,6 +7325,44 @@ class DatabaseManager:
         )
         
         return int(max(0, min(100, total_score)))
+    
+    def _calculate_dimension_score(self, usage: float, alert_threshold: float, warning_threshold: float, dimension: str, config: Dict[str, float] = None) -> float:
+        """
+        计算单个维度的健康评分（0-100分）
+        
+        Args:
+            usage: 使用率
+            alert_threshold: 提示阈值
+            warning_threshold: 警告阈值
+            dimension: 维度名称
+            config: 健康度配置字典
+            
+        Returns:
+            维度评分（0-100）
+        """
+        if config is None:
+            config = self.get_health_config()
+        
+        # 根据不同的维度调整评分策略
+        if dimension == 'swap':
+            # Swap使用率影响倍数
+            usage = min(usage * config['swap_multiplier'], 100)
+        
+        # 基于配置的阈值进行评分
+        if usage <= alert_threshold:
+            # 正常范围：基于配置的基础评分和扣分率
+            normal_penalty = usage * config['normal_range_penalty_rate']
+            return max(0, config['normal_range_score_base'] - normal_penalty)
+        elif usage <= warning_threshold:
+            # 提示范围：基于配置的基础评分和扣分率
+            alert_range = warning_threshold - alert_threshold
+            alert_penalty = (usage - alert_threshold) / alert_range * (config['normal_range_score_base'] - config['alert_range_score_base'])
+            return max(0, config['alert_range_score_base'] - alert_penalty)
+        else:
+            # 警告范围：基于配置的基础评分和扣分率
+            warning_range = 100 - warning_threshold
+            warning_penalty = (usage - warning_threshold) / warning_range * (config['alert_range_score_base'] - config['warning_range_score_base'])
+            return max(0, config['warning_range_score_base'] - warning_penalty)
 
     def get_machine_status_by_ip(self, ip: str) -> Dict:
         """
@@ -6073,6 +7738,114 @@ class DatabaseManager:
         finally:
             self.return_connection(connection)
 
+    def get_health_config(self, force_refresh: bool = False) -> Dict[str, float]:
+        """获取健康度配置"""
+        import time
+        
+        # 检查缓存是否有效
+        current_time = time.time()
+        if (not force_refresh and 
+            self._health_config_cache is not None and 
+            current_time - self._health_config_cache_time < self._health_config_cache_ttl):
+            return self._health_config_cache
+        
+        connection = self.get_connection()
+        if not connection:
+            return self._get_default_health_config()
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT config_key, config_value FROM health_config")
+                config_data = cursor.fetchall()
+                
+                config_dict = {}
+                for row in config_data:
+                    # 修复：使用索引而不是字典键访问
+                    config_dict[row[0]] = float(row[1])
+                
+                # 确保所有必要的配置项都存在
+                default_config = self._get_default_health_config()
+                for key, value in default_config.items():
+                    if key not in config_dict:
+                        config_dict[key] = value
+                
+                # 更新缓存
+                self._health_config_cache = config_dict
+                self._health_config_cache_time = current_time
+                
+                return config_dict
+                
+        except Exception as e:
+            print(f"获取健康度配置失败: {e}")
+            return self._get_default_health_config()
+        finally:
+            self.return_connection(connection)
+    
+    def _get_default_health_config(self) -> Dict[str, float]:
+        """获取默认健康度配置"""
+        return {
+            'cpu_warning_threshold': 90.0,
+            'cpu_alert_threshold': 70.0,
+            'memory_warning_threshold': 90.0,
+            'memory_alert_threshold': 70.0,
+            'disk_warning_threshold': 90.0,
+            'disk_alert_threshold': 70.0,
+            'swap_warning_threshold': 50.0,
+            'swap_alert_threshold': 20.0,
+            'network_warning_threshold': 90.0,
+            'network_alert_threshold': 70.0,
+            'data_freshness_warning_hours': 1.0,
+            'data_freshness_alert_hours': 0.3,
+            'cpu_weight': 0.20,
+            'memory_weight': 0.20,
+            'disk_weight': 0.20,
+            'swap_weight': 0.15,
+            'network_weight': 0.15,
+            'freshness_weight': 0.10,
+            'network_base_bandwidth_mbps': 1000.0,
+            'network_score_threshold': 80.0,
+            'freshness_score_decay_rate': 20.0,
+            # 新增评分配置参数
+            'normal_range_score_base': 80.0,
+            'alert_range_score_base': 50.0,
+            'warning_range_score_base': 20.0,
+            'normal_range_penalty_rate': 0.20,
+            'alert_range_penalty_rate': 0.30,
+            'warning_range_penalty_rate': 0.50,
+            'swap_multiplier': 2.0,
+            'network_penalty_multiplier': 2.0
+        }
+    
+    def update_health_config(self, config_key: str, config_value: float) -> bool:
+        """更新健康度配置"""
+        connection = self.get_connection()
+        if not connection:
+            return False
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO health_config (config_key, config_value, updated_at) 
+                    VALUES (%s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (config_key) DO UPDATE SET 
+                    config_value = EXCLUDED.config_value,
+                    updated_at = CURRENT_TIMESTAMP
+                """, (config_key, config_value))
+                connection.commit()
+                
+                # 清除缓存，强制下次读取时刷新
+                self._health_config_cache = None
+                self._health_config_cache_time = 0
+                
+                return True
+                
+        except Exception as e:
+            print(f"更新健康度配置失败: {e}")
+            connection.rollback()
+            return False
+        finally:
+            self.return_connection(connection)
+    
     def assess_machine_status(self, metric: Dict) -> Dict:
         """
         根据监控指标评估机器运行状态
@@ -6083,6 +7856,9 @@ class DatabaseManager:
         Returns:
             包含状态分级和详细信息的字典
         """
+        # 获取健康度配置
+        config = self.get_health_config()
+        
         # 获取关键指标值，处理None值
         cpu_usr = metric.get('cpu_usr', 0) or 0
         cpu_sys = metric.get('cpu_sys', 0) or 0
@@ -6107,9 +7883,8 @@ class DatabaseManager:
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
         
-        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
-        # 1000 Mbps = 125,000 KB/s
-        max_bandwidth_kbps = 125000
+        # 计算网络使用率（使用配置的基准带宽）
+        max_bandwidth_kbps = config['network_base_bandwidth_mbps'] * 125  # Mbps转KB/s
         total_network_usage = net_rx_kbps + net_tx_kbps
         network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
@@ -6119,60 +7894,60 @@ class DatabaseManager:
         warnings = []
         
         # CPU使用率检查
-        if cpu_total >= 90:
+        if cpu_total >= config['cpu_warning_threshold']:
             status_level = "警告"
             issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
-        elif cpu_total >= 70:
+        elif cpu_total >= config['cpu_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
         
         # 内存使用率检查
-        if mem_usage_percent >= 90:
+        if mem_usage_percent >= config['memory_warning_threshold']:
             status_level = "警告"
             issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
-        elif mem_usage_percent >= 70:
+        elif mem_usage_percent >= config['memory_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
         
         # 磁盘使用率检查
-        if disk_used_percent >= 90:
+        if disk_used_percent >= config['disk_warning_threshold']:
             status_level = "警告"
             issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
-        elif disk_used_percent >= 70:
+        elif disk_used_percent >= config['disk_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
         
         # Swap使用率检查
-        if swap_usage_percent >= 50:
+        if swap_usage_percent >= config['swap_warning_threshold']:
             status_level = "警告"
             issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
-        elif swap_usage_percent >= 20:
+        elif swap_usage_percent >= config['swap_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
         # 网络使用率检查
-        if network_usage_percent >= 90:
+        if network_usage_percent >= config['network_warning_threshold']:
             status_level = "警告"
             issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
-        elif network_usage_percent >= 70:
+        elif network_usage_percent >= config['network_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
         
-        # 数据时效性检查（超过1小时无数据视为异常）
+        # 数据时效性检查
         import time
         current_timestamp = int(time.time())
         metric_timestamp = metric.get('ts', 0)
         time_diff_hours = (current_timestamp - metric_timestamp) / 3600
         
-        if time_diff_hours > 1:
+        if time_diff_hours > config['data_freshness_warning_hours']:
             status_level = "警告"
             issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
-        elif time_diff_hours > 0.3:
+        elif time_diff_hours > config['data_freshness_alert_hours']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
@@ -6193,12 +7968,12 @@ class DatabaseManager:
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours, config)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float, config: Dict[str, float] = None) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -6209,35 +7984,38 @@ class DatabaseManager:
             swap_usage: Swap使用率
             network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
+            config: 健康度配置字典
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重（调整为5维评分）
+        if config is None:
+            config = self.get_health_config()
+            
+        # 各项指标的权重
         weights = {
-            'cpu': 0.20,
-            'memory': 0.20,
-            'disk': 0.20,
-            'swap': 0.15,
-            'network': 0.15,
-            'freshness': 0.10
+            'cpu': config['cpu_weight'],
+            'memory': config['memory_weight'],
+            'disk': config['disk_weight'],
+            'swap': config['swap_weight'],
+            'network': config['network_weight'],
+            'freshness': config['freshness_weight']
         }
         
-        # 计算各项得分（0-100分）
-        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
-        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
-        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
-        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        # 计算各项得分（0-100分），基于配置的阈值进行动态调整
+        cpu_score = self._calculate_dimension_score(cpu_usage, config['cpu_alert_threshold'], config['cpu_warning_threshold'], 'cpu', config)
+        mem_score = self._calculate_dimension_score(mem_usage, config['memory_alert_threshold'], config['memory_warning_threshold'], 'memory', config)
+        disk_score = self._calculate_dimension_score(disk_usage, config['disk_alert_threshold'], config['disk_warning_threshold'], 'disk', config)
+        swap_score = self._calculate_dimension_score(swap_usage, config['swap_alert_threshold'], config['swap_warning_threshold'], 'swap', config)
         
-        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
-        # 网络使用率越高得分越高，但超过80%开始扣分
-        if network_usage <= 80:
+        # 网络使用率得分（基于配置的阈值）
+        if network_usage <= config['network_score_threshold']:
             network_score = 100
         else:
-            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_score = max(0, 100 - (network_usage - config['network_score_threshold']) * 2)
         
-        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
-        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        # 数据新鲜度得分（使用配置的衰减率）
+        freshness_score = max(0, 100 - (data_freshness * config['freshness_score_decay_rate']))
         
         # 加权平均
         total_score = (
@@ -6250,6 +8028,44 @@ class DatabaseManager:
         )
         
         return int(max(0, min(100, total_score)))
+    
+    def _calculate_dimension_score(self, usage: float, alert_threshold: float, warning_threshold: float, dimension: str, config: Dict[str, float] = None) -> float:
+        """
+        计算单个维度的健康评分（0-100分）
+        
+        Args:
+            usage: 使用率
+            alert_threshold: 提示阈值
+            warning_threshold: 警告阈值
+            dimension: 维度名称
+            config: 健康度配置字典
+            
+        Returns:
+            维度评分（0-100）
+        """
+        if config is None:
+            config = self.get_health_config()
+        
+        # 根据不同的维度调整评分策略
+        if dimension == 'swap':
+            # Swap使用率影响倍数
+            usage = min(usage * config['swap_multiplier'], 100)
+        
+        # 基于配置的阈值进行评分
+        if usage <= alert_threshold:
+            # 正常范围：基于配置的基础评分和扣分率
+            normal_penalty = usage * config['normal_range_penalty_rate']
+            return max(0, config['normal_range_score_base'] - normal_penalty)
+        elif usage <= warning_threshold:
+            # 提示范围：基于配置的基础评分和扣分率
+            alert_range = warning_threshold - alert_threshold
+            alert_penalty = (usage - alert_threshold) / alert_range * (config['normal_range_score_base'] - config['alert_range_score_base'])
+            return max(0, config['alert_range_score_base'] - alert_penalty)
+        else:
+            # 警告范围：基于配置的基础评分和扣分率
+            warning_range = 100 - warning_threshold
+            warning_penalty = (usage - warning_threshold) / warning_range * (config['alert_range_score_base'] - config['warning_range_score_base'])
+            return max(0, config['warning_range_score_base'] - warning_penalty)
 
     def get_machine_status_by_ip(self, ip: str) -> Dict:
         """
@@ -6645,6 +8461,114 @@ class DatabaseManager:
         finally:
             self.return_connection(connection)
 
+    def get_health_config(self, force_refresh: bool = False) -> Dict[str, float]:
+        """获取健康度配置"""
+        import time
+        
+        # 检查缓存是否有效
+        current_time = time.time()
+        if (not force_refresh and 
+            self._health_config_cache is not None and 
+            current_time - self._health_config_cache_time < self._health_config_cache_ttl):
+            return self._health_config_cache
+        
+        connection = self.get_connection()
+        if not connection:
+            return self._get_default_health_config()
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT config_key, config_value FROM health_config")
+                config_data = cursor.fetchall()
+                
+                config_dict = {}
+                for row in config_data:
+                    # 修复：使用索引而不是字典键访问
+                    config_dict[row[0]] = float(row[1])
+                
+                # 确保所有必要的配置项都存在
+                default_config = self._get_default_health_config()
+                for key, value in default_config.items():
+                    if key not in config_dict:
+                        config_dict[key] = value
+                
+                # 更新缓存
+                self._health_config_cache = config_dict
+                self._health_config_cache_time = current_time
+                
+                return config_dict
+                
+        except Exception as e:
+            print(f"获取健康度配置失败: {e}")
+            return self._get_default_health_config()
+        finally:
+            self.return_connection(connection)
+    
+    def _get_default_health_config(self) -> Dict[str, float]:
+        """获取默认健康度配置"""
+        return {
+            'cpu_warning_threshold': 90.0,
+            'cpu_alert_threshold': 70.0,
+            'memory_warning_threshold': 90.0,
+            'memory_alert_threshold': 70.0,
+            'disk_warning_threshold': 90.0,
+            'disk_alert_threshold': 70.0,
+            'swap_warning_threshold': 50.0,
+            'swap_alert_threshold': 20.0,
+            'network_warning_threshold': 90.0,
+            'network_alert_threshold': 70.0,
+            'data_freshness_warning_hours': 1.0,
+            'data_freshness_alert_hours': 0.3,
+            'cpu_weight': 0.20,
+            'memory_weight': 0.20,
+            'disk_weight': 0.20,
+            'swap_weight': 0.15,
+            'network_weight': 0.15,
+            'freshness_weight': 0.10,
+            'network_base_bandwidth_mbps': 1000.0,
+            'network_score_threshold': 80.0,
+            'freshness_score_decay_rate': 20.0,
+            # 新增评分配置参数
+            'normal_range_score_base': 80.0,
+            'alert_range_score_base': 50.0,
+            'warning_range_score_base': 20.0,
+            'normal_range_penalty_rate': 0.20,
+            'alert_range_penalty_rate': 0.30,
+            'warning_range_penalty_rate': 0.50,
+            'swap_multiplier': 2.0,
+            'network_penalty_multiplier': 2.0
+        }
+    
+    def update_health_config(self, config_key: str, config_value: float) -> bool:
+        """更新健康度配置"""
+        connection = self.get_connection()
+        if not connection:
+            return False
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO health_config (config_key, config_value, updated_at) 
+                    VALUES (%s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (config_key) DO UPDATE SET 
+                    config_value = EXCLUDED.config_value,
+                    updated_at = CURRENT_TIMESTAMP
+                """, (config_key, config_value))
+                connection.commit()
+                
+                # 清除缓存，强制下次读取时刷新
+                self._health_config_cache = None
+                self._health_config_cache_time = 0
+                
+                return True
+                
+        except Exception as e:
+            print(f"更新健康度配置失败: {e}")
+            connection.rollback()
+            return False
+        finally:
+            self.return_connection(connection)
+    
     def assess_machine_status(self, metric: Dict) -> Dict:
         """
         根据监控指标评估机器运行状态
@@ -6655,6 +8579,9 @@ class DatabaseManager:
         Returns:
             包含状态分级和详细信息的字典
         """
+        # 获取健康度配置
+        config = self.get_health_config()
+        
         # 获取关键指标值，处理None值
         cpu_usr = metric.get('cpu_usr', 0) or 0
         cpu_sys = metric.get('cpu_sys', 0) or 0
@@ -6679,9 +8606,8 @@ class DatabaseManager:
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
         
-        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
-        # 1000 Mbps = 125,000 KB/s
-        max_bandwidth_kbps = 125000
+        # 计算网络使用率（使用配置的基准带宽）
+        max_bandwidth_kbps = config['network_base_bandwidth_mbps'] * 125  # Mbps转KB/s
         total_network_usage = net_rx_kbps + net_tx_kbps
         network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
@@ -6691,60 +8617,60 @@ class DatabaseManager:
         warnings = []
         
         # CPU使用率检查
-        if cpu_total >= 90:
+        if cpu_total >= config['cpu_warning_threshold']:
             status_level = "警告"
             issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
-        elif cpu_total >= 70:
+        elif cpu_total >= config['cpu_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
         
         # 内存使用率检查
-        if mem_usage_percent >= 90:
+        if mem_usage_percent >= config['memory_warning_threshold']:
             status_level = "警告"
             issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
-        elif mem_usage_percent >= 70:
+        elif mem_usage_percent >= config['memory_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
         
         # 磁盘使用率检查
-        if disk_used_percent >= 90:
+        if disk_used_percent >= config['disk_warning_threshold']:
             status_level = "警告"
             issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
-        elif disk_used_percent >= 70:
+        elif disk_used_percent >= config['disk_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
         
         # Swap使用率检查
-        if swap_usage_percent >= 50:
+        if swap_usage_percent >= config['swap_warning_threshold']:
             status_level = "警告"
             issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
-        elif swap_usage_percent >= 20:
+        elif swap_usage_percent >= config['swap_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
         # 网络使用率检查
-        if network_usage_percent >= 90:
+        if network_usage_percent >= config['network_warning_threshold']:
             status_level = "警告"
             issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
-        elif network_usage_percent >= 70:
+        elif network_usage_percent >= config['network_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
         
-        # 数据时效性检查（超过1小时无数据视为异常）
+        # 数据时效性检查
         import time
         current_timestamp = int(time.time())
         metric_timestamp = metric.get('ts', 0)
         time_diff_hours = (current_timestamp - metric_timestamp) / 3600
         
-        if time_diff_hours > 1:
+        if time_diff_hours > config['data_freshness_warning_hours']:
             status_level = "警告"
             issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
-        elif time_diff_hours > 0.3:
+        elif time_diff_hours > config['data_freshness_alert_hours']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
@@ -6765,12 +8691,12 @@ class DatabaseManager:
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours, config)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float, config: Dict[str, float] = None) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -6781,35 +8707,38 @@ class DatabaseManager:
             swap_usage: Swap使用率
             network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
+            config: 健康度配置字典
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重（调整为5维评分）
+        if config is None:
+            config = self.get_health_config()
+            
+        # 各项指标的权重
         weights = {
-            'cpu': 0.20,
-            'memory': 0.20,
-            'disk': 0.20,
-            'swap': 0.15,
-            'network': 0.15,
-            'freshness': 0.10
+            'cpu': config['cpu_weight'],
+            'memory': config['memory_weight'],
+            'disk': config['disk_weight'],
+            'swap': config['swap_weight'],
+            'network': config['network_weight'],
+            'freshness': config['freshness_weight']
         }
         
-        # 计算各项得分（0-100分）
-        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
-        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
-        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
-        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        # 计算各项得分（0-100分），基于配置的阈值进行动态调整
+        cpu_score = self._calculate_dimension_score(cpu_usage, config['cpu_alert_threshold'], config['cpu_warning_threshold'], 'cpu', config)
+        mem_score = self._calculate_dimension_score(mem_usage, config['memory_alert_threshold'], config['memory_warning_threshold'], 'memory', config)
+        disk_score = self._calculate_dimension_score(disk_usage, config['disk_alert_threshold'], config['disk_warning_threshold'], 'disk', config)
+        swap_score = self._calculate_dimension_score(swap_usage, config['swap_alert_threshold'], config['swap_warning_threshold'], 'swap', config)
         
-        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
-        # 网络使用率越高得分越高，但超过80%开始扣分
-        if network_usage <= 80:
+        # 网络使用率得分（基于配置的阈值）
+        if network_usage <= config['network_score_threshold']:
             network_score = 100
         else:
-            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_score = max(0, 100 - (network_usage - config['network_score_threshold']) * 2)
         
-        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
-        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        # 数据新鲜度得分（使用配置的衰减率）
+        freshness_score = max(0, 100 - (data_freshness * config['freshness_score_decay_rate']))
         
         # 加权平均
         total_score = (
@@ -6822,6 +8751,44 @@ class DatabaseManager:
         )
         
         return int(max(0, min(100, total_score)))
+    
+    def _calculate_dimension_score(self, usage: float, alert_threshold: float, warning_threshold: float, dimension: str, config: Dict[str, float] = None) -> float:
+        """
+        计算单个维度的健康评分（0-100分）
+        
+        Args:
+            usage: 使用率
+            alert_threshold: 提示阈值
+            warning_threshold: 警告阈值
+            dimension: 维度名称
+            config: 健康度配置字典
+            
+        Returns:
+            维度评分（0-100）
+        """
+        if config is None:
+            config = self.get_health_config()
+        
+        # 根据不同的维度调整评分策略
+        if dimension == 'swap':
+            # Swap使用率影响倍数
+            usage = min(usage * config['swap_multiplier'], 100)
+        
+        # 基于配置的阈值进行评分
+        if usage <= alert_threshold:
+            # 正常范围：基于配置的基础评分和扣分率
+            normal_penalty = usage * config['normal_range_penalty_rate']
+            return max(0, config['normal_range_score_base'] - normal_penalty)
+        elif usage <= warning_threshold:
+            # 提示范围：基于配置的基础评分和扣分率
+            alert_range = warning_threshold - alert_threshold
+            alert_penalty = (usage - alert_threshold) / alert_range * (config['normal_range_score_base'] - config['alert_range_score_base'])
+            return max(0, config['alert_range_score_base'] - alert_penalty)
+        else:
+            # 警告范围：基于配置的基础评分和扣分率
+            warning_range = 100 - warning_threshold
+            warning_penalty = (usage - warning_threshold) / warning_range * (config['alert_range_score_base'] - config['warning_range_score_base'])
+            return max(0, config['warning_range_score_base'] - warning_penalty)
 
     def get_machine_status_by_ip(self, ip: str) -> Dict:
         """
@@ -7182,6 +9149,114 @@ class DatabaseManager:
         finally:
             self.return_connection(connection)
 
+    def get_health_config(self, force_refresh: bool = False) -> Dict[str, float]:
+        """获取健康度配置"""
+        import time
+        
+        # 检查缓存是否有效
+        current_time = time.time()
+        if (not force_refresh and 
+            self._health_config_cache is not None and 
+            current_time - self._health_config_cache_time < self._health_config_cache_ttl):
+            return self._health_config_cache
+        
+        connection = self.get_connection()
+        if not connection:
+            return self._get_default_health_config()
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT config_key, config_value FROM health_config")
+                config_data = cursor.fetchall()
+                
+                config_dict = {}
+                for row in config_data:
+                    # 修复：使用索引而不是字典键访问
+                    config_dict[row[0]] = float(row[1])
+                
+                # 确保所有必要的配置项都存在
+                default_config = self._get_default_health_config()
+                for key, value in default_config.items():
+                    if key not in config_dict:
+                        config_dict[key] = value
+                
+                # 更新缓存
+                self._health_config_cache = config_dict
+                self._health_config_cache_time = current_time
+                
+                return config_dict
+                
+        except Exception as e:
+            print(f"获取健康度配置失败: {e}")
+            return self._get_default_health_config()
+        finally:
+            self.return_connection(connection)
+    
+    def _get_default_health_config(self) -> Dict[str, float]:
+        """获取默认健康度配置"""
+        return {
+            'cpu_warning_threshold': 90.0,
+            'cpu_alert_threshold': 70.0,
+            'memory_warning_threshold': 90.0,
+            'memory_alert_threshold': 70.0,
+            'disk_warning_threshold': 90.0,
+            'disk_alert_threshold': 70.0,
+            'swap_warning_threshold': 50.0,
+            'swap_alert_threshold': 20.0,
+            'network_warning_threshold': 90.0,
+            'network_alert_threshold': 70.0,
+            'data_freshness_warning_hours': 1.0,
+            'data_freshness_alert_hours': 0.3,
+            'cpu_weight': 0.20,
+            'memory_weight': 0.20,
+            'disk_weight': 0.20,
+            'swap_weight': 0.15,
+            'network_weight': 0.15,
+            'freshness_weight': 0.10,
+            'network_base_bandwidth_mbps': 1000.0,
+            'network_score_threshold': 80.0,
+            'freshness_score_decay_rate': 20.0,
+            # 新增评分配置参数
+            'normal_range_score_base': 80.0,
+            'alert_range_score_base': 50.0,
+            'warning_range_score_base': 20.0,
+            'normal_range_penalty_rate': 0.20,
+            'alert_range_penalty_rate': 0.30,
+            'warning_range_penalty_rate': 0.50,
+            'swap_multiplier': 2.0,
+            'network_penalty_multiplier': 2.0
+        }
+    
+    def update_health_config(self, config_key: str, config_value: float) -> bool:
+        """更新健康度配置"""
+        connection = self.get_connection()
+        if not connection:
+            return False
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO health_config (config_key, config_value, updated_at) 
+                    VALUES (%s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (config_key) DO UPDATE SET 
+                    config_value = EXCLUDED.config_value,
+                    updated_at = CURRENT_TIMESTAMP
+                """, (config_key, config_value))
+                connection.commit()
+                
+                # 清除缓存，强制下次读取时刷新
+                self._health_config_cache = None
+                self._health_config_cache_time = 0
+                
+                return True
+                
+        except Exception as e:
+            print(f"更新健康度配置失败: {e}")
+            connection.rollback()
+            return False
+        finally:
+            self.return_connection(connection)
+    
     def assess_machine_status(self, metric: Dict) -> Dict:
         """
         根据监控指标评估机器运行状态
@@ -7192,6 +9267,9 @@ class DatabaseManager:
         Returns:
             包含状态分级和详细信息的字典
         """
+        # 获取健康度配置
+        config = self.get_health_config()
+        
         # 获取关键指标值，处理None值
         cpu_usr = metric.get('cpu_usr', 0) or 0
         cpu_sys = metric.get('cpu_sys', 0) or 0
@@ -7216,9 +9294,8 @@ class DatabaseManager:
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
         
-        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
-        # 1000 Mbps = 125,000 KB/s
-        max_bandwidth_kbps = 125000
+        # 计算网络使用率（使用配置的基准带宽）
+        max_bandwidth_kbps = config['network_base_bandwidth_mbps'] * 125  # Mbps转KB/s
         total_network_usage = net_rx_kbps + net_tx_kbps
         network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
@@ -7228,60 +9305,60 @@ class DatabaseManager:
         warnings = []
         
         # CPU使用率检查
-        if cpu_total >= 90:
+        if cpu_total >= config['cpu_warning_threshold']:
             status_level = "警告"
             issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
-        elif cpu_total >= 70:
+        elif cpu_total >= config['cpu_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
         
         # 内存使用率检查
-        if mem_usage_percent >= 90:
+        if mem_usage_percent >= config['memory_warning_threshold']:
             status_level = "警告"
             issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
-        elif mem_usage_percent >= 70:
+        elif mem_usage_percent >= config['memory_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
         
         # 磁盘使用率检查
-        if disk_used_percent >= 90:
+        if disk_used_percent >= config['disk_warning_threshold']:
             status_level = "警告"
             issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
-        elif disk_used_percent >= 70:
+        elif disk_used_percent >= config['disk_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
         
         # Swap使用率检查
-        if swap_usage_percent >= 50:
+        if swap_usage_percent >= config['swap_warning_threshold']:
             status_level = "警告"
             issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
-        elif swap_usage_percent >= 20:
+        elif swap_usage_percent >= config['swap_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
         # 网络使用率检查
-        if network_usage_percent >= 90:
+        if network_usage_percent >= config['network_warning_threshold']:
             status_level = "警告"
             issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
-        elif network_usage_percent >= 70:
+        elif network_usage_percent >= config['network_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
         
-        # 数据时效性检查（超过1小时无数据视为异常）
+        # 数据时效性检查
         import time
         current_timestamp = int(time.time())
         metric_timestamp = metric.get('ts', 0)
         time_diff_hours = (current_timestamp - metric_timestamp) / 3600
         
-        if time_diff_hours > 1:
+        if time_diff_hours > config['data_freshness_warning_hours']:
             status_level = "警告"
             issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
-        elif time_diff_hours > 0.3:
+        elif time_diff_hours > config['data_freshness_alert_hours']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
@@ -7302,12 +9379,12 @@ class DatabaseManager:
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours, config)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float, config: Dict[str, float] = None) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -7318,35 +9395,38 @@ class DatabaseManager:
             swap_usage: Swap使用率
             network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
+            config: 健康度配置字典
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重（调整为5维评分）
+        if config is None:
+            config = self.get_health_config()
+            
+        # 各项指标的权重
         weights = {
-            'cpu': 0.20,
-            'memory': 0.20,
-            'disk': 0.20,
-            'swap': 0.15,
-            'network': 0.15,
-            'freshness': 0.10
+            'cpu': config['cpu_weight'],
+            'memory': config['memory_weight'],
+            'disk': config['disk_weight'],
+            'swap': config['swap_weight'],
+            'network': config['network_weight'],
+            'freshness': config['freshness_weight']
         }
         
-        # 计算各项得分（0-100分）
-        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
-        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
-        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
-        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        # 计算各项得分（0-100分），基于配置的阈值进行动态调整
+        cpu_score = self._calculate_dimension_score(cpu_usage, config['cpu_alert_threshold'], config['cpu_warning_threshold'], 'cpu', config)
+        mem_score = self._calculate_dimension_score(mem_usage, config['memory_alert_threshold'], config['memory_warning_threshold'], 'memory', config)
+        disk_score = self._calculate_dimension_score(disk_usage, config['disk_alert_threshold'], config['disk_warning_threshold'], 'disk', config)
+        swap_score = self._calculate_dimension_score(swap_usage, config['swap_alert_threshold'], config['swap_warning_threshold'], 'swap', config)
         
-        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
-        # 网络使用率越高得分越高，但超过80%开始扣分
-        if network_usage <= 80:
+        # 网络使用率得分（基于配置的阈值）
+        if network_usage <= config['network_score_threshold']:
             network_score = 100
         else:
-            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_score = max(0, 100 - (network_usage - config['network_score_threshold']) * 2)
         
-        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
-        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        # 数据新鲜度得分（使用配置的衰减率）
+        freshness_score = max(0, 100 - (data_freshness * config['freshness_score_decay_rate']))
         
         # 加权平均
         total_score = (
@@ -7359,6 +9439,44 @@ class DatabaseManager:
         )
         
         return int(max(0, min(100, total_score)))
+    
+    def _calculate_dimension_score(self, usage: float, alert_threshold: float, warning_threshold: float, dimension: str, config: Dict[str, float] = None) -> float:
+        """
+        计算单个维度的健康评分（0-100分）
+        
+        Args:
+            usage: 使用率
+            alert_threshold: 提示阈值
+            warning_threshold: 警告阈值
+            dimension: 维度名称
+            config: 健康度配置字典
+            
+        Returns:
+            维度评分（0-100）
+        """
+        if config is None:
+            config = self.get_health_config()
+        
+        # 根据不同的维度调整评分策略
+        if dimension == 'swap':
+            # Swap使用率影响倍数
+            usage = min(usage * config['swap_multiplier'], 100)
+        
+        # 基于配置的阈值进行评分
+        if usage <= alert_threshold:
+            # 正常范围：基于配置的基础评分和扣分率
+            normal_penalty = usage * config['normal_range_penalty_rate']
+            return max(0, config['normal_range_score_base'] - normal_penalty)
+        elif usage <= warning_threshold:
+            # 提示范围：基于配置的基础评分和扣分率
+            alert_range = warning_threshold - alert_threshold
+            alert_penalty = (usage - alert_threshold) / alert_range * (config['normal_range_score_base'] - config['alert_range_score_base'])
+            return max(0, config['alert_range_score_base'] - alert_penalty)
+        else:
+            # 警告范围：基于配置的基础评分和扣分率
+            warning_range = 100 - warning_threshold
+            warning_penalty = (usage - warning_threshold) / warning_range * (config['alert_range_score_base'] - config['warning_range_score_base'])
+            return max(0, config['warning_range_score_base'] - warning_penalty)
 
     def get_machine_status_by_ip(self, ip: str) -> Dict:
         """
@@ -7755,6 +9873,114 @@ class DatabaseManager:
         finally:
             self.return_connection(connection)
 
+    def get_health_config(self, force_refresh: bool = False) -> Dict[str, float]:
+        """获取健康度配置"""
+        import time
+        
+        # 检查缓存是否有效
+        current_time = time.time()
+        if (not force_refresh and 
+            self._health_config_cache is not None and 
+            current_time - self._health_config_cache_time < self._health_config_cache_ttl):
+            return self._health_config_cache
+        
+        connection = self.get_connection()
+        if not connection:
+            return self._get_default_health_config()
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT config_key, config_value FROM health_config")
+                config_data = cursor.fetchall()
+                
+                config_dict = {}
+                for row in config_data:
+                    # 修复：使用索引而不是字典键访问
+                    config_dict[row[0]] = float(row[1])
+                
+                # 确保所有必要的配置项都存在
+                default_config = self._get_default_health_config()
+                for key, value in default_config.items():
+                    if key not in config_dict:
+                        config_dict[key] = value
+                
+                # 更新缓存
+                self._health_config_cache = config_dict
+                self._health_config_cache_time = current_time
+                
+                return config_dict
+                
+        except Exception as e:
+            print(f"获取健康度配置失败: {e}")
+            return self._get_default_health_config()
+        finally:
+            self.return_connection(connection)
+    
+    def _get_default_health_config(self) -> Dict[str, float]:
+        """获取默认健康度配置"""
+        return {
+            'cpu_warning_threshold': 90.0,
+            'cpu_alert_threshold': 70.0,
+            'memory_warning_threshold': 90.0,
+            'memory_alert_threshold': 70.0,
+            'disk_warning_threshold': 90.0,
+            'disk_alert_threshold': 70.0,
+            'swap_warning_threshold': 50.0,
+            'swap_alert_threshold': 20.0,
+            'network_warning_threshold': 90.0,
+            'network_alert_threshold': 70.0,
+            'data_freshness_warning_hours': 1.0,
+            'data_freshness_alert_hours': 0.3,
+            'cpu_weight': 0.20,
+            'memory_weight': 0.20,
+            'disk_weight': 0.20,
+            'swap_weight': 0.15,
+            'network_weight': 0.15,
+            'freshness_weight': 0.10,
+            'network_base_bandwidth_mbps': 1000.0,
+            'network_score_threshold': 80.0,
+            'freshness_score_decay_rate': 20.0,
+            # 新增评分配置参数
+            'normal_range_score_base': 80.0,
+            'alert_range_score_base': 50.0,
+            'warning_range_score_base': 20.0,
+            'normal_range_penalty_rate': 0.20,
+            'alert_range_penalty_rate': 0.30,
+            'warning_range_penalty_rate': 0.50,
+            'swap_multiplier': 2.0,
+            'network_penalty_multiplier': 2.0
+        }
+    
+    def update_health_config(self, config_key: str, config_value: float) -> bool:
+        """更新健康度配置"""
+        connection = self.get_connection()
+        if not connection:
+            return False
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO health_config (config_key, config_value, updated_at) 
+                    VALUES (%s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (config_key) DO UPDATE SET 
+                    config_value = EXCLUDED.config_value,
+                    updated_at = CURRENT_TIMESTAMP
+                """, (config_key, config_value))
+                connection.commit()
+                
+                # 清除缓存，强制下次读取时刷新
+                self._health_config_cache = None
+                self._health_config_cache_time = 0
+                
+                return True
+                
+        except Exception as e:
+            print(f"更新健康度配置失败: {e}")
+            connection.rollback()
+            return False
+        finally:
+            self.return_connection(connection)
+    
     def assess_machine_status(self, metric: Dict) -> Dict:
         """
         根据监控指标评估机器运行状态
@@ -7765,6 +9991,9 @@ class DatabaseManager:
         Returns:
             包含状态分级和详细信息的字典
         """
+        # 获取健康度配置
+        config = self.get_health_config()
+        
         # 获取关键指标值，处理None值
         cpu_usr = metric.get('cpu_usr', 0) or 0
         cpu_sys = metric.get('cpu_sys', 0) or 0
@@ -7789,9 +10018,8 @@ class DatabaseManager:
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
         
-        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
-        # 1000 Mbps = 125,000 KB/s
-        max_bandwidth_kbps = 125000
+        # 计算网络使用率（使用配置的基准带宽）
+        max_bandwidth_kbps = config['network_base_bandwidth_mbps'] * 125  # Mbps转KB/s
         total_network_usage = net_rx_kbps + net_tx_kbps
         network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
@@ -7801,60 +10029,60 @@ class DatabaseManager:
         warnings = []
         
         # CPU使用率检查
-        if cpu_total >= 90:
+        if cpu_total >= config['cpu_warning_threshold']:
             status_level = "警告"
             issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
-        elif cpu_total >= 70:
+        elif cpu_total >= config['cpu_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
         
         # 内存使用率检查
-        if mem_usage_percent >= 90:
+        if mem_usage_percent >= config['memory_warning_threshold']:
             status_level = "警告"
             issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
-        elif mem_usage_percent >= 70:
+        elif mem_usage_percent >= config['memory_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
         
         # 磁盘使用率检查
-        if disk_used_percent >= 90:
+        if disk_used_percent >= config['disk_warning_threshold']:
             status_level = "警告"
             issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
-        elif disk_used_percent >= 70:
+        elif disk_used_percent >= config['disk_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
         
         # Swap使用率检查
-        if swap_usage_percent >= 50:
+        if swap_usage_percent >= config['swap_warning_threshold']:
             status_level = "警告"
             issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
-        elif swap_usage_percent >= 20:
+        elif swap_usage_percent >= config['swap_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
         # 网络使用率检查
-        if network_usage_percent >= 90:
+        if network_usage_percent >= config['network_warning_threshold']:
             status_level = "警告"
             issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
-        elif network_usage_percent >= 70:
+        elif network_usage_percent >= config['network_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
         
-        # 数据时效性检查（超过1小时无数据视为异常）
+        # 数据时效性检查
         import time
         current_timestamp = int(time.time())
         metric_timestamp = metric.get('ts', 0)
         time_diff_hours = (current_timestamp - metric_timestamp) / 3600
         
-        if time_diff_hours > 1:
+        if time_diff_hours > config['data_freshness_warning_hours']:
             status_level = "警告"
             issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
-        elif time_diff_hours > 0.3:
+        elif time_diff_hours > config['data_freshness_alert_hours']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
@@ -7875,12 +10103,12 @@ class DatabaseManager:
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours, config)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float, config: Dict[str, float] = None) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -7891,35 +10119,38 @@ class DatabaseManager:
             swap_usage: Swap使用率
             network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
+            config: 健康度配置字典
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重（调整为5维评分）
+        if config is None:
+            config = self.get_health_config()
+            
+        # 各项指标的权重
         weights = {
-            'cpu': 0.20,
-            'memory': 0.20,
-            'disk': 0.20,
-            'swap': 0.15,
-            'network': 0.15,
-            'freshness': 0.10
+            'cpu': config['cpu_weight'],
+            'memory': config['memory_weight'],
+            'disk': config['disk_weight'],
+            'swap': config['swap_weight'],
+            'network': config['network_weight'],
+            'freshness': config['freshness_weight']
         }
         
-        # 计算各项得分（0-100分）
-        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
-        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
-        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
-        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        # 计算各项得分（0-100分），基于配置的阈值进行动态调整
+        cpu_score = self._calculate_dimension_score(cpu_usage, config['cpu_alert_threshold'], config['cpu_warning_threshold'], 'cpu', config)
+        mem_score = self._calculate_dimension_score(mem_usage, config['memory_alert_threshold'], config['memory_warning_threshold'], 'memory', config)
+        disk_score = self._calculate_dimension_score(disk_usage, config['disk_alert_threshold'], config['disk_warning_threshold'], 'disk', config)
+        swap_score = self._calculate_dimension_score(swap_usage, config['swap_alert_threshold'], config['swap_warning_threshold'], 'swap', config)
         
-        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
-        # 网络使用率越高得分越高，但超过80%开始扣分
-        if network_usage <= 80:
+        # 网络使用率得分（基于配置的阈值）
+        if network_usage <= config['network_score_threshold']:
             network_score = 100
         else:
-            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_score = max(0, 100 - (network_usage - config['network_score_threshold']) * 2)
         
-        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
-        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        # 数据新鲜度得分（使用配置的衰减率）
+        freshness_score = max(0, 100 - (data_freshness * config['freshness_score_decay_rate']))
         
         # 加权平均
         total_score = (
@@ -7932,6 +10163,44 @@ class DatabaseManager:
         )
         
         return int(max(0, min(100, total_score)))
+    
+    def _calculate_dimension_score(self, usage: float, alert_threshold: float, warning_threshold: float, dimension: str, config: Dict[str, float] = None) -> float:
+        """
+        计算单个维度的健康评分（0-100分）
+        
+        Args:
+            usage: 使用率
+            alert_threshold: 提示阈值
+            warning_threshold: 警告阈值
+            dimension: 维度名称
+            config: 健康度配置字典
+            
+        Returns:
+            维度评分（0-100）
+        """
+        if config is None:
+            config = self.get_health_config()
+        
+        # 根据不同的维度调整评分策略
+        if dimension == 'swap':
+            # Swap使用率影响倍数
+            usage = min(usage * config['swap_multiplier'], 100)
+        
+        # 基于配置的阈值进行评分
+        if usage <= alert_threshold:
+            # 正常范围：基于配置的基础评分和扣分率
+            normal_penalty = usage * config['normal_range_penalty_rate']
+            return max(0, config['normal_range_score_base'] - normal_penalty)
+        elif usage <= warning_threshold:
+            # 提示范围：基于配置的基础评分和扣分率
+            alert_range = warning_threshold - alert_threshold
+            alert_penalty = (usage - alert_threshold) / alert_range * (config['normal_range_score_base'] - config['alert_range_score_base'])
+            return max(0, config['alert_range_score_base'] - alert_penalty)
+        else:
+            # 警告范围：基于配置的基础评分和扣分率
+            warning_range = 100 - warning_threshold
+            warning_penalty = (usage - warning_threshold) / warning_range * (config['alert_range_score_base'] - config['warning_range_score_base'])
+            return max(0, config['warning_range_score_base'] - warning_penalty)
 
     def get_machine_status_by_ip(self, ip: str) -> Dict:
         """
@@ -8298,6 +10567,114 @@ class DatabaseManager:
         finally:
             self.return_connection(connection)
 
+    def get_health_config(self, force_refresh: bool = False) -> Dict[str, float]:
+        """获取健康度配置"""
+        import time
+        
+        # 检查缓存是否有效
+        current_time = time.time()
+        if (not force_refresh and 
+            self._health_config_cache is not None and 
+            current_time - self._health_config_cache_time < self._health_config_cache_ttl):
+            return self._health_config_cache
+        
+        connection = self.get_connection()
+        if not connection:
+            return self._get_default_health_config()
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT config_key, config_value FROM health_config")
+                config_data = cursor.fetchall()
+                
+                config_dict = {}
+                for row in config_data:
+                    # 修复：使用索引而不是字典键访问
+                    config_dict[row[0]] = float(row[1])
+                
+                # 确保所有必要的配置项都存在
+                default_config = self._get_default_health_config()
+                for key, value in default_config.items():
+                    if key not in config_dict:
+                        config_dict[key] = value
+                
+                # 更新缓存
+                self._health_config_cache = config_dict
+                self._health_config_cache_time = current_time
+                
+                return config_dict
+                
+        except Exception as e:
+            print(f"获取健康度配置失败: {e}")
+            return self._get_default_health_config()
+        finally:
+            self.return_connection(connection)
+    
+    def _get_default_health_config(self) -> Dict[str, float]:
+        """获取默认健康度配置"""
+        return {
+            'cpu_warning_threshold': 90.0,
+            'cpu_alert_threshold': 70.0,
+            'memory_warning_threshold': 90.0,
+            'memory_alert_threshold': 70.0,
+            'disk_warning_threshold': 90.0,
+            'disk_alert_threshold': 70.0,
+            'swap_warning_threshold': 50.0,
+            'swap_alert_threshold': 20.0,
+            'network_warning_threshold': 90.0,
+            'network_alert_threshold': 70.0,
+            'data_freshness_warning_hours': 1.0,
+            'data_freshness_alert_hours': 0.3,
+            'cpu_weight': 0.20,
+            'memory_weight': 0.20,
+            'disk_weight': 0.20,
+            'swap_weight': 0.15,
+            'network_weight': 0.15,
+            'freshness_weight': 0.10,
+            'network_base_bandwidth_mbps': 1000.0,
+            'network_score_threshold': 80.0,
+            'freshness_score_decay_rate': 20.0,
+            # 新增评分配置参数
+            'normal_range_score_base': 80.0,
+            'alert_range_score_base': 50.0,
+            'warning_range_score_base': 20.0,
+            'normal_range_penalty_rate': 0.20,
+            'alert_range_penalty_rate': 0.30,
+            'warning_range_penalty_rate': 0.50,
+            'swap_multiplier': 2.0,
+            'network_penalty_multiplier': 2.0
+        }
+    
+    def update_health_config(self, config_key: str, config_value: float) -> bool:
+        """更新健康度配置"""
+        connection = self.get_connection()
+        if not connection:
+            return False
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO health_config (config_key, config_value, updated_at) 
+                    VALUES (%s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (config_key) DO UPDATE SET 
+                    config_value = EXCLUDED.config_value,
+                    updated_at = CURRENT_TIMESTAMP
+                """, (config_key, config_value))
+                connection.commit()
+                
+                # 清除缓存，强制下次读取时刷新
+                self._health_config_cache = None
+                self._health_config_cache_time = 0
+                
+                return True
+                
+        except Exception as e:
+            print(f"更新健康度配置失败: {e}")
+            connection.rollback()
+            return False
+        finally:
+            self.return_connection(connection)
+    
     def assess_machine_status(self, metric: Dict) -> Dict:
         """
         根据监控指标评估机器运行状态
@@ -8308,6 +10685,9 @@ class DatabaseManager:
         Returns:
             包含状态分级和详细信息的字典
         """
+        # 获取健康度配置
+        config = self.get_health_config()
+        
         # 获取关键指标值，处理None值
         cpu_usr = metric.get('cpu_usr', 0) or 0
         cpu_sys = metric.get('cpu_sys', 0) or 0
@@ -8332,9 +10712,8 @@ class DatabaseManager:
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
         
-        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
-        # 1000 Mbps = 125,000 KB/s
-        max_bandwidth_kbps = 125000
+        # 计算网络使用率（使用配置的基准带宽）
+        max_bandwidth_kbps = config['network_base_bandwidth_mbps'] * 125  # Mbps转KB/s
         total_network_usage = net_rx_kbps + net_tx_kbps
         network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
@@ -8344,60 +10723,60 @@ class DatabaseManager:
         warnings = []
         
         # CPU使用率检查
-        if cpu_total >= 90:
+        if cpu_total >= config['cpu_warning_threshold']:
             status_level = "警告"
             issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
-        elif cpu_total >= 70:
+        elif cpu_total >= config['cpu_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
         
         # 内存使用率检查
-        if mem_usage_percent >= 90:
+        if mem_usage_percent >= config['memory_warning_threshold']:
             status_level = "警告"
             issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
-        elif mem_usage_percent >= 70:
+        elif mem_usage_percent >= config['memory_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
         
         # 磁盘使用率检查
-        if disk_used_percent >= 90:
+        if disk_used_percent >= config['disk_warning_threshold']:
             status_level = "警告"
             issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
-        elif disk_used_percent >= 70:
+        elif disk_used_percent >= config['disk_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
         
         # Swap使用率检查
-        if swap_usage_percent >= 50:
+        if swap_usage_percent >= config['swap_warning_threshold']:
             status_level = "警告"
             issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
-        elif swap_usage_percent >= 20:
+        elif swap_usage_percent >= config['swap_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
         # 网络使用率检查
-        if network_usage_percent >= 90:
+        if network_usage_percent >= config['network_warning_threshold']:
             status_level = "警告"
             issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
-        elif network_usage_percent >= 70:
+        elif network_usage_percent >= config['network_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
         
-        # 数据时效性检查（超过1小时无数据视为异常）
+        # 数据时效性检查
         import time
         current_timestamp = int(time.time())
         metric_timestamp = metric.get('ts', 0)
         time_diff_hours = (current_timestamp - metric_timestamp) / 3600
         
-        if time_diff_hours > 1:
+        if time_diff_hours > config['data_freshness_warning_hours']:
             status_level = "警告"
             issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
-        elif time_diff_hours > 0.3:
+        elif time_diff_hours > config['data_freshness_alert_hours']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
@@ -8418,12 +10797,12 @@ class DatabaseManager:
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours, config)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float, config: Dict[str, float] = None) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -8434,35 +10813,38 @@ class DatabaseManager:
             swap_usage: Swap使用率
             network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
+            config: 健康度配置字典
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重（调整为5维评分）
+        if config is None:
+            config = self.get_health_config()
+            
+        # 各项指标的权重
         weights = {
-            'cpu': 0.20,
-            'memory': 0.20,
-            'disk': 0.20,
-            'swap': 0.15,
-            'network': 0.15,
-            'freshness': 0.10
+            'cpu': config['cpu_weight'],
+            'memory': config['memory_weight'],
+            'disk': config['disk_weight'],
+            'swap': config['swap_weight'],
+            'network': config['network_weight'],
+            'freshness': config['freshness_weight']
         }
         
-        # 计算各项得分（0-100分）
-        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
-        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
-        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
-        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        # 计算各项得分（0-100分），基于配置的阈值进行动态调整
+        cpu_score = self._calculate_dimension_score(cpu_usage, config['cpu_alert_threshold'], config['cpu_warning_threshold'], 'cpu', config)
+        mem_score = self._calculate_dimension_score(mem_usage, config['memory_alert_threshold'], config['memory_warning_threshold'], 'memory', config)
+        disk_score = self._calculate_dimension_score(disk_usage, config['disk_alert_threshold'], config['disk_warning_threshold'], 'disk', config)
+        swap_score = self._calculate_dimension_score(swap_usage, config['swap_alert_threshold'], config['swap_warning_threshold'], 'swap', config)
         
-        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
-        # 网络使用率越高得分越高，但超过80%开始扣分
-        if network_usage <= 80:
+        # 网络使用率得分（基于配置的阈值）
+        if network_usage <= config['network_score_threshold']:
             network_score = 100
         else:
-            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_score = max(0, 100 - (network_usage - config['network_score_threshold']) * 2)
         
-        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
-        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        # 数据新鲜度得分（使用配置的衰减率）
+        freshness_score = max(0, 100 - (data_freshness * config['freshness_score_decay_rate']))
         
         # 加权平均
         total_score = (
@@ -8475,6 +10857,44 @@ class DatabaseManager:
         )
         
         return int(max(0, min(100, total_score)))
+    
+    def _calculate_dimension_score(self, usage: float, alert_threshold: float, warning_threshold: float, dimension: str, config: Dict[str, float] = None) -> float:
+        """
+        计算单个维度的健康评分（0-100分）
+        
+        Args:
+            usage: 使用率
+            alert_threshold: 提示阈值
+            warning_threshold: 警告阈值
+            dimension: 维度名称
+            config: 健康度配置字典
+            
+        Returns:
+            维度评分（0-100）
+        """
+        if config is None:
+            config = self.get_health_config()
+        
+        # 根据不同的维度调整评分策略
+        if dimension == 'swap':
+            # Swap使用率影响倍数
+            usage = min(usage * config['swap_multiplier'], 100)
+        
+        # 基于配置的阈值进行评分
+        if usage <= alert_threshold:
+            # 正常范围：基于配置的基础评分和扣分率
+            normal_penalty = usage * config['normal_range_penalty_rate']
+            return max(0, config['normal_range_score_base'] - normal_penalty)
+        elif usage <= warning_threshold:
+            # 提示范围：基于配置的基础评分和扣分率
+            alert_range = warning_threshold - alert_threshold
+            alert_penalty = (usage - alert_threshold) / alert_range * (config['normal_range_score_base'] - config['alert_range_score_base'])
+            return max(0, config['alert_range_score_base'] - alert_penalty)
+        else:
+            # 警告范围：基于配置的基础评分和扣分率
+            warning_range = 100 - warning_threshold
+            warning_penalty = (usage - warning_threshold) / warning_range * (config['alert_range_score_base'] - config['warning_range_score_base'])
+            return max(0, config['warning_range_score_base'] - warning_penalty)
 
     def get_machine_status_by_ip(self, ip: str) -> Dict:
         """
@@ -8841,6 +11261,114 @@ class DatabaseManager:
         finally:
             self.return_connection(connection)
 
+    def get_health_config(self, force_refresh: bool = False) -> Dict[str, float]:
+        """获取健康度配置"""
+        import time
+        
+        # 检查缓存是否有效
+        current_time = time.time()
+        if (not force_refresh and 
+            self._health_config_cache is not None and 
+            current_time - self._health_config_cache_time < self._health_config_cache_ttl):
+            return self._health_config_cache
+        
+        connection = self.get_connection()
+        if not connection:
+            return self._get_default_health_config()
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT config_key, config_value FROM health_config")
+                config_data = cursor.fetchall()
+                
+                config_dict = {}
+                for row in config_data:
+                    # 修复：使用索引而不是字典键访问
+                    config_dict[row[0]] = float(row[1])
+                
+                # 确保所有必要的配置项都存在
+                default_config = self._get_default_health_config()
+                for key, value in default_config.items():
+                    if key not in config_dict:
+                        config_dict[key] = value
+                
+                # 更新缓存
+                self._health_config_cache = config_dict
+                self._health_config_cache_time = current_time
+                
+                return config_dict
+                
+        except Exception as e:
+            print(f"获取健康度配置失败: {e}")
+            return self._get_default_health_config()
+        finally:
+            self.return_connection(connection)
+    
+    def _get_default_health_config(self) -> Dict[str, float]:
+        """获取默认健康度配置"""
+        return {
+            'cpu_warning_threshold': 90.0,
+            'cpu_alert_threshold': 70.0,
+            'memory_warning_threshold': 90.0,
+            'memory_alert_threshold': 70.0,
+            'disk_warning_threshold': 90.0,
+            'disk_alert_threshold': 70.0,
+            'swap_warning_threshold': 50.0,
+            'swap_alert_threshold': 20.0,
+            'network_warning_threshold': 90.0,
+            'network_alert_threshold': 70.0,
+            'data_freshness_warning_hours': 1.0,
+            'data_freshness_alert_hours': 0.3,
+            'cpu_weight': 0.20,
+            'memory_weight': 0.20,
+            'disk_weight': 0.20,
+            'swap_weight': 0.15,
+            'network_weight': 0.15,
+            'freshness_weight': 0.10,
+            'network_base_bandwidth_mbps': 1000.0,
+            'network_score_threshold': 80.0,
+            'freshness_score_decay_rate': 20.0,
+            # 新增评分配置参数
+            'normal_range_score_base': 80.0,
+            'alert_range_score_base': 50.0,
+            'warning_range_score_base': 20.0,
+            'normal_range_penalty_rate': 0.20,
+            'alert_range_penalty_rate': 0.30,
+            'warning_range_penalty_rate': 0.50,
+            'swap_multiplier': 2.0,
+            'network_penalty_multiplier': 2.0
+        }
+    
+    def update_health_config(self, config_key: str, config_value: float) -> bool:
+        """更新健康度配置"""
+        connection = self.get_connection()
+        if not connection:
+            return False
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO health_config (config_key, config_value, updated_at) 
+                    VALUES (%s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (config_key) DO UPDATE SET 
+                    config_value = EXCLUDED.config_value,
+                    updated_at = CURRENT_TIMESTAMP
+                """, (config_key, config_value))
+                connection.commit()
+                
+                # 清除缓存，强制下次读取时刷新
+                self._health_config_cache = None
+                self._health_config_cache_time = 0
+                
+                return True
+                
+        except Exception as e:
+            print(f"更新健康度配置失败: {e}")
+            connection.rollback()
+            return False
+        finally:
+            self.return_connection(connection)
+    
     def assess_machine_status(self, metric: Dict) -> Dict:
         """
         根据监控指标评估机器运行状态
@@ -8851,6 +11379,9 @@ class DatabaseManager:
         Returns:
             包含状态分级和详细信息的字典
         """
+        # 获取健康度配置
+        config = self.get_health_config()
+        
         # 获取关键指标值，处理None值
         cpu_usr = metric.get('cpu_usr', 0) or 0
         cpu_sys = metric.get('cpu_sys', 0) or 0
@@ -8875,9 +11406,8 @@ class DatabaseManager:
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
         
-        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
-        # 1000 Mbps = 125,000 KB/s
-        max_bandwidth_kbps = 125000
+        # 计算网络使用率（使用配置的基准带宽）
+        max_bandwidth_kbps = config['network_base_bandwidth_mbps'] * 125  # Mbps转KB/s
         total_network_usage = net_rx_kbps + net_tx_kbps
         network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
@@ -8887,60 +11417,60 @@ class DatabaseManager:
         warnings = []
         
         # CPU使用率检查
-        if cpu_total >= 90:
+        if cpu_total >= config['cpu_warning_threshold']:
             status_level = "警告"
             issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
-        elif cpu_total >= 70:
+        elif cpu_total >= config['cpu_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
         
         # 内存使用率检查
-        if mem_usage_percent >= 90:
+        if mem_usage_percent >= config['memory_warning_threshold']:
             status_level = "警告"
             issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
-        elif mem_usage_percent >= 70:
+        elif mem_usage_percent >= config['memory_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
         
         # 磁盘使用率检查
-        if disk_used_percent >= 90:
+        if disk_used_percent >= config['disk_warning_threshold']:
             status_level = "警告"
             issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
-        elif disk_used_percent >= 70:
+        elif disk_used_percent >= config['disk_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
         
         # Swap使用率检查
-        if swap_usage_percent >= 50:
+        if swap_usage_percent >= config['swap_warning_threshold']:
             status_level = "警告"
             issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
-        elif swap_usage_percent >= 20:
+        elif swap_usage_percent >= config['swap_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
         # 网络使用率检查
-        if network_usage_percent >= 90:
+        if network_usage_percent >= config['network_warning_threshold']:
             status_level = "警告"
             issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
-        elif network_usage_percent >= 70:
+        elif network_usage_percent >= config['network_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
         
-        # 数据时效性检查（超过1小时无数据视为异常）
+        # 数据时效性检查
         import time
         current_timestamp = int(time.time())
         metric_timestamp = metric.get('ts', 0)
         time_diff_hours = (current_timestamp - metric_timestamp) / 3600
         
-        if time_diff_hours > 1:
+        if time_diff_hours > config['data_freshness_warning_hours']:
             status_level = "警告"
             issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
-        elif time_diff_hours > 0.3:
+        elif time_diff_hours > config['data_freshness_alert_hours']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
@@ -8961,12 +11491,12 @@ class DatabaseManager:
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours, config)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float, config: Dict[str, float] = None) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -8977,35 +11507,38 @@ class DatabaseManager:
             swap_usage: Swap使用率
             network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
+            config: 健康度配置字典
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重（调整为5维评分）
+        if config is None:
+            config = self.get_health_config()
+            
+        # 各项指标的权重
         weights = {
-            'cpu': 0.20,
-            'memory': 0.20,
-            'disk': 0.20,
-            'swap': 0.15,
-            'network': 0.15,
-            'freshness': 0.10
+            'cpu': config['cpu_weight'],
+            'memory': config['memory_weight'],
+            'disk': config['disk_weight'],
+            'swap': config['swap_weight'],
+            'network': config['network_weight'],
+            'freshness': config['freshness_weight']
         }
         
-        # 计算各项得分（0-100分）
-        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
-        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
-        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
-        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        # 计算各项得分（0-100分），基于配置的阈值进行动态调整
+        cpu_score = self._calculate_dimension_score(cpu_usage, config['cpu_alert_threshold'], config['cpu_warning_threshold'], 'cpu', config)
+        mem_score = self._calculate_dimension_score(mem_usage, config['memory_alert_threshold'], config['memory_warning_threshold'], 'memory', config)
+        disk_score = self._calculate_dimension_score(disk_usage, config['disk_alert_threshold'], config['disk_warning_threshold'], 'disk', config)
+        swap_score = self._calculate_dimension_score(swap_usage, config['swap_alert_threshold'], config['swap_warning_threshold'], 'swap', config)
         
-        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
-        # 网络使用率越高得分越高，但超过80%开始扣分
-        if network_usage <= 80:
+        # 网络使用率得分（基于配置的阈值）
+        if network_usage <= config['network_score_threshold']:
             network_score = 100
         else:
-            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_score = max(0, 100 - (network_usage - config['network_score_threshold']) * 2)
         
-        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
-        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        # 数据新鲜度得分（使用配置的衰减率）
+        freshness_score = max(0, 100 - (data_freshness * config['freshness_score_decay_rate']))
         
         # 加权平均
         total_score = (
@@ -9018,6 +11551,44 @@ class DatabaseManager:
         )
         
         return int(max(0, min(100, total_score)))
+    
+    def _calculate_dimension_score(self, usage: float, alert_threshold: float, warning_threshold: float, dimension: str, config: Dict[str, float] = None) -> float:
+        """
+        计算单个维度的健康评分（0-100分）
+        
+        Args:
+            usage: 使用率
+            alert_threshold: 提示阈值
+            warning_threshold: 警告阈值
+            dimension: 维度名称
+            config: 健康度配置字典
+            
+        Returns:
+            维度评分（0-100）
+        """
+        if config is None:
+            config = self.get_health_config()
+        
+        # 根据不同的维度调整评分策略
+        if dimension == 'swap':
+            # Swap使用率影响倍数
+            usage = min(usage * config['swap_multiplier'], 100)
+        
+        # 基于配置的阈值进行评分
+        if usage <= alert_threshold:
+            # 正常范围：基于配置的基础评分和扣分率
+            normal_penalty = usage * config['normal_range_penalty_rate']
+            return max(0, config['normal_range_score_base'] - normal_penalty)
+        elif usage <= warning_threshold:
+            # 提示范围：基于配置的基础评分和扣分率
+            alert_range = warning_threshold - alert_threshold
+            alert_penalty = (usage - alert_threshold) / alert_range * (config['normal_range_score_base'] - config['alert_range_score_base'])
+            return max(0, config['alert_range_score_base'] - alert_penalty)
+        else:
+            # 警告范围：基于配置的基础评分和扣分率
+            warning_range = 100 - warning_threshold
+            warning_penalty = (usage - warning_threshold) / warning_range * (config['alert_range_score_base'] - config['warning_range_score_base'])
+            return max(0, config['warning_range_score_base'] - warning_penalty)
 
     def get_machine_status_by_ip(self, ip: str) -> Dict:
         """
@@ -9405,6 +11976,114 @@ class DatabaseManager:
         finally:
             self.return_connection(connection)
 
+    def get_health_config(self, force_refresh: bool = False) -> Dict[str, float]:
+        """获取健康度配置"""
+        import time
+        
+        # 检查缓存是否有效
+        current_time = time.time()
+        if (not force_refresh and 
+            self._health_config_cache is not None and 
+            current_time - self._health_config_cache_time < self._health_config_cache_ttl):
+            return self._health_config_cache
+        
+        connection = self.get_connection()
+        if not connection:
+            return self._get_default_health_config()
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT config_key, config_value FROM health_config")
+                config_data = cursor.fetchall()
+                
+                config_dict = {}
+                for row in config_data:
+                    # 修复：使用索引而不是字典键访问
+                    config_dict[row[0]] = float(row[1])
+                
+                # 确保所有必要的配置项都存在
+                default_config = self._get_default_health_config()
+                for key, value in default_config.items():
+                    if key not in config_dict:
+                        config_dict[key] = value
+                
+                # 更新缓存
+                self._health_config_cache = config_dict
+                self._health_config_cache_time = current_time
+                
+                return config_dict
+                
+        except Exception as e:
+            print(f"获取健康度配置失败: {e}")
+            return self._get_default_health_config()
+        finally:
+            self.return_connection(connection)
+    
+    def _get_default_health_config(self) -> Dict[str, float]:
+        """获取默认健康度配置"""
+        return {
+            'cpu_warning_threshold': 90.0,
+            'cpu_alert_threshold': 70.0,
+            'memory_warning_threshold': 90.0,
+            'memory_alert_threshold': 70.0,
+            'disk_warning_threshold': 90.0,
+            'disk_alert_threshold': 70.0,
+            'swap_warning_threshold': 50.0,
+            'swap_alert_threshold': 20.0,
+            'network_warning_threshold': 90.0,
+            'network_alert_threshold': 70.0,
+            'data_freshness_warning_hours': 1.0,
+            'data_freshness_alert_hours': 0.3,
+            'cpu_weight': 0.20,
+            'memory_weight': 0.20,
+            'disk_weight': 0.20,
+            'swap_weight': 0.15,
+            'network_weight': 0.15,
+            'freshness_weight': 0.10,
+            'network_base_bandwidth_mbps': 1000.0,
+            'network_score_threshold': 80.0,
+            'freshness_score_decay_rate': 20.0,
+            # 新增评分配置参数
+            'normal_range_score_base': 80.0,
+            'alert_range_score_base': 50.0,
+            'warning_range_score_base': 20.0,
+            'normal_range_penalty_rate': 0.20,
+            'alert_range_penalty_rate': 0.30,
+            'warning_range_penalty_rate': 0.50,
+            'swap_multiplier': 2.0,
+            'network_penalty_multiplier': 2.0
+        }
+    
+    def update_health_config(self, config_key: str, config_value: float) -> bool:
+        """更新健康度配置"""
+        connection = self.get_connection()
+        if not connection:
+            return False
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO health_config (config_key, config_value, updated_at) 
+                    VALUES (%s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (config_key) DO UPDATE SET 
+                    config_value = EXCLUDED.config_value,
+                    updated_at = CURRENT_TIMESTAMP
+                """, (config_key, config_value))
+                connection.commit()
+                
+                # 清除缓存，强制下次读取时刷新
+                self._health_config_cache = None
+                self._health_config_cache_time = 0
+                
+                return True
+                
+        except Exception as e:
+            print(f"更新健康度配置失败: {e}")
+            connection.rollback()
+            return False
+        finally:
+            self.return_connection(connection)
+    
     def assess_machine_status(self, metric: Dict) -> Dict:
         """
         根据监控指标评估机器运行状态
@@ -9415,6 +12094,9 @@ class DatabaseManager:
         Returns:
             包含状态分级和详细信息的字典
         """
+        # 获取健康度配置
+        config = self.get_health_config()
+        
         # 获取关键指标值，处理None值
         cpu_usr = metric.get('cpu_usr', 0) or 0
         cpu_sys = metric.get('cpu_sys', 0) or 0
@@ -9439,9 +12121,8 @@ class DatabaseManager:
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
         
-        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
-        # 1000 Mbps = 125,000 KB/s
-        max_bandwidth_kbps = 125000
+        # 计算网络使用率（使用配置的基准带宽）
+        max_bandwidth_kbps = config['network_base_bandwidth_mbps'] * 125  # Mbps转KB/s
         total_network_usage = net_rx_kbps + net_tx_kbps
         network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
@@ -9451,60 +12132,60 @@ class DatabaseManager:
         warnings = []
         
         # CPU使用率检查
-        if cpu_total >= 90:
+        if cpu_total >= config['cpu_warning_threshold']:
             status_level = "警告"
             issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
-        elif cpu_total >= 70:
+        elif cpu_total >= config['cpu_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
         
         # 内存使用率检查
-        if mem_usage_percent >= 90:
+        if mem_usage_percent >= config['memory_warning_threshold']:
             status_level = "警告"
             issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
-        elif mem_usage_percent >= 70:
+        elif mem_usage_percent >= config['memory_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
         
         # 磁盘使用率检查
-        if disk_used_percent >= 90:
+        if disk_used_percent >= config['disk_warning_threshold']:
             status_level = "警告"
             issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
-        elif disk_used_percent >= 70:
+        elif disk_used_percent >= config['disk_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
         
         # Swap使用率检查
-        if swap_usage_percent >= 50:
+        if swap_usage_percent >= config['swap_warning_threshold']:
             status_level = "警告"
             issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
-        elif swap_usage_percent >= 20:
+        elif swap_usage_percent >= config['swap_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
         # 网络使用率检查
-        if network_usage_percent >= 90:
+        if network_usage_percent >= config['network_warning_threshold']:
             status_level = "警告"
             issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
-        elif network_usage_percent >= 70:
+        elif network_usage_percent >= config['network_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
         
-        # 数据时效性检查（超过1小时无数据视为异常）
+        # 数据时效性检查
         import time
         current_timestamp = int(time.time())
         metric_timestamp = metric.get('ts', 0)
         time_diff_hours = (current_timestamp - metric_timestamp) / 3600
         
-        if time_diff_hours > 1:
+        if time_diff_hours > config['data_freshness_warning_hours']:
             status_level = "警告"
             issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
-        elif time_diff_hours > 0.3:
+        elif time_diff_hours > config['data_freshness_alert_hours']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
@@ -9525,12 +12206,12 @@ class DatabaseManager:
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours, config)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float, config: Dict[str, float] = None) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -9541,35 +12222,38 @@ class DatabaseManager:
             swap_usage: Swap使用率
             network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
+            config: 健康度配置字典
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重（调整为5维评分）
+        if config is None:
+            config = self.get_health_config()
+            
+        # 各项指标的权重
         weights = {
-            'cpu': 0.20,
-            'memory': 0.20,
-            'disk': 0.20,
-            'swap': 0.15,
-            'network': 0.15,
-            'freshness': 0.10
+            'cpu': config['cpu_weight'],
+            'memory': config['memory_weight'],
+            'disk': config['disk_weight'],
+            'swap': config['swap_weight'],
+            'network': config['network_weight'],
+            'freshness': config['freshness_weight']
         }
         
-        # 计算各项得分（0-100分）
-        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
-        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
-        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
-        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        # 计算各项得分（0-100分），基于配置的阈值进行动态调整
+        cpu_score = self._calculate_dimension_score(cpu_usage, config['cpu_alert_threshold'], config['cpu_warning_threshold'], 'cpu', config)
+        mem_score = self._calculate_dimension_score(mem_usage, config['memory_alert_threshold'], config['memory_warning_threshold'], 'memory', config)
+        disk_score = self._calculate_dimension_score(disk_usage, config['disk_alert_threshold'], config['disk_warning_threshold'], 'disk', config)
+        swap_score = self._calculate_dimension_score(swap_usage, config['swap_alert_threshold'], config['swap_warning_threshold'], 'swap', config)
         
-        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
-        # 网络使用率越高得分越高，但超过80%开始扣分
-        if network_usage <= 80:
+        # 网络使用率得分（基于配置的阈值）
+        if network_usage <= config['network_score_threshold']:
             network_score = 100
         else:
-            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_score = max(0, 100 - (network_usage - config['network_score_threshold']) * 2)
         
-        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
-        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        # 数据新鲜度得分（使用配置的衰减率）
+        freshness_score = max(0, 100 - (data_freshness * config['freshness_score_decay_rate']))
         
         # 加权平均
         total_score = (
@@ -9582,6 +12266,44 @@ class DatabaseManager:
         )
         
         return int(max(0, min(100, total_score)))
+    
+    def _calculate_dimension_score(self, usage: float, alert_threshold: float, warning_threshold: float, dimension: str, config: Dict[str, float] = None) -> float:
+        """
+        计算单个维度的健康评分（0-100分）
+        
+        Args:
+            usage: 使用率
+            alert_threshold: 提示阈值
+            warning_threshold: 警告阈值
+            dimension: 维度名称
+            config: 健康度配置字典
+            
+        Returns:
+            维度评分（0-100）
+        """
+        if config is None:
+            config = self.get_health_config()
+        
+        # 根据不同的维度调整评分策略
+        if dimension == 'swap':
+            # Swap使用率影响倍数
+            usage = min(usage * config['swap_multiplier'], 100)
+        
+        # 基于配置的阈值进行评分
+        if usage <= alert_threshold:
+            # 正常范围：基于配置的基础评分和扣分率
+            normal_penalty = usage * config['normal_range_penalty_rate']
+            return max(0, config['normal_range_score_base'] - normal_penalty)
+        elif usage <= warning_threshold:
+            # 提示范围：基于配置的基础评分和扣分率
+            alert_range = warning_threshold - alert_threshold
+            alert_penalty = (usage - alert_threshold) / alert_range * (config['normal_range_score_base'] - config['alert_range_score_base'])
+            return max(0, config['alert_range_score_base'] - alert_penalty)
+        else:
+            # 警告范围：基于配置的基础评分和扣分率
+            warning_range = 100 - warning_threshold
+            warning_penalty = (usage - warning_threshold) / warning_range * (config['alert_range_score_base'] - config['warning_range_score_base'])
+            return max(0, config['warning_range_score_base'] - warning_penalty)
 
     def get_machine_status_by_ip(self, ip: str) -> Dict:
         """
@@ -9963,6 +12685,114 @@ class DatabaseManager:
         finally:
             self.return_connection(connection)
 
+    def get_health_config(self, force_refresh: bool = False) -> Dict[str, float]:
+        """获取健康度配置"""
+        import time
+        
+        # 检查缓存是否有效
+        current_time = time.time()
+        if (not force_refresh and 
+            self._health_config_cache is not None and 
+            current_time - self._health_config_cache_time < self._health_config_cache_ttl):
+            return self._health_config_cache
+        
+        connection = self.get_connection()
+        if not connection:
+            return self._get_default_health_config()
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT config_key, config_value FROM health_config")
+                config_data = cursor.fetchall()
+                
+                config_dict = {}
+                for row in config_data:
+                    # 修复：使用索引而不是字典键访问
+                    config_dict[row[0]] = float(row[1])
+                
+                # 确保所有必要的配置项都存在
+                default_config = self._get_default_health_config()
+                for key, value in default_config.items():
+                    if key not in config_dict:
+                        config_dict[key] = value
+                
+                # 更新缓存
+                self._health_config_cache = config_dict
+                self._health_config_cache_time = current_time
+                
+                return config_dict
+                
+        except Exception as e:
+            print(f"获取健康度配置失败: {e}")
+            return self._get_default_health_config()
+        finally:
+            self.return_connection(connection)
+    
+    def _get_default_health_config(self) -> Dict[str, float]:
+        """获取默认健康度配置"""
+        return {
+            'cpu_warning_threshold': 90.0,
+            'cpu_alert_threshold': 70.0,
+            'memory_warning_threshold': 90.0,
+            'memory_alert_threshold': 70.0,
+            'disk_warning_threshold': 90.0,
+            'disk_alert_threshold': 70.0,
+            'swap_warning_threshold': 50.0,
+            'swap_alert_threshold': 20.0,
+            'network_warning_threshold': 90.0,
+            'network_alert_threshold': 70.0,
+            'data_freshness_warning_hours': 1.0,
+            'data_freshness_alert_hours': 0.3,
+            'cpu_weight': 0.20,
+            'memory_weight': 0.20,
+            'disk_weight': 0.20,
+            'swap_weight': 0.15,
+            'network_weight': 0.15,
+            'freshness_weight': 0.10,
+            'network_base_bandwidth_mbps': 1000.0,
+            'network_score_threshold': 80.0,
+            'freshness_score_decay_rate': 20.0,
+            # 新增评分配置参数
+            'normal_range_score_base': 80.0,
+            'alert_range_score_base': 50.0,
+            'warning_range_score_base': 20.0,
+            'normal_range_penalty_rate': 0.20,
+            'alert_range_penalty_rate': 0.30,
+            'warning_range_penalty_rate': 0.50,
+            'swap_multiplier': 2.0,
+            'network_penalty_multiplier': 2.0
+        }
+    
+    def update_health_config(self, config_key: str, config_value: float) -> bool:
+        """更新健康度配置"""
+        connection = self.get_connection()
+        if not connection:
+            return False
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO health_config (config_key, config_value, updated_at) 
+                    VALUES (%s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (config_key) DO UPDATE SET 
+                    config_value = EXCLUDED.config_value,
+                    updated_at = CURRENT_TIMESTAMP
+                """, (config_key, config_value))
+                connection.commit()
+                
+                # 清除缓存，强制下次读取时刷新
+                self._health_config_cache = None
+                self._health_config_cache_time = 0
+                
+                return True
+                
+        except Exception as e:
+            print(f"更新健康度配置失败: {e}")
+            connection.rollback()
+            return False
+        finally:
+            self.return_connection(connection)
+    
     def assess_machine_status(self, metric: Dict) -> Dict:
         """
         根据监控指标评估机器运行状态
@@ -9973,6 +12803,9 @@ class DatabaseManager:
         Returns:
             包含状态分级和详细信息的字典
         """
+        # 获取健康度配置
+        config = self.get_health_config()
+        
         # 获取关键指标值，处理None值
         cpu_usr = metric.get('cpu_usr', 0) or 0
         cpu_sys = metric.get('cpu_sys', 0) or 0
@@ -9997,9 +12830,8 @@ class DatabaseManager:
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
         
-        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
-        # 1000 Mbps = 125,000 KB/s
-        max_bandwidth_kbps = 125000
+        # 计算网络使用率（使用配置的基准带宽）
+        max_bandwidth_kbps = config['network_base_bandwidth_mbps'] * 125  # Mbps转KB/s
         total_network_usage = net_rx_kbps + net_tx_kbps
         network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
@@ -10009,60 +12841,60 @@ class DatabaseManager:
         warnings = []
         
         # CPU使用率检查
-        if cpu_total >= 90:
+        if cpu_total >= config['cpu_warning_threshold']:
             status_level = "警告"
             issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
-        elif cpu_total >= 70:
+        elif cpu_total >= config['cpu_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
         
         # 内存使用率检查
-        if mem_usage_percent >= 90:
+        if mem_usage_percent >= config['memory_warning_threshold']:
             status_level = "警告"
             issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
-        elif mem_usage_percent >= 70:
+        elif mem_usage_percent >= config['memory_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
         
         # 磁盘使用率检查
-        if disk_used_percent >= 90:
+        if disk_used_percent >= config['disk_warning_threshold']:
             status_level = "警告"
             issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
-        elif disk_used_percent >= 70:
+        elif disk_used_percent >= config['disk_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
         
         # Swap使用率检查
-        if swap_usage_percent >= 50:
+        if swap_usage_percent >= config['swap_warning_threshold']:
             status_level = "警告"
             issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
-        elif swap_usage_percent >= 20:
+        elif swap_usage_percent >= config['swap_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
         # 网络使用率检查
-        if network_usage_percent >= 90:
+        if network_usage_percent >= config['network_warning_threshold']:
             status_level = "警告"
             issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
-        elif network_usage_percent >= 70:
+        elif network_usage_percent >= config['network_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
         
-        # 数据时效性检查（超过1小时无数据视为异常）
+        # 数据时效性检查
         import time
         current_timestamp = int(time.time())
         metric_timestamp = metric.get('ts', 0)
         time_diff_hours = (current_timestamp - metric_timestamp) / 3600
         
-        if time_diff_hours > 1:
+        if time_diff_hours > config['data_freshness_warning_hours']:
             status_level = "警告"
             issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
-        elif time_diff_hours > 0.3:
+        elif time_diff_hours > config['data_freshness_alert_hours']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
@@ -10083,12 +12915,12 @@ class DatabaseManager:
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours, config)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float, config: Dict[str, float] = None) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -10099,35 +12931,38 @@ class DatabaseManager:
             swap_usage: Swap使用率
             network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
+            config: 健康度配置字典
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重（调整为5维评分）
+        if config is None:
+            config = self.get_health_config()
+            
+        # 各项指标的权重
         weights = {
-            'cpu': 0.20,
-            'memory': 0.20,
-            'disk': 0.20,
-            'swap': 0.15,
-            'network': 0.15,
-            'freshness': 0.10
+            'cpu': config['cpu_weight'],
+            'memory': config['memory_weight'],
+            'disk': config['disk_weight'],
+            'swap': config['swap_weight'],
+            'network': config['network_weight'],
+            'freshness': config['freshness_weight']
         }
         
-        # 计算各项得分（0-100分）
-        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
-        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
-        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
-        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        # 计算各项得分（0-100分），基于配置的阈值进行动态调整
+        cpu_score = self._calculate_dimension_score(cpu_usage, config['cpu_alert_threshold'], config['cpu_warning_threshold'], 'cpu', config)
+        mem_score = self._calculate_dimension_score(mem_usage, config['memory_alert_threshold'], config['memory_warning_threshold'], 'memory', config)
+        disk_score = self._calculate_dimension_score(disk_usage, config['disk_alert_threshold'], config['disk_warning_threshold'], 'disk', config)
+        swap_score = self._calculate_dimension_score(swap_usage, config['swap_alert_threshold'], config['swap_warning_threshold'], 'swap', config)
         
-        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
-        # 网络使用率越高得分越高，但超过80%开始扣分
-        if network_usage <= 80:
+        # 网络使用率得分（基于配置的阈值）
+        if network_usage <= config['network_score_threshold']:
             network_score = 100
         else:
-            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_score = max(0, 100 - (network_usage - config['network_score_threshold']) * 2)
         
-        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
-        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        # 数据新鲜度得分（使用配置的衰减率）
+        freshness_score = max(0, 100 - (data_freshness * config['freshness_score_decay_rate']))
         
         # 加权平均
         total_score = (
@@ -10140,6 +12975,44 @@ class DatabaseManager:
         )
         
         return int(max(0, min(100, total_score)))
+    
+    def _calculate_dimension_score(self, usage: float, alert_threshold: float, warning_threshold: float, dimension: str, config: Dict[str, float] = None) -> float:
+        """
+        计算单个维度的健康评分（0-100分）
+        
+        Args:
+            usage: 使用率
+            alert_threshold: 提示阈值
+            warning_threshold: 警告阈值
+            dimension: 维度名称
+            config: 健康度配置字典
+            
+        Returns:
+            维度评分（0-100）
+        """
+        if config is None:
+            config = self.get_health_config()
+        
+        # 根据不同的维度调整评分策略
+        if dimension == 'swap':
+            # Swap使用率影响倍数
+            usage = min(usage * config['swap_multiplier'], 100)
+        
+        # 基于配置的阈值进行评分
+        if usage <= alert_threshold:
+            # 正常范围：基于配置的基础评分和扣分率
+            normal_penalty = usage * config['normal_range_penalty_rate']
+            return max(0, config['normal_range_score_base'] - normal_penalty)
+        elif usage <= warning_threshold:
+            # 提示范围：基于配置的基础评分和扣分率
+            alert_range = warning_threshold - alert_threshold
+            alert_penalty = (usage - alert_threshold) / alert_range * (config['normal_range_score_base'] - config['alert_range_score_base'])
+            return max(0, config['alert_range_score_base'] - alert_penalty)
+        else:
+            # 警告范围：基于配置的基础评分和扣分率
+            warning_range = 100 - warning_threshold
+            warning_penalty = (usage - warning_threshold) / warning_range * (config['alert_range_score_base'] - config['warning_range_score_base'])
+            return max(0, config['warning_range_score_base'] - warning_penalty)
 
     def get_machine_status_by_ip(self, ip: str) -> Dict:
         """
@@ -10524,6 +13397,114 @@ class DatabaseManager:
         finally:
             self.return_connection(connection)
 
+    def get_health_config(self, force_refresh: bool = False) -> Dict[str, float]:
+        """获取健康度配置"""
+        import time
+        
+        # 检查缓存是否有效
+        current_time = time.time()
+        if (not force_refresh and 
+            self._health_config_cache is not None and 
+            current_time - self._health_config_cache_time < self._health_config_cache_ttl):
+            return self._health_config_cache
+        
+        connection = self.get_connection()
+        if not connection:
+            return self._get_default_health_config()
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT config_key, config_value FROM health_config")
+                config_data = cursor.fetchall()
+                
+                config_dict = {}
+                for row in config_data:
+                    # 修复：使用索引而不是字典键访问
+                    config_dict[row[0]] = float(row[1])
+                
+                # 确保所有必要的配置项都存在
+                default_config = self._get_default_health_config()
+                for key, value in default_config.items():
+                    if key not in config_dict:
+                        config_dict[key] = value
+                
+                # 更新缓存
+                self._health_config_cache = config_dict
+                self._health_config_cache_time = current_time
+                
+                return config_dict
+                
+        except Exception as e:
+            print(f"获取健康度配置失败: {e}")
+            return self._get_default_health_config()
+        finally:
+            self.return_connection(connection)
+    
+    def _get_default_health_config(self) -> Dict[str, float]:
+        """获取默认健康度配置"""
+        return {
+            'cpu_warning_threshold': 90.0,
+            'cpu_alert_threshold': 70.0,
+            'memory_warning_threshold': 90.0,
+            'memory_alert_threshold': 70.0,
+            'disk_warning_threshold': 90.0,
+            'disk_alert_threshold': 70.0,
+            'swap_warning_threshold': 50.0,
+            'swap_alert_threshold': 20.0,
+            'network_warning_threshold': 90.0,
+            'network_alert_threshold': 70.0,
+            'data_freshness_warning_hours': 1.0,
+            'data_freshness_alert_hours': 0.3,
+            'cpu_weight': 0.20,
+            'memory_weight': 0.20,
+            'disk_weight': 0.20,
+            'swap_weight': 0.15,
+            'network_weight': 0.15,
+            'freshness_weight': 0.10,
+            'network_base_bandwidth_mbps': 1000.0,
+            'network_score_threshold': 80.0,
+            'freshness_score_decay_rate': 20.0,
+            # 新增评分配置参数
+            'normal_range_score_base': 80.0,
+            'alert_range_score_base': 50.0,
+            'warning_range_score_base': 20.0,
+            'normal_range_penalty_rate': 0.20,
+            'alert_range_penalty_rate': 0.30,
+            'warning_range_penalty_rate': 0.50,
+            'swap_multiplier': 2.0,
+            'network_penalty_multiplier': 2.0
+        }
+    
+    def update_health_config(self, config_key: str, config_value: float) -> bool:
+        """更新健康度配置"""
+        connection = self.get_connection()
+        if not connection:
+            return False
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO health_config (config_key, config_value, updated_at) 
+                    VALUES (%s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (config_key) DO UPDATE SET 
+                    config_value = EXCLUDED.config_value,
+                    updated_at = CURRENT_TIMESTAMP
+                """, (config_key, config_value))
+                connection.commit()
+                
+                # 清除缓存，强制下次读取时刷新
+                self._health_config_cache = None
+                self._health_config_cache_time = 0
+                
+                return True
+                
+        except Exception as e:
+            print(f"更新健康度配置失败: {e}")
+            connection.rollback()
+            return False
+        finally:
+            self.return_connection(connection)
+    
     def assess_machine_status(self, metric: Dict) -> Dict:
         """
         根据监控指标评估机器运行状态
@@ -10534,6 +13515,9 @@ class DatabaseManager:
         Returns:
             包含状态分级和详细信息的字典
         """
+        # 获取健康度配置
+        config = self.get_health_config()
+        
         # 获取关键指标值，处理None值
         cpu_usr = metric.get('cpu_usr', 0) or 0
         cpu_sys = metric.get('cpu_sys', 0) or 0
@@ -10558,9 +13542,8 @@ class DatabaseManager:
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
         
-        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
-        # 1000 Mbps = 125,000 KB/s
-        max_bandwidth_kbps = 125000
+        # 计算网络使用率（使用配置的基准带宽）
+        max_bandwidth_kbps = config['network_base_bandwidth_mbps'] * 125  # Mbps转KB/s
         total_network_usage = net_rx_kbps + net_tx_kbps
         network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
@@ -10570,60 +13553,60 @@ class DatabaseManager:
         warnings = []
         
         # CPU使用率检查
-        if cpu_total >= 90:
+        if cpu_total >= config['cpu_warning_threshold']:
             status_level = "警告"
             issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
-        elif cpu_total >= 70:
+        elif cpu_total >= config['cpu_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
         
         # 内存使用率检查
-        if mem_usage_percent >= 90:
+        if mem_usage_percent >= config['memory_warning_threshold']:
             status_level = "警告"
             issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
-        elif mem_usage_percent >= 70:
+        elif mem_usage_percent >= config['memory_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
         
         # 磁盘使用率检查
-        if disk_used_percent >= 90:
+        if disk_used_percent >= config['disk_warning_threshold']:
             status_level = "警告"
             issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
-        elif disk_used_percent >= 70:
+        elif disk_used_percent >= config['disk_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
         
         # Swap使用率检查
-        if swap_usage_percent >= 50:
+        if swap_usage_percent >= config['swap_warning_threshold']:
             status_level = "警告"
             issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
-        elif swap_usage_percent >= 20:
+        elif swap_usage_percent >= config['swap_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
         # 网络使用率检查
-        if network_usage_percent >= 90:
+        if network_usage_percent >= config['network_warning_threshold']:
             status_level = "警告"
             issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
-        elif network_usage_percent >= 70:
+        elif network_usage_percent >= config['network_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
         
-        # 数据时效性检查（超过1小时无数据视为异常）
+        # 数据时效性检查
         import time
         current_timestamp = int(time.time())
         metric_timestamp = metric.get('ts', 0)
         time_diff_hours = (current_timestamp - metric_timestamp) / 3600
         
-        if time_diff_hours > 1:
+        if time_diff_hours > config['data_freshness_warning_hours']:
             status_level = "警告"
             issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
-        elif time_diff_hours > 0.3:
+        elif time_diff_hours > config['data_freshness_alert_hours']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
@@ -10644,12 +13627,12 @@ class DatabaseManager:
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours, config)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float, config: Dict[str, float] = None) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -10660,35 +13643,38 @@ class DatabaseManager:
             swap_usage: Swap使用率
             network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
+            config: 健康度配置字典
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重（调整为5维评分）
+        if config is None:
+            config = self.get_health_config()
+            
+        # 各项指标的权重
         weights = {
-            'cpu': 0.20,
-            'memory': 0.20,
-            'disk': 0.20,
-            'swap': 0.15,
-            'network': 0.15,
-            'freshness': 0.10
+            'cpu': config['cpu_weight'],
+            'memory': config['memory_weight'],
+            'disk': config['disk_weight'],
+            'swap': config['swap_weight'],
+            'network': config['network_weight'],
+            'freshness': config['freshness_weight']
         }
         
-        # 计算各项得分（0-100分）
-        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
-        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
-        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
-        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        # 计算各项得分（0-100分），基于配置的阈值进行动态调整
+        cpu_score = self._calculate_dimension_score(cpu_usage, config['cpu_alert_threshold'], config['cpu_warning_threshold'], 'cpu', config)
+        mem_score = self._calculate_dimension_score(mem_usage, config['memory_alert_threshold'], config['memory_warning_threshold'], 'memory', config)
+        disk_score = self._calculate_dimension_score(disk_usage, config['disk_alert_threshold'], config['disk_warning_threshold'], 'disk', config)
+        swap_score = self._calculate_dimension_score(swap_usage, config['swap_alert_threshold'], config['swap_warning_threshold'], 'swap', config)
         
-        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
-        # 网络使用率越高得分越高，但超过80%开始扣分
-        if network_usage <= 80:
+        # 网络使用率得分（基于配置的阈值）
+        if network_usage <= config['network_score_threshold']:
             network_score = 100
         else:
-            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_score = max(0, 100 - (network_usage - config['network_score_threshold']) * 2)
         
-        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
-        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        # 数据新鲜度得分（使用配置的衰减率）
+        freshness_score = max(0, 100 - (data_freshness * config['freshness_score_decay_rate']))
         
         # 加权平均
         total_score = (
@@ -10701,6 +13687,44 @@ class DatabaseManager:
         )
         
         return int(max(0, min(100, total_score)))
+    
+    def _calculate_dimension_score(self, usage: float, alert_threshold: float, warning_threshold: float, dimension: str, config: Dict[str, float] = None) -> float:
+        """
+        计算单个维度的健康评分（0-100分）
+        
+        Args:
+            usage: 使用率
+            alert_threshold: 提示阈值
+            warning_threshold: 警告阈值
+            dimension: 维度名称
+            config: 健康度配置字典
+            
+        Returns:
+            维度评分（0-100）
+        """
+        if config is None:
+            config = self.get_health_config()
+        
+        # 根据不同的维度调整评分策略
+        if dimension == 'swap':
+            # Swap使用率影响倍数
+            usage = min(usage * config['swap_multiplier'], 100)
+        
+        # 基于配置的阈值进行评分
+        if usage <= alert_threshold:
+            # 正常范围：基于配置的基础评分和扣分率
+            normal_penalty = usage * config['normal_range_penalty_rate']
+            return max(0, config['normal_range_score_base'] - normal_penalty)
+        elif usage <= warning_threshold:
+            # 提示范围：基于配置的基础评分和扣分率
+            alert_range = warning_threshold - alert_threshold
+            alert_penalty = (usage - alert_threshold) / alert_range * (config['normal_range_score_base'] - config['alert_range_score_base'])
+            return max(0, config['alert_range_score_base'] - alert_penalty)
+        else:
+            # 警告范围：基于配置的基础评分和扣分率
+            warning_range = 100 - warning_threshold
+            warning_penalty = (usage - warning_threshold) / warning_range * (config['alert_range_score_base'] - config['warning_range_score_base'])
+            return max(0, config['warning_range_score_base'] - warning_penalty)
 
     def get_machine_status_by_ip(self, ip: str) -> Dict:
         """
@@ -11103,6 +14127,114 @@ class DatabaseManager:
         finally:
             self.return_connection(connection)
 
+    def get_health_config(self, force_refresh: bool = False) -> Dict[str, float]:
+        """获取健康度配置"""
+        import time
+        
+        # 检查缓存是否有效
+        current_time = time.time()
+        if (not force_refresh and 
+            self._health_config_cache is not None and 
+            current_time - self._health_config_cache_time < self._health_config_cache_ttl):
+            return self._health_config_cache
+        
+        connection = self.get_connection()
+        if not connection:
+            return self._get_default_health_config()
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT config_key, config_value FROM health_config")
+                config_data = cursor.fetchall()
+                
+                config_dict = {}
+                for row in config_data:
+                    # 修复：使用索引而不是字典键访问
+                    config_dict[row[0]] = float(row[1])
+                
+                # 确保所有必要的配置项都存在
+                default_config = self._get_default_health_config()
+                for key, value in default_config.items():
+                    if key not in config_dict:
+                        config_dict[key] = value
+                
+                # 更新缓存
+                self._health_config_cache = config_dict
+                self._health_config_cache_time = current_time
+                
+                return config_dict
+                
+        except Exception as e:
+            print(f"获取健康度配置失败: {e}")
+            return self._get_default_health_config()
+        finally:
+            self.return_connection(connection)
+    
+    def _get_default_health_config(self) -> Dict[str, float]:
+        """获取默认健康度配置"""
+        return {
+            'cpu_warning_threshold': 90.0,
+            'cpu_alert_threshold': 70.0,
+            'memory_warning_threshold': 90.0,
+            'memory_alert_threshold': 70.0,
+            'disk_warning_threshold': 90.0,
+            'disk_alert_threshold': 70.0,
+            'swap_warning_threshold': 50.0,
+            'swap_alert_threshold': 20.0,
+            'network_warning_threshold': 90.0,
+            'network_alert_threshold': 70.0,
+            'data_freshness_warning_hours': 1.0,
+            'data_freshness_alert_hours': 0.3,
+            'cpu_weight': 0.20,
+            'memory_weight': 0.20,
+            'disk_weight': 0.20,
+            'swap_weight': 0.15,
+            'network_weight': 0.15,
+            'freshness_weight': 0.10,
+            'network_base_bandwidth_mbps': 1000.0,
+            'network_score_threshold': 80.0,
+            'freshness_score_decay_rate': 20.0,
+            # 新增评分配置参数
+            'normal_range_score_base': 80.0,
+            'alert_range_score_base': 50.0,
+            'warning_range_score_base': 20.0,
+            'normal_range_penalty_rate': 0.20,
+            'alert_range_penalty_rate': 0.30,
+            'warning_range_penalty_rate': 0.50,
+            'swap_multiplier': 2.0,
+            'network_penalty_multiplier': 2.0
+        }
+    
+    def update_health_config(self, config_key: str, config_value: float) -> bool:
+        """更新健康度配置"""
+        connection = self.get_connection()
+        if not connection:
+            return False
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO health_config (config_key, config_value, updated_at) 
+                    VALUES (%s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (config_key) DO UPDATE SET 
+                    config_value = EXCLUDED.config_value,
+                    updated_at = CURRENT_TIMESTAMP
+                """, (config_key, config_value))
+                connection.commit()
+                
+                # 清除缓存，强制下次读取时刷新
+                self._health_config_cache = None
+                self._health_config_cache_time = 0
+                
+                return True
+                
+        except Exception as e:
+            print(f"更新健康度配置失败: {e}")
+            connection.rollback()
+            return False
+        finally:
+            self.return_connection(connection)
+    
     def assess_machine_status(self, metric: Dict) -> Dict:
         """
         根据监控指标评估机器运行状态
@@ -11113,6 +14245,9 @@ class DatabaseManager:
         Returns:
             包含状态分级和详细信息的字典
         """
+        # 获取健康度配置
+        config = self.get_health_config()
+        
         # 获取关键指标值，处理None值
         cpu_usr = metric.get('cpu_usr', 0) or 0
         cpu_sys = metric.get('cpu_sys', 0) or 0
@@ -11137,9 +14272,8 @@ class DatabaseManager:
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
         
-        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
-        # 1000 Mbps = 125,000 KB/s
-        max_bandwidth_kbps = 125000
+        # 计算网络使用率（使用配置的基准带宽）
+        max_bandwidth_kbps = config['network_base_bandwidth_mbps'] * 125  # Mbps转KB/s
         total_network_usage = net_rx_kbps + net_tx_kbps
         network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
@@ -11149,60 +14283,60 @@ class DatabaseManager:
         warnings = []
         
         # CPU使用率检查
-        if cpu_total >= 90:
+        if cpu_total >= config['cpu_warning_threshold']:
             status_level = "警告"
             issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
-        elif cpu_total >= 70:
+        elif cpu_total >= config['cpu_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
         
         # 内存使用率检查
-        if mem_usage_percent >= 90:
+        if mem_usage_percent >= config['memory_warning_threshold']:
             status_level = "警告"
             issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
-        elif mem_usage_percent >= 70:
+        elif mem_usage_percent >= config['memory_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
         
         # 磁盘使用率检查
-        if disk_used_percent >= 90:
+        if disk_used_percent >= config['disk_warning_threshold']:
             status_level = "警告"
             issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
-        elif disk_used_percent >= 70:
+        elif disk_used_percent >= config['disk_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
         
         # Swap使用率检查
-        if swap_usage_percent >= 50:
+        if swap_usage_percent >= config['swap_warning_threshold']:
             status_level = "警告"
             issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
-        elif swap_usage_percent >= 20:
+        elif swap_usage_percent >= config['swap_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
         # 网络使用率检查
-        if network_usage_percent >= 90:
+        if network_usage_percent >= config['network_warning_threshold']:
             status_level = "警告"
             issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
-        elif network_usage_percent >= 70:
+        elif network_usage_percent >= config['network_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
         
-        # 数据时效性检查（超过1小时无数据视为异常）
+        # 数据时效性检查
         import time
         current_timestamp = int(time.time())
         metric_timestamp = metric.get('ts', 0)
         time_diff_hours = (current_timestamp - metric_timestamp) / 3600
         
-        if time_diff_hours > 1:
+        if time_diff_hours > config['data_freshness_warning_hours']:
             status_level = "警告"
             issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
-        elif time_diff_hours > 0.3:
+        elif time_diff_hours > config['data_freshness_alert_hours']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
@@ -11223,12 +14357,12 @@ class DatabaseManager:
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours, config)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float, config: Dict[str, float] = None) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -11239,35 +14373,38 @@ class DatabaseManager:
             swap_usage: Swap使用率
             network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
+            config: 健康度配置字典
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重（调整为5维评分）
+        if config is None:
+            config = self.get_health_config()
+            
+        # 各项指标的权重
         weights = {
-            'cpu': 0.20,
-            'memory': 0.20,
-            'disk': 0.20,
-            'swap': 0.15,
-            'network': 0.15,
-            'freshness': 0.10
+            'cpu': config['cpu_weight'],
+            'memory': config['memory_weight'],
+            'disk': config['disk_weight'],
+            'swap': config['swap_weight'],
+            'network': config['network_weight'],
+            'freshness': config['freshness_weight']
         }
         
-        # 计算各项得分（0-100分）
-        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
-        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
-        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
-        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        # 计算各项得分（0-100分），基于配置的阈值进行动态调整
+        cpu_score = self._calculate_dimension_score(cpu_usage, config['cpu_alert_threshold'], config['cpu_warning_threshold'], 'cpu', config)
+        mem_score = self._calculate_dimension_score(mem_usage, config['memory_alert_threshold'], config['memory_warning_threshold'], 'memory', config)
+        disk_score = self._calculate_dimension_score(disk_usage, config['disk_alert_threshold'], config['disk_warning_threshold'], 'disk', config)
+        swap_score = self._calculate_dimension_score(swap_usage, config['swap_alert_threshold'], config['swap_warning_threshold'], 'swap', config)
         
-        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
-        # 网络使用率越高得分越高，但超过80%开始扣分
-        if network_usage <= 80:
+        # 网络使用率得分（基于配置的阈值）
+        if network_usage <= config['network_score_threshold']:
             network_score = 100
         else:
-            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_score = max(0, 100 - (network_usage - config['network_score_threshold']) * 2)
         
-        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
-        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        # 数据新鲜度得分（使用配置的衰减率）
+        freshness_score = max(0, 100 - (data_freshness * config['freshness_score_decay_rate']))
         
         # 加权平均
         total_score = (
@@ -11280,6 +14417,44 @@ class DatabaseManager:
         )
         
         return int(max(0, min(100, total_score)))
+    
+    def _calculate_dimension_score(self, usage: float, alert_threshold: float, warning_threshold: float, dimension: str, config: Dict[str, float] = None) -> float:
+        """
+        计算单个维度的健康评分（0-100分）
+        
+        Args:
+            usage: 使用率
+            alert_threshold: 提示阈值
+            warning_threshold: 警告阈值
+            dimension: 维度名称
+            config: 健康度配置字典
+            
+        Returns:
+            维度评分（0-100）
+        """
+        if config is None:
+            config = self.get_health_config()
+        
+        # 根据不同的维度调整评分策略
+        if dimension == 'swap':
+            # Swap使用率影响倍数
+            usage = min(usage * config['swap_multiplier'], 100)
+        
+        # 基于配置的阈值进行评分
+        if usage <= alert_threshold:
+            # 正常范围：基于配置的基础评分和扣分率
+            normal_penalty = usage * config['normal_range_penalty_rate']
+            return max(0, config['normal_range_score_base'] - normal_penalty)
+        elif usage <= warning_threshold:
+            # 提示范围：基于配置的基础评分和扣分率
+            alert_range = warning_threshold - alert_threshold
+            alert_penalty = (usage - alert_threshold) / alert_range * (config['normal_range_score_base'] - config['alert_range_score_base'])
+            return max(0, config['alert_range_score_base'] - alert_penalty)
+        else:
+            # 警告范围：基于配置的基础评分和扣分率
+            warning_range = 100 - warning_threshold
+            warning_penalty = (usage - warning_threshold) / warning_range * (config['alert_range_score_base'] - config['warning_range_score_base'])
+            return max(0, config['warning_range_score_base'] - warning_penalty)
 
     def get_machine_status_by_ip(self, ip: str) -> Dict:
         """
@@ -11670,6 +14845,114 @@ class DatabaseManager:
         finally:
             self.return_connection(connection)
 
+    def get_health_config(self, force_refresh: bool = False) -> Dict[str, float]:
+        """获取健康度配置"""
+        import time
+        
+        # 检查缓存是否有效
+        current_time = time.time()
+        if (not force_refresh and 
+            self._health_config_cache is not None and 
+            current_time - self._health_config_cache_time < self._health_config_cache_ttl):
+            return self._health_config_cache
+        
+        connection = self.get_connection()
+        if not connection:
+            return self._get_default_health_config()
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT config_key, config_value FROM health_config")
+                config_data = cursor.fetchall()
+                
+                config_dict = {}
+                for row in config_data:
+                    # 修复：使用索引而不是字典键访问
+                    config_dict[row[0]] = float(row[1])
+                
+                # 确保所有必要的配置项都存在
+                default_config = self._get_default_health_config()
+                for key, value in default_config.items():
+                    if key not in config_dict:
+                        config_dict[key] = value
+                
+                # 更新缓存
+                self._health_config_cache = config_dict
+                self._health_config_cache_time = current_time
+                
+                return config_dict
+                
+        except Exception as e:
+            print(f"获取健康度配置失败: {e}")
+            return self._get_default_health_config()
+        finally:
+            self.return_connection(connection)
+    
+    def _get_default_health_config(self) -> Dict[str, float]:
+        """获取默认健康度配置"""
+        return {
+            'cpu_warning_threshold': 90.0,
+            'cpu_alert_threshold': 70.0,
+            'memory_warning_threshold': 90.0,
+            'memory_alert_threshold': 70.0,
+            'disk_warning_threshold': 90.0,
+            'disk_alert_threshold': 70.0,
+            'swap_warning_threshold': 50.0,
+            'swap_alert_threshold': 20.0,
+            'network_warning_threshold': 90.0,
+            'network_alert_threshold': 70.0,
+            'data_freshness_warning_hours': 1.0,
+            'data_freshness_alert_hours': 0.3,
+            'cpu_weight': 0.20,
+            'memory_weight': 0.20,
+            'disk_weight': 0.20,
+            'swap_weight': 0.15,
+            'network_weight': 0.15,
+            'freshness_weight': 0.10,
+            'network_base_bandwidth_mbps': 1000.0,
+            'network_score_threshold': 80.0,
+            'freshness_score_decay_rate': 20.0,
+            # 新增评分配置参数
+            'normal_range_score_base': 80.0,
+            'alert_range_score_base': 50.0,
+            'warning_range_score_base': 20.0,
+            'normal_range_penalty_rate': 0.20,
+            'alert_range_penalty_rate': 0.30,
+            'warning_range_penalty_rate': 0.50,
+            'swap_multiplier': 2.0,
+            'network_penalty_multiplier': 2.0
+        }
+    
+    def update_health_config(self, config_key: str, config_value: float) -> bool:
+        """更新健康度配置"""
+        connection = self.get_connection()
+        if not connection:
+            return False
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO health_config (config_key, config_value, updated_at) 
+                    VALUES (%s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (config_key) DO UPDATE SET 
+                    config_value = EXCLUDED.config_value,
+                    updated_at = CURRENT_TIMESTAMP
+                """, (config_key, config_value))
+                connection.commit()
+                
+                # 清除缓存，强制下次读取时刷新
+                self._health_config_cache = None
+                self._health_config_cache_time = 0
+                
+                return True
+                
+        except Exception as e:
+            print(f"更新健康度配置失败: {e}")
+            connection.rollback()
+            return False
+        finally:
+            self.return_connection(connection)
+    
     def assess_machine_status(self, metric: Dict) -> Dict:
         """
         根据监控指标评估机器运行状态
@@ -11680,6 +14963,9 @@ class DatabaseManager:
         Returns:
             包含状态分级和详细信息的字典
         """
+        # 获取健康度配置
+        config = self.get_health_config()
+        
         # 获取关键指标值，处理None值
         cpu_usr = metric.get('cpu_usr', 0) or 0
         cpu_sys = metric.get('cpu_sys', 0) or 0
@@ -11704,9 +14990,8 @@ class DatabaseManager:
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
         
-        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
-        # 1000 Mbps = 125,000 KB/s
-        max_bandwidth_kbps = 125000
+        # 计算网络使用率（使用配置的基准带宽）
+        max_bandwidth_kbps = config['network_base_bandwidth_mbps'] * 125  # Mbps转KB/s
         total_network_usage = net_rx_kbps + net_tx_kbps
         network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
@@ -11716,60 +15001,60 @@ class DatabaseManager:
         warnings = []
         
         # CPU使用率检查
-        if cpu_total >= 90:
+        if cpu_total >= config['cpu_warning_threshold']:
             status_level = "警告"
             issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
-        elif cpu_total >= 70:
+        elif cpu_total >= config['cpu_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
         
         # 内存使用率检查
-        if mem_usage_percent >= 90:
+        if mem_usage_percent >= config['memory_warning_threshold']:
             status_level = "警告"
             issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
-        elif mem_usage_percent >= 70:
+        elif mem_usage_percent >= config['memory_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
         
         # 磁盘使用率检查
-        if disk_used_percent >= 90:
+        if disk_used_percent >= config['disk_warning_threshold']:
             status_level = "警告"
             issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
-        elif disk_used_percent >= 70:
+        elif disk_used_percent >= config['disk_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
         
         # Swap使用率检查
-        if swap_usage_percent >= 50:
+        if swap_usage_percent >= config['swap_warning_threshold']:
             status_level = "警告"
             issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
-        elif swap_usage_percent >= 20:
+        elif swap_usage_percent >= config['swap_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
         # 网络使用率检查
-        if network_usage_percent >= 90:
+        if network_usage_percent >= config['network_warning_threshold']:
             status_level = "警告"
             issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
-        elif network_usage_percent >= 70:
+        elif network_usage_percent >= config['network_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
         
-        # 数据时效性检查（超过1小时无数据视为异常）
+        # 数据时效性检查
         import time
         current_timestamp = int(time.time())
         metric_timestamp = metric.get('ts', 0)
         time_diff_hours = (current_timestamp - metric_timestamp) / 3600
         
-        if time_diff_hours > 1:
+        if time_diff_hours > config['data_freshness_warning_hours']:
             status_level = "警告"
             issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
-        elif time_diff_hours > 0.3:
+        elif time_diff_hours > config['data_freshness_alert_hours']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
@@ -11790,12 +15075,12 @@ class DatabaseManager:
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours, config)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float, config: Dict[str, float] = None) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -11806,35 +15091,38 @@ class DatabaseManager:
             swap_usage: Swap使用率
             network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
+            config: 健康度配置字典
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重（调整为5维评分）
+        if config is None:
+            config = self.get_health_config()
+            
+        # 各项指标的权重
         weights = {
-            'cpu': 0.20,
-            'memory': 0.20,
-            'disk': 0.20,
-            'swap': 0.15,
-            'network': 0.15,
-            'freshness': 0.10
+            'cpu': config['cpu_weight'],
+            'memory': config['memory_weight'],
+            'disk': config['disk_weight'],
+            'swap': config['swap_weight'],
+            'network': config['network_weight'],
+            'freshness': config['freshness_weight']
         }
         
-        # 计算各项得分（0-100分）
-        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
-        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
-        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
-        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        # 计算各项得分（0-100分），基于配置的阈值进行动态调整
+        cpu_score = self._calculate_dimension_score(cpu_usage, config['cpu_alert_threshold'], config['cpu_warning_threshold'], 'cpu', config)
+        mem_score = self._calculate_dimension_score(mem_usage, config['memory_alert_threshold'], config['memory_warning_threshold'], 'memory', config)
+        disk_score = self._calculate_dimension_score(disk_usage, config['disk_alert_threshold'], config['disk_warning_threshold'], 'disk', config)
+        swap_score = self._calculate_dimension_score(swap_usage, config['swap_alert_threshold'], config['swap_warning_threshold'], 'swap', config)
         
-        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
-        # 网络使用率越高得分越高，但超过80%开始扣分
-        if network_usage <= 80:
+        # 网络使用率得分（基于配置的阈值）
+        if network_usage <= config['network_score_threshold']:
             network_score = 100
         else:
-            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_score = max(0, 100 - (network_usage - config['network_score_threshold']) * 2)
         
-        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
-        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        # 数据新鲜度得分（使用配置的衰减率）
+        freshness_score = max(0, 100 - (data_freshness * config['freshness_score_decay_rate']))
         
         # 加权平均
         total_score = (
@@ -11847,6 +15135,44 @@ class DatabaseManager:
         )
         
         return int(max(0, min(100, total_score)))
+    
+    def _calculate_dimension_score(self, usage: float, alert_threshold: float, warning_threshold: float, dimension: str, config: Dict[str, float] = None) -> float:
+        """
+        计算单个维度的健康评分（0-100分）
+        
+        Args:
+            usage: 使用率
+            alert_threshold: 提示阈值
+            warning_threshold: 警告阈值
+            dimension: 维度名称
+            config: 健康度配置字典
+            
+        Returns:
+            维度评分（0-100）
+        """
+        if config is None:
+            config = self.get_health_config()
+        
+        # 根据不同的维度调整评分策略
+        if dimension == 'swap':
+            # Swap使用率影响倍数
+            usage = min(usage * config['swap_multiplier'], 100)
+        
+        # 基于配置的阈值进行评分
+        if usage <= alert_threshold:
+            # 正常范围：基于配置的基础评分和扣分率
+            normal_penalty = usage * config['normal_range_penalty_rate']
+            return max(0, config['normal_range_score_base'] - normal_penalty)
+        elif usage <= warning_threshold:
+            # 提示范围：基于配置的基础评分和扣分率
+            alert_range = warning_threshold - alert_threshold
+            alert_penalty = (usage - alert_threshold) / alert_range * (config['normal_range_score_base'] - config['alert_range_score_base'])
+            return max(0, config['alert_range_score_base'] - alert_penalty)
+        else:
+            # 警告范围：基于配置的基础评分和扣分率
+            warning_range = 100 - warning_threshold
+            warning_penalty = (usage - warning_threshold) / warning_range * (config['alert_range_score_base'] - config['warning_range_score_base'])
+            return max(0, config['warning_range_score_base'] - warning_penalty)
 
     def get_machine_status_by_ip(self, ip: str) -> Dict:
         """
@@ -12256,6 +15582,114 @@ class DatabaseManager:
         finally:
             self.return_connection(connection)
 
+    def get_health_config(self, force_refresh: bool = False) -> Dict[str, float]:
+        """获取健康度配置"""
+        import time
+        
+        # 检查缓存是否有效
+        current_time = time.time()
+        if (not force_refresh and 
+            self._health_config_cache is not None and 
+            current_time - self._health_config_cache_time < self._health_config_cache_ttl):
+            return self._health_config_cache
+        
+        connection = self.get_connection()
+        if not connection:
+            return self._get_default_health_config()
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT config_key, config_value FROM health_config")
+                config_data = cursor.fetchall()
+                
+                config_dict = {}
+                for row in config_data:
+                    # 修复：使用索引而不是字典键访问
+                    config_dict[row[0]] = float(row[1])
+                
+                # 确保所有必要的配置项都存在
+                default_config = self._get_default_health_config()
+                for key, value in default_config.items():
+                    if key not in config_dict:
+                        config_dict[key] = value
+                
+                # 更新缓存
+                self._health_config_cache = config_dict
+                self._health_config_cache_time = current_time
+                
+                return config_dict
+                
+        except Exception as e:
+            print(f"获取健康度配置失败: {e}")
+            return self._get_default_health_config()
+        finally:
+            self.return_connection(connection)
+    
+    def _get_default_health_config(self) -> Dict[str, float]:
+        """获取默认健康度配置"""
+        return {
+            'cpu_warning_threshold': 90.0,
+            'cpu_alert_threshold': 70.0,
+            'memory_warning_threshold': 90.0,
+            'memory_alert_threshold': 70.0,
+            'disk_warning_threshold': 90.0,
+            'disk_alert_threshold': 70.0,
+            'swap_warning_threshold': 50.0,
+            'swap_alert_threshold': 20.0,
+            'network_warning_threshold': 90.0,
+            'network_alert_threshold': 70.0,
+            'data_freshness_warning_hours': 1.0,
+            'data_freshness_alert_hours': 0.3,
+            'cpu_weight': 0.20,
+            'memory_weight': 0.20,
+            'disk_weight': 0.20,
+            'swap_weight': 0.15,
+            'network_weight': 0.15,
+            'freshness_weight': 0.10,
+            'network_base_bandwidth_mbps': 1000.0,
+            'network_score_threshold': 80.0,
+            'freshness_score_decay_rate': 20.0,
+            # 新增评分配置参数
+            'normal_range_score_base': 80.0,
+            'alert_range_score_base': 50.0,
+            'warning_range_score_base': 20.0,
+            'normal_range_penalty_rate': 0.20,
+            'alert_range_penalty_rate': 0.30,
+            'warning_range_penalty_rate': 0.50,
+            'swap_multiplier': 2.0,
+            'network_penalty_multiplier': 2.0
+        }
+    
+    def update_health_config(self, config_key: str, config_value: float) -> bool:
+        """更新健康度配置"""
+        connection = self.get_connection()
+        if not connection:
+            return False
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO health_config (config_key, config_value, updated_at) 
+                    VALUES (%s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (config_key) DO UPDATE SET 
+                    config_value = EXCLUDED.config_value,
+                    updated_at = CURRENT_TIMESTAMP
+                """, (config_key, config_value))
+                connection.commit()
+                
+                # 清除缓存，强制下次读取时刷新
+                self._health_config_cache = None
+                self._health_config_cache_time = 0
+                
+                return True
+                
+        except Exception as e:
+            print(f"更新健康度配置失败: {e}")
+            connection.rollback()
+            return False
+        finally:
+            self.return_connection(connection)
+    
     def assess_machine_status(self, metric: Dict) -> Dict:
         """
         根据监控指标评估机器运行状态
@@ -12266,6 +15700,9 @@ class DatabaseManager:
         Returns:
             包含状态分级和详细信息的字典
         """
+        # 获取健康度配置
+        config = self.get_health_config()
+        
         # 获取关键指标值，处理None值
         cpu_usr = metric.get('cpu_usr', 0) or 0
         cpu_sys = metric.get('cpu_sys', 0) or 0
@@ -12290,9 +15727,8 @@ class DatabaseManager:
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
         
-        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
-        # 1000 Mbps = 125,000 KB/s
-        max_bandwidth_kbps = 125000
+        # 计算网络使用率（使用配置的基准带宽）
+        max_bandwidth_kbps = config['network_base_bandwidth_mbps'] * 125  # Mbps转KB/s
         total_network_usage = net_rx_kbps + net_tx_kbps
         network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
@@ -12302,60 +15738,60 @@ class DatabaseManager:
         warnings = []
         
         # CPU使用率检查
-        if cpu_total >= 90:
+        if cpu_total >= config['cpu_warning_threshold']:
             status_level = "警告"
             issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
-        elif cpu_total >= 70:
+        elif cpu_total >= config['cpu_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
         
         # 内存使用率检查
-        if mem_usage_percent >= 90:
+        if mem_usage_percent >= config['memory_warning_threshold']:
             status_level = "警告"
             issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
-        elif mem_usage_percent >= 70:
+        elif mem_usage_percent >= config['memory_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
         
         # 磁盘使用率检查
-        if disk_used_percent >= 90:
+        if disk_used_percent >= config['disk_warning_threshold']:
             status_level = "警告"
             issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
-        elif disk_used_percent >= 70:
+        elif disk_used_percent >= config['disk_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
         
         # Swap使用率检查
-        if swap_usage_percent >= 50:
+        if swap_usage_percent >= config['swap_warning_threshold']:
             status_level = "警告"
             issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
-        elif swap_usage_percent >= 20:
+        elif swap_usage_percent >= config['swap_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
         # 网络使用率检查
-        if network_usage_percent >= 90:
+        if network_usage_percent >= config['network_warning_threshold']:
             status_level = "警告"
             issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
-        elif network_usage_percent >= 70:
+        elif network_usage_percent >= config['network_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
         
-        # 数据时效性检查（超过1小时无数据视为异常）
+        # 数据时效性检查
         import time
         current_timestamp = int(time.time())
         metric_timestamp = metric.get('ts', 0)
         time_diff_hours = (current_timestamp - metric_timestamp) / 3600
         
-        if time_diff_hours > 1:
+        if time_diff_hours > config['data_freshness_warning_hours']:
             status_level = "警告"
             issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
-        elif time_diff_hours > 0.3:
+        elif time_diff_hours > config['data_freshness_alert_hours']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
@@ -12376,12 +15812,12 @@ class DatabaseManager:
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours, config)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float, config: Dict[str, float] = None) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -12392,35 +15828,38 @@ class DatabaseManager:
             swap_usage: Swap使用率
             network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
+            config: 健康度配置字典
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重（调整为5维评分）
+        if config is None:
+            config = self.get_health_config()
+            
+        # 各项指标的权重
         weights = {
-            'cpu': 0.20,
-            'memory': 0.20,
-            'disk': 0.20,
-            'swap': 0.15,
-            'network': 0.15,
-            'freshness': 0.10
+            'cpu': config['cpu_weight'],
+            'memory': config['memory_weight'],
+            'disk': config['disk_weight'],
+            'swap': config['swap_weight'],
+            'network': config['network_weight'],
+            'freshness': config['freshness_weight']
         }
         
-        # 计算各项得分（0-100分）
-        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
-        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
-        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
-        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        # 计算各项得分（0-100分），基于配置的阈值进行动态调整
+        cpu_score = self._calculate_dimension_score(cpu_usage, config['cpu_alert_threshold'], config['cpu_warning_threshold'], 'cpu', config)
+        mem_score = self._calculate_dimension_score(mem_usage, config['memory_alert_threshold'], config['memory_warning_threshold'], 'memory', config)
+        disk_score = self._calculate_dimension_score(disk_usage, config['disk_alert_threshold'], config['disk_warning_threshold'], 'disk', config)
+        swap_score = self._calculate_dimension_score(swap_usage, config['swap_alert_threshold'], config['swap_warning_threshold'], 'swap', config)
         
-        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
-        # 网络使用率越高得分越高，但超过80%开始扣分
-        if network_usage <= 80:
+        # 网络使用率得分（基于配置的阈值）
+        if network_usage <= config['network_score_threshold']:
             network_score = 100
         else:
-            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_score = max(0, 100 - (network_usage - config['network_score_threshold']) * 2)
         
-        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
-        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        # 数据新鲜度得分（使用配置的衰减率）
+        freshness_score = max(0, 100 - (data_freshness * config['freshness_score_decay_rate']))
         
         # 加权平均
         total_score = (
@@ -12433,6 +15872,44 @@ class DatabaseManager:
         )
         
         return int(max(0, min(100, total_score)))
+    
+    def _calculate_dimension_score(self, usage: float, alert_threshold: float, warning_threshold: float, dimension: str, config: Dict[str, float] = None) -> float:
+        """
+        计算单个维度的健康评分（0-100分）
+        
+        Args:
+            usage: 使用率
+            alert_threshold: 提示阈值
+            warning_threshold: 警告阈值
+            dimension: 维度名称
+            config: 健康度配置字典
+            
+        Returns:
+            维度评分（0-100）
+        """
+        if config is None:
+            config = self.get_health_config()
+        
+        # 根据不同的维度调整评分策略
+        if dimension == 'swap':
+            # Swap使用率影响倍数
+            usage = min(usage * config['swap_multiplier'], 100)
+        
+        # 基于配置的阈值进行评分
+        if usage <= alert_threshold:
+            # 正常范围：基于配置的基础评分和扣分率
+            normal_penalty = usage * config['normal_range_penalty_rate']
+            return max(0, config['normal_range_score_base'] - normal_penalty)
+        elif usage <= warning_threshold:
+            # 提示范围：基于配置的基础评分和扣分率
+            alert_range = warning_threshold - alert_threshold
+            alert_penalty = (usage - alert_threshold) / alert_range * (config['normal_range_score_base'] - config['alert_range_score_base'])
+            return max(0, config['alert_range_score_base'] - alert_penalty)
+        else:
+            # 警告范围：基于配置的基础评分和扣分率
+            warning_range = 100 - warning_threshold
+            warning_penalty = (usage - warning_threshold) / warning_range * (config['alert_range_score_base'] - config['warning_range_score_base'])
+            return max(0, config['warning_range_score_base'] - warning_penalty)
 
     def get_machine_status_by_ip(self, ip: str) -> Dict:
         """
@@ -12821,6 +16298,114 @@ class DatabaseManager:
         finally:
             self.return_connection(connection)
 
+    def get_health_config(self, force_refresh: bool = False) -> Dict[str, float]:
+        """获取健康度配置"""
+        import time
+        
+        # 检查缓存是否有效
+        current_time = time.time()
+        if (not force_refresh and 
+            self._health_config_cache is not None and 
+            current_time - self._health_config_cache_time < self._health_config_cache_ttl):
+            return self._health_config_cache
+        
+        connection = self.get_connection()
+        if not connection:
+            return self._get_default_health_config()
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT config_key, config_value FROM health_config")
+                config_data = cursor.fetchall()
+                
+                config_dict = {}
+                for row in config_data:
+                    # 修复：使用索引而不是字典键访问
+                    config_dict[row[0]] = float(row[1])
+                
+                # 确保所有必要的配置项都存在
+                default_config = self._get_default_health_config()
+                for key, value in default_config.items():
+                    if key not in config_dict:
+                        config_dict[key] = value
+                
+                # 更新缓存
+                self._health_config_cache = config_dict
+                self._health_config_cache_time = current_time
+                
+                return config_dict
+                
+        except Exception as e:
+            print(f"获取健康度配置失败: {e}")
+            return self._get_default_health_config()
+        finally:
+            self.return_connection(connection)
+    
+    def _get_default_health_config(self) -> Dict[str, float]:
+        """获取默认健康度配置"""
+        return {
+            'cpu_warning_threshold': 90.0,
+            'cpu_alert_threshold': 70.0,
+            'memory_warning_threshold': 90.0,
+            'memory_alert_threshold': 70.0,
+            'disk_warning_threshold': 90.0,
+            'disk_alert_threshold': 70.0,
+            'swap_warning_threshold': 50.0,
+            'swap_alert_threshold': 20.0,
+            'network_warning_threshold': 90.0,
+            'network_alert_threshold': 70.0,
+            'data_freshness_warning_hours': 1.0,
+            'data_freshness_alert_hours': 0.3,
+            'cpu_weight': 0.20,
+            'memory_weight': 0.20,
+            'disk_weight': 0.20,
+            'swap_weight': 0.15,
+            'network_weight': 0.15,
+            'freshness_weight': 0.10,
+            'network_base_bandwidth_mbps': 1000.0,
+            'network_score_threshold': 80.0,
+            'freshness_score_decay_rate': 20.0,
+            # 新增评分配置参数
+            'normal_range_score_base': 80.0,
+            'alert_range_score_base': 50.0,
+            'warning_range_score_base': 20.0,
+            'normal_range_penalty_rate': 0.20,
+            'alert_range_penalty_rate': 0.30,
+            'warning_range_penalty_rate': 0.50,
+            'swap_multiplier': 2.0,
+            'network_penalty_multiplier': 2.0
+        }
+    
+    def update_health_config(self, config_key: str, config_value: float) -> bool:
+        """更新健康度配置"""
+        connection = self.get_connection()
+        if not connection:
+            return False
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO health_config (config_key, config_value, updated_at) 
+                    VALUES (%s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (config_key) DO UPDATE SET 
+                    config_value = EXCLUDED.config_value,
+                    updated_at = CURRENT_TIMESTAMP
+                """, (config_key, config_value))
+                connection.commit()
+                
+                # 清除缓存，强制下次读取时刷新
+                self._health_config_cache = None
+                self._health_config_cache_time = 0
+                
+                return True
+                
+        except Exception as e:
+            print(f"更新健康度配置失败: {e}")
+            connection.rollback()
+            return False
+        finally:
+            self.return_connection(connection)
+    
     def assess_machine_status(self, metric: Dict) -> Dict:
         """
         根据监控指标评估机器运行状态
@@ -12831,6 +16416,9 @@ class DatabaseManager:
         Returns:
             包含状态分级和详细信息的字典
         """
+        # 获取健康度配置
+        config = self.get_health_config()
+        
         # 获取关键指标值，处理None值
         cpu_usr = metric.get('cpu_usr', 0) or 0
         cpu_sys = metric.get('cpu_sys', 0) or 0
@@ -12855,9 +16443,8 @@ class DatabaseManager:
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
         
-        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
-        # 1000 Mbps = 125,000 KB/s
-        max_bandwidth_kbps = 125000
+        # 计算网络使用率（使用配置的基准带宽）
+        max_bandwidth_kbps = config['network_base_bandwidth_mbps'] * 125  # Mbps转KB/s
         total_network_usage = net_rx_kbps + net_tx_kbps
         network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
@@ -12867,60 +16454,60 @@ class DatabaseManager:
         warnings = []
         
         # CPU使用率检查
-        if cpu_total >= 90:
+        if cpu_total >= config['cpu_warning_threshold']:
             status_level = "警告"
             issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
-        elif cpu_total >= 70:
+        elif cpu_total >= config['cpu_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
         
         # 内存使用率检查
-        if mem_usage_percent >= 90:
+        if mem_usage_percent >= config['memory_warning_threshold']:
             status_level = "警告"
             issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
-        elif mem_usage_percent >= 70:
+        elif mem_usage_percent >= config['memory_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
         
         # 磁盘使用率检查
-        if disk_used_percent >= 90:
+        if disk_used_percent >= config['disk_warning_threshold']:
             status_level = "警告"
             issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
-        elif disk_used_percent >= 70:
+        elif disk_used_percent >= config['disk_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
         
         # Swap使用率检查
-        if swap_usage_percent >= 50:
+        if swap_usage_percent >= config['swap_warning_threshold']:
             status_level = "警告"
             issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
-        elif swap_usage_percent >= 20:
+        elif swap_usage_percent >= config['swap_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
         # 网络使用率检查
-        if network_usage_percent >= 90:
+        if network_usage_percent >= config['network_warning_threshold']:
             status_level = "警告"
             issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
-        elif network_usage_percent >= 70:
+        elif network_usage_percent >= config['network_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
         
-        # 数据时效性检查（超过1小时无数据视为异常）
+        # 数据时效性检查
         import time
         current_timestamp = int(time.time())
         metric_timestamp = metric.get('ts', 0)
         time_diff_hours = (current_timestamp - metric_timestamp) / 3600
         
-        if time_diff_hours > 1:
+        if time_diff_hours > config['data_freshness_warning_hours']:
             status_level = "警告"
             issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
-        elif time_diff_hours > 0.3:
+        elif time_diff_hours > config['data_freshness_alert_hours']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
@@ -12941,12 +16528,12 @@ class DatabaseManager:
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours, config)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float, config: Dict[str, float] = None) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -12957,35 +16544,38 @@ class DatabaseManager:
             swap_usage: Swap使用率
             network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
+            config: 健康度配置字典
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重（调整为5维评分）
+        if config is None:
+            config = self.get_health_config()
+            
+        # 各项指标的权重
         weights = {
-            'cpu': 0.20,
-            'memory': 0.20,
-            'disk': 0.20,
-            'swap': 0.15,
-            'network': 0.15,
-            'freshness': 0.10
+            'cpu': config['cpu_weight'],
+            'memory': config['memory_weight'],
+            'disk': config['disk_weight'],
+            'swap': config['swap_weight'],
+            'network': config['network_weight'],
+            'freshness': config['freshness_weight']
         }
         
-        # 计算各项得分（0-100分）
-        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
-        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
-        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
-        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        # 计算各项得分（0-100分），基于配置的阈值进行动态调整
+        cpu_score = self._calculate_dimension_score(cpu_usage, config['cpu_alert_threshold'], config['cpu_warning_threshold'], 'cpu', config)
+        mem_score = self._calculate_dimension_score(mem_usage, config['memory_alert_threshold'], config['memory_warning_threshold'], 'memory', config)
+        disk_score = self._calculate_dimension_score(disk_usage, config['disk_alert_threshold'], config['disk_warning_threshold'], 'disk', config)
+        swap_score = self._calculate_dimension_score(swap_usage, config['swap_alert_threshold'], config['swap_warning_threshold'], 'swap', config)
         
-        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
-        # 网络使用率越高得分越高，但超过80%开始扣分
-        if network_usage <= 80:
+        # 网络使用率得分（基于配置的阈值）
+        if network_usage <= config['network_score_threshold']:
             network_score = 100
         else:
-            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_score = max(0, 100 - (network_usage - config['network_score_threshold']) * 2)
         
-        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
-        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        # 数据新鲜度得分（使用配置的衰减率）
+        freshness_score = max(0, 100 - (data_freshness * config['freshness_score_decay_rate']))
         
         # 加权平均
         total_score = (
@@ -12998,6 +16588,44 @@ class DatabaseManager:
         )
         
         return int(max(0, min(100, total_score)))
+    
+    def _calculate_dimension_score(self, usage: float, alert_threshold: float, warning_threshold: float, dimension: str, config: Dict[str, float] = None) -> float:
+        """
+        计算单个维度的健康评分（0-100分）
+        
+        Args:
+            usage: 使用率
+            alert_threshold: 提示阈值
+            warning_threshold: 警告阈值
+            dimension: 维度名称
+            config: 健康度配置字典
+            
+        Returns:
+            维度评分（0-100）
+        """
+        if config is None:
+            config = self.get_health_config()
+        
+        # 根据不同的维度调整评分策略
+        if dimension == 'swap':
+            # Swap使用率影响倍数
+            usage = min(usage * config['swap_multiplier'], 100)
+        
+        # 基于配置的阈值进行评分
+        if usage <= alert_threshold:
+            # 正常范围：基于配置的基础评分和扣分率
+            normal_penalty = usage * config['normal_range_penalty_rate']
+            return max(0, config['normal_range_score_base'] - normal_penalty)
+        elif usage <= warning_threshold:
+            # 提示范围：基于配置的基础评分和扣分率
+            alert_range = warning_threshold - alert_threshold
+            alert_penalty = (usage - alert_threshold) / alert_range * (config['normal_range_score_base'] - config['alert_range_score_base'])
+            return max(0, config['alert_range_score_base'] - alert_penalty)
+        else:
+            # 警告范围：基于配置的基础评分和扣分率
+            warning_range = 100 - warning_threshold
+            warning_penalty = (usage - warning_threshold) / warning_range * (config['alert_range_score_base'] - config['warning_range_score_base'])
+            return max(0, config['warning_range_score_base'] - warning_penalty)
 
     def get_machine_status_by_ip(self, ip: str) -> Dict:
         """
@@ -13400,6 +17028,114 @@ class DatabaseManager:
         finally:
             self.return_connection(connection)
 
+    def get_health_config(self, force_refresh: bool = False) -> Dict[str, float]:
+        """获取健康度配置"""
+        import time
+        
+        # 检查缓存是否有效
+        current_time = time.time()
+        if (not force_refresh and 
+            self._health_config_cache is not None and 
+            current_time - self._health_config_cache_time < self._health_config_cache_ttl):
+            return self._health_config_cache
+        
+        connection = self.get_connection()
+        if not connection:
+            return self._get_default_health_config()
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT config_key, config_value FROM health_config")
+                config_data = cursor.fetchall()
+                
+                config_dict = {}
+                for row in config_data:
+                    # 修复：使用索引而不是字典键访问
+                    config_dict[row[0]] = float(row[1])
+                
+                # 确保所有必要的配置项都存在
+                default_config = self._get_default_health_config()
+                for key, value in default_config.items():
+                    if key not in config_dict:
+                        config_dict[key] = value
+                
+                # 更新缓存
+                self._health_config_cache = config_dict
+                self._health_config_cache_time = current_time
+                
+                return config_dict
+                
+        except Exception as e:
+            print(f"获取健康度配置失败: {e}")
+            return self._get_default_health_config()
+        finally:
+            self.return_connection(connection)
+    
+    def _get_default_health_config(self) -> Dict[str, float]:
+        """获取默认健康度配置"""
+        return {
+            'cpu_warning_threshold': 90.0,
+            'cpu_alert_threshold': 70.0,
+            'memory_warning_threshold': 90.0,
+            'memory_alert_threshold': 70.0,
+            'disk_warning_threshold': 90.0,
+            'disk_alert_threshold': 70.0,
+            'swap_warning_threshold': 50.0,
+            'swap_alert_threshold': 20.0,
+            'network_warning_threshold': 90.0,
+            'network_alert_threshold': 70.0,
+            'data_freshness_warning_hours': 1.0,
+            'data_freshness_alert_hours': 0.3,
+            'cpu_weight': 0.20,
+            'memory_weight': 0.20,
+            'disk_weight': 0.20,
+            'swap_weight': 0.15,
+            'network_weight': 0.15,
+            'freshness_weight': 0.10,
+            'network_base_bandwidth_mbps': 1000.0,
+            'network_score_threshold': 80.0,
+            'freshness_score_decay_rate': 20.0,
+            # 新增评分配置参数
+            'normal_range_score_base': 80.0,
+            'alert_range_score_base': 50.0,
+            'warning_range_score_base': 20.0,
+            'normal_range_penalty_rate': 0.20,
+            'alert_range_penalty_rate': 0.30,
+            'warning_range_penalty_rate': 0.50,
+            'swap_multiplier': 2.0,
+            'network_penalty_multiplier': 2.0
+        }
+    
+    def update_health_config(self, config_key: str, config_value: float) -> bool:
+        """更新健康度配置"""
+        connection = self.get_connection()
+        if not connection:
+            return False
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO health_config (config_key, config_value, updated_at) 
+                    VALUES (%s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (config_key) DO UPDATE SET 
+                    config_value = EXCLUDED.config_value,
+                    updated_at = CURRENT_TIMESTAMP
+                """, (config_key, config_value))
+                connection.commit()
+                
+                # 清除缓存，强制下次读取时刷新
+                self._health_config_cache = None
+                self._health_config_cache_time = 0
+                
+                return True
+                
+        except Exception as e:
+            print(f"更新健康度配置失败: {e}")
+            connection.rollback()
+            return False
+        finally:
+            self.return_connection(connection)
+    
     def assess_machine_status(self, metric: Dict) -> Dict:
         """
         根据监控指标评估机器运行状态
@@ -13410,6 +17146,9 @@ class DatabaseManager:
         Returns:
             包含状态分级和详细信息的字典
         """
+        # 获取健康度配置
+        config = self.get_health_config()
+        
         # 获取关键指标值，处理None值
         cpu_usr = metric.get('cpu_usr', 0) or 0
         cpu_sys = metric.get('cpu_sys', 0) or 0
@@ -13434,9 +17173,8 @@ class DatabaseManager:
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
         
-        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
-        # 1000 Mbps = 125,000 KB/s
-        max_bandwidth_kbps = 125000
+        # 计算网络使用率（使用配置的基准带宽）
+        max_bandwidth_kbps = config['network_base_bandwidth_mbps'] * 125  # Mbps转KB/s
         total_network_usage = net_rx_kbps + net_tx_kbps
         network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
@@ -13446,60 +17184,60 @@ class DatabaseManager:
         warnings = []
         
         # CPU使用率检查
-        if cpu_total >= 90:
+        if cpu_total >= config['cpu_warning_threshold']:
             status_level = "警告"
             issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
-        elif cpu_total >= 70:
+        elif cpu_total >= config['cpu_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
         
         # 内存使用率检查
-        if mem_usage_percent >= 90:
+        if mem_usage_percent >= config['memory_warning_threshold']:
             status_level = "警告"
             issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
-        elif mem_usage_percent >= 70:
+        elif mem_usage_percent >= config['memory_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
         
         # 磁盘使用率检查
-        if disk_used_percent >= 90:
+        if disk_used_percent >= config['disk_warning_threshold']:
             status_level = "警告"
             issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
-        elif disk_used_percent >= 70:
+        elif disk_used_percent >= config['disk_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
         
         # Swap使用率检查
-        if swap_usage_percent >= 50:
+        if swap_usage_percent >= config['swap_warning_threshold']:
             status_level = "警告"
             issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
-        elif swap_usage_percent >= 20:
+        elif swap_usage_percent >= config['swap_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
         # 网络使用率检查
-        if network_usage_percent >= 90:
+        if network_usage_percent >= config['network_warning_threshold']:
             status_level = "警告"
             issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
-        elif network_usage_percent >= 70:
+        elif network_usage_percent >= config['network_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
         
-        # 数据时效性检查（超过1小时无数据视为异常）
+        # 数据时效性检查
         import time
         current_timestamp = int(time.time())
         metric_timestamp = metric.get('ts', 0)
         time_diff_hours = (current_timestamp - metric_timestamp) / 3600
         
-        if time_diff_hours > 1:
+        if time_diff_hours > config['data_freshness_warning_hours']:
             status_level = "警告"
             issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
-        elif time_diff_hours > 0.3:
+        elif time_diff_hours > config['data_freshness_alert_hours']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
@@ -13520,12 +17258,12 @@ class DatabaseManager:
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours, config)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float, config: Dict[str, float] = None) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -13536,35 +17274,38 @@ class DatabaseManager:
             swap_usage: Swap使用率
             network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
+            config: 健康度配置字典
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重（调整为5维评分）
+        if config is None:
+            config = self.get_health_config()
+            
+        # 各项指标的权重
         weights = {
-            'cpu': 0.20,
-            'memory': 0.20,
-            'disk': 0.20,
-            'swap': 0.15,
-            'network': 0.15,
-            'freshness': 0.10
+            'cpu': config['cpu_weight'],
+            'memory': config['memory_weight'],
+            'disk': config['disk_weight'],
+            'swap': config['swap_weight'],
+            'network': config['network_weight'],
+            'freshness': config['freshness_weight']
         }
         
-        # 计算各项得分（0-100分）
-        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
-        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
-        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
-        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        # 计算各项得分（0-100分），基于配置的阈值进行动态调整
+        cpu_score = self._calculate_dimension_score(cpu_usage, config['cpu_alert_threshold'], config['cpu_warning_threshold'], 'cpu', config)
+        mem_score = self._calculate_dimension_score(mem_usage, config['memory_alert_threshold'], config['memory_warning_threshold'], 'memory', config)
+        disk_score = self._calculate_dimension_score(disk_usage, config['disk_alert_threshold'], config['disk_warning_threshold'], 'disk', config)
+        swap_score = self._calculate_dimension_score(swap_usage, config['swap_alert_threshold'], config['swap_warning_threshold'], 'swap', config)
         
-        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
-        # 网络使用率越高得分越高，但超过80%开始扣分
-        if network_usage <= 80:
+        # 网络使用率得分（基于配置的阈值）
+        if network_usage <= config['network_score_threshold']:
             network_score = 100
         else:
-            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_score = max(0, 100 - (network_usage - config['network_score_threshold']) * 2)
         
-        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
-        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        # 数据新鲜度得分（使用配置的衰减率）
+        freshness_score = max(0, 100 - (data_freshness * config['freshness_score_decay_rate']))
         
         # 加权平均
         total_score = (
@@ -13577,6 +17318,44 @@ class DatabaseManager:
         )
         
         return int(max(0, min(100, total_score)))
+    
+    def _calculate_dimension_score(self, usage: float, alert_threshold: float, warning_threshold: float, dimension: str, config: Dict[str, float] = None) -> float:
+        """
+        计算单个维度的健康评分（0-100分）
+        
+        Args:
+            usage: 使用率
+            alert_threshold: 提示阈值
+            warning_threshold: 警告阈值
+            dimension: 维度名称
+            config: 健康度配置字典
+            
+        Returns:
+            维度评分（0-100）
+        """
+        if config is None:
+            config = self.get_health_config()
+        
+        # 根据不同的维度调整评分策略
+        if dimension == 'swap':
+            # Swap使用率影响倍数
+            usage = min(usage * config['swap_multiplier'], 100)
+        
+        # 基于配置的阈值进行评分
+        if usage <= alert_threshold:
+            # 正常范围：基于配置的基础评分和扣分率
+            normal_penalty = usage * config['normal_range_penalty_rate']
+            return max(0, config['normal_range_score_base'] - normal_penalty)
+        elif usage <= warning_threshold:
+            # 提示范围：基于配置的基础评分和扣分率
+            alert_range = warning_threshold - alert_threshold
+            alert_penalty = (usage - alert_threshold) / alert_range * (config['normal_range_score_base'] - config['alert_range_score_base'])
+            return max(0, config['alert_range_score_base'] - alert_penalty)
+        else:
+            # 警告范围：基于配置的基础评分和扣分率
+            warning_range = 100 - warning_threshold
+            warning_penalty = (usage - warning_threshold) / warning_range * (config['alert_range_score_base'] - config['warning_range_score_base'])
+            return max(0, config['warning_range_score_base'] - warning_penalty)
 
     def get_machine_status_by_ip(self, ip: str) -> Dict:
         """
@@ -13951,6 +17730,114 @@ class DatabaseManager:
         finally:
             self.return_connection(connection)
 
+    def get_health_config(self, force_refresh: bool = False) -> Dict[str, float]:
+        """获取健康度配置"""
+        import time
+        
+        # 检查缓存是否有效
+        current_time = time.time()
+        if (not force_refresh and 
+            self._health_config_cache is not None and 
+            current_time - self._health_config_cache_time < self._health_config_cache_ttl):
+            return self._health_config_cache
+        
+        connection = self.get_connection()
+        if not connection:
+            return self._get_default_health_config()
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT config_key, config_value FROM health_config")
+                config_data = cursor.fetchall()
+                
+                config_dict = {}
+                for row in config_data:
+                    # 修复：使用索引而不是字典键访问
+                    config_dict[row[0]] = float(row[1])
+                
+                # 确保所有必要的配置项都存在
+                default_config = self._get_default_health_config()
+                for key, value in default_config.items():
+                    if key not in config_dict:
+                        config_dict[key] = value
+                
+                # 更新缓存
+                self._health_config_cache = config_dict
+                self._health_config_cache_time = current_time
+                
+                return config_dict
+                
+        except Exception as e:
+            print(f"获取健康度配置失败: {e}")
+            return self._get_default_health_config()
+        finally:
+            self.return_connection(connection)
+    
+    def _get_default_health_config(self) -> Dict[str, float]:
+        """获取默认健康度配置"""
+        return {
+            'cpu_warning_threshold': 90.0,
+            'cpu_alert_threshold': 70.0,
+            'memory_warning_threshold': 90.0,
+            'memory_alert_threshold': 70.0,
+            'disk_warning_threshold': 90.0,
+            'disk_alert_threshold': 70.0,
+            'swap_warning_threshold': 50.0,
+            'swap_alert_threshold': 20.0,
+            'network_warning_threshold': 90.0,
+            'network_alert_threshold': 70.0,
+            'data_freshness_warning_hours': 1.0,
+            'data_freshness_alert_hours': 0.3,
+            'cpu_weight': 0.20,
+            'memory_weight': 0.20,
+            'disk_weight': 0.20,
+            'swap_weight': 0.15,
+            'network_weight': 0.15,
+            'freshness_weight': 0.10,
+            'network_base_bandwidth_mbps': 1000.0,
+            'network_score_threshold': 80.0,
+            'freshness_score_decay_rate': 20.0,
+            # 新增评分配置参数
+            'normal_range_score_base': 80.0,
+            'alert_range_score_base': 50.0,
+            'warning_range_score_base': 20.0,
+            'normal_range_penalty_rate': 0.20,
+            'alert_range_penalty_rate': 0.30,
+            'warning_range_penalty_rate': 0.50,
+            'swap_multiplier': 2.0,
+            'network_penalty_multiplier': 2.0
+        }
+    
+    def update_health_config(self, config_key: str, config_value: float) -> bool:
+        """更新健康度配置"""
+        connection = self.get_connection()
+        if not connection:
+            return False
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO health_config (config_key, config_value, updated_at) 
+                    VALUES (%s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (config_key) DO UPDATE SET 
+                    config_value = EXCLUDED.config_value,
+                    updated_at = CURRENT_TIMESTAMP
+                """, (config_key, config_value))
+                connection.commit()
+                
+                # 清除缓存，强制下次读取时刷新
+                self._health_config_cache = None
+                self._health_config_cache_time = 0
+                
+                return True
+                
+        except Exception as e:
+            print(f"更新健康度配置失败: {e}")
+            connection.rollback()
+            return False
+        finally:
+            self.return_connection(connection)
+    
     def assess_machine_status(self, metric: Dict) -> Dict:
         """
         根据监控指标评估机器运行状态
@@ -13961,6 +17848,9 @@ class DatabaseManager:
         Returns:
             包含状态分级和详细信息的字典
         """
+        # 获取健康度配置
+        config = self.get_health_config()
+        
         # 获取关键指标值，处理None值
         cpu_usr = metric.get('cpu_usr', 0) or 0
         cpu_sys = metric.get('cpu_sys', 0) or 0
@@ -13985,9 +17875,8 @@ class DatabaseManager:
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
         
-        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
-        # 1000 Mbps = 125,000 KB/s
-        max_bandwidth_kbps = 125000
+        # 计算网络使用率（使用配置的基准带宽）
+        max_bandwidth_kbps = config['network_base_bandwidth_mbps'] * 125  # Mbps转KB/s
         total_network_usage = net_rx_kbps + net_tx_kbps
         network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
@@ -13997,60 +17886,60 @@ class DatabaseManager:
         warnings = []
         
         # CPU使用率检查
-        if cpu_total >= 90:
+        if cpu_total >= config['cpu_warning_threshold']:
             status_level = "警告"
             issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
-        elif cpu_total >= 70:
+        elif cpu_total >= config['cpu_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
         
         # 内存使用率检查
-        if mem_usage_percent >= 90:
+        if mem_usage_percent >= config['memory_warning_threshold']:
             status_level = "警告"
             issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
-        elif mem_usage_percent >= 70:
+        elif mem_usage_percent >= config['memory_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
         
         # 磁盘使用率检查
-        if disk_used_percent >= 90:
+        if disk_used_percent >= config['disk_warning_threshold']:
             status_level = "警告"
             issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
-        elif disk_used_percent >= 70:
+        elif disk_used_percent >= config['disk_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
         
         # Swap使用率检查
-        if swap_usage_percent >= 50:
+        if swap_usage_percent >= config['swap_warning_threshold']:
             status_level = "警告"
             issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
-        elif swap_usage_percent >= 20:
+        elif swap_usage_percent >= config['swap_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
         # 网络使用率检查
-        if network_usage_percent >= 90:
+        if network_usage_percent >= config['network_warning_threshold']:
             status_level = "警告"
             issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
-        elif network_usage_percent >= 70:
+        elif network_usage_percent >= config['network_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
         
-        # 数据时效性检查（超过1小时无数据视为异常）
+        # 数据时效性检查
         import time
         current_timestamp = int(time.time())
         metric_timestamp = metric.get('ts', 0)
         time_diff_hours = (current_timestamp - metric_timestamp) / 3600
         
-        if time_diff_hours > 1:
+        if time_diff_hours > config['data_freshness_warning_hours']:
             status_level = "警告"
             issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
-        elif time_diff_hours > 0.3:
+        elif time_diff_hours > config['data_freshness_alert_hours']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
@@ -14071,12 +17960,12 @@ class DatabaseManager:
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours, config)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float, config: Dict[str, float] = None) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -14087,35 +17976,38 @@ class DatabaseManager:
             swap_usage: Swap使用率
             network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
+            config: 健康度配置字典
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重（调整为5维评分）
+        if config is None:
+            config = self.get_health_config()
+            
+        # 各项指标的权重
         weights = {
-            'cpu': 0.20,
-            'memory': 0.20,
-            'disk': 0.20,
-            'swap': 0.15,
-            'network': 0.15,
-            'freshness': 0.10
+            'cpu': config['cpu_weight'],
+            'memory': config['memory_weight'],
+            'disk': config['disk_weight'],
+            'swap': config['swap_weight'],
+            'network': config['network_weight'],
+            'freshness': config['freshness_weight']
         }
         
-        # 计算各项得分（0-100分）
-        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
-        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
-        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
-        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        # 计算各项得分（0-100分），基于配置的阈值进行动态调整
+        cpu_score = self._calculate_dimension_score(cpu_usage, config['cpu_alert_threshold'], config['cpu_warning_threshold'], 'cpu', config)
+        mem_score = self._calculate_dimension_score(mem_usage, config['memory_alert_threshold'], config['memory_warning_threshold'], 'memory', config)
+        disk_score = self._calculate_dimension_score(disk_usage, config['disk_alert_threshold'], config['disk_warning_threshold'], 'disk', config)
+        swap_score = self._calculate_dimension_score(swap_usage, config['swap_alert_threshold'], config['swap_warning_threshold'], 'swap', config)
         
-        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
-        # 网络使用率越高得分越高，但超过80%开始扣分
-        if network_usage <= 80:
+        # 网络使用率得分（基于配置的阈值）
+        if network_usage <= config['network_score_threshold']:
             network_score = 100
         else:
-            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_score = max(0, 100 - (network_usage - config['network_score_threshold']) * 2)
         
-        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
-        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        # 数据新鲜度得分（使用配置的衰减率）
+        freshness_score = max(0, 100 - (data_freshness * config['freshness_score_decay_rate']))
         
         # 加权平均
         total_score = (
@@ -14128,6 +18020,44 @@ class DatabaseManager:
         )
         
         return int(max(0, min(100, total_score)))
+    
+    def _calculate_dimension_score(self, usage: float, alert_threshold: float, warning_threshold: float, dimension: str, config: Dict[str, float] = None) -> float:
+        """
+        计算单个维度的健康评分（0-100分）
+        
+        Args:
+            usage: 使用率
+            alert_threshold: 提示阈值
+            warning_threshold: 警告阈值
+            dimension: 维度名称
+            config: 健康度配置字典
+            
+        Returns:
+            维度评分（0-100）
+        """
+        if config is None:
+            config = self.get_health_config()
+        
+        # 根据不同的维度调整评分策略
+        if dimension == 'swap':
+            # Swap使用率影响倍数
+            usage = min(usage * config['swap_multiplier'], 100)
+        
+        # 基于配置的阈值进行评分
+        if usage <= alert_threshold:
+            # 正常范围：基于配置的基础评分和扣分率
+            normal_penalty = usage * config['normal_range_penalty_rate']
+            return max(0, config['normal_range_score_base'] - normal_penalty)
+        elif usage <= warning_threshold:
+            # 提示范围：基于配置的基础评分和扣分率
+            alert_range = warning_threshold - alert_threshold
+            alert_penalty = (usage - alert_threshold) / alert_range * (config['normal_range_score_base'] - config['alert_range_score_base'])
+            return max(0, config['alert_range_score_base'] - alert_penalty)
+        else:
+            # 警告范围：基于配置的基础评分和扣分率
+            warning_range = 100 - warning_threshold
+            warning_penalty = (usage - warning_threshold) / warning_range * (config['alert_range_score_base'] - config['warning_range_score_base'])
+            return max(0, config['warning_range_score_base'] - warning_penalty)
 
     def get_machine_status_by_ip(self, ip: str) -> Dict:
         """
@@ -14579,6 +18509,114 @@ class DatabaseManager:
         finally:
             self.return_connection(connection)
 
+    def get_health_config(self, force_refresh: bool = False) -> Dict[str, float]:
+        """获取健康度配置"""
+        import time
+        
+        # 检查缓存是否有效
+        current_time = time.time()
+        if (not force_refresh and 
+            self._health_config_cache is not None and 
+            current_time - self._health_config_cache_time < self._health_config_cache_ttl):
+            return self._health_config_cache
+        
+        connection = self.get_connection()
+        if not connection:
+            return self._get_default_health_config()
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT config_key, config_value FROM health_config")
+                config_data = cursor.fetchall()
+                
+                config_dict = {}
+                for row in config_data:
+                    # 修复：使用索引而不是字典键访问
+                    config_dict[row[0]] = float(row[1])
+                
+                # 确保所有必要的配置项都存在
+                default_config = self._get_default_health_config()
+                for key, value in default_config.items():
+                    if key not in config_dict:
+                        config_dict[key] = value
+                
+                # 更新缓存
+                self._health_config_cache = config_dict
+                self._health_config_cache_time = current_time
+                
+                return config_dict
+                
+        except Exception as e:
+            print(f"获取健康度配置失败: {e}")
+            return self._get_default_health_config()
+        finally:
+            self.return_connection(connection)
+    
+    def _get_default_health_config(self) -> Dict[str, float]:
+        """获取默认健康度配置"""
+        return {
+            'cpu_warning_threshold': 90.0,
+            'cpu_alert_threshold': 70.0,
+            'memory_warning_threshold': 90.0,
+            'memory_alert_threshold': 70.0,
+            'disk_warning_threshold': 90.0,
+            'disk_alert_threshold': 70.0,
+            'swap_warning_threshold': 50.0,
+            'swap_alert_threshold': 20.0,
+            'network_warning_threshold': 90.0,
+            'network_alert_threshold': 70.0,
+            'data_freshness_warning_hours': 1.0,
+            'data_freshness_alert_hours': 0.3,
+            'cpu_weight': 0.20,
+            'memory_weight': 0.20,
+            'disk_weight': 0.20,
+            'swap_weight': 0.15,
+            'network_weight': 0.15,
+            'freshness_weight': 0.10,
+            'network_base_bandwidth_mbps': 1000.0,
+            'network_score_threshold': 80.0,
+            'freshness_score_decay_rate': 20.0,
+            # 新增评分配置参数
+            'normal_range_score_base': 80.0,
+            'alert_range_score_base': 50.0,
+            'warning_range_score_base': 20.0,
+            'normal_range_penalty_rate': 0.20,
+            'alert_range_penalty_rate': 0.30,
+            'warning_range_penalty_rate': 0.50,
+            'swap_multiplier': 2.0,
+            'network_penalty_multiplier': 2.0
+        }
+    
+    def update_health_config(self, config_key: str, config_value: float) -> bool:
+        """更新健康度配置"""
+        connection = self.get_connection()
+        if not connection:
+            return False
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO health_config (config_key, config_value, updated_at) 
+                    VALUES (%s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (config_key) DO UPDATE SET 
+                    config_value = EXCLUDED.config_value,
+                    updated_at = CURRENT_TIMESTAMP
+                """, (config_key, config_value))
+                connection.commit()
+                
+                # 清除缓存，强制下次读取时刷新
+                self._health_config_cache = None
+                self._health_config_cache_time = 0
+                
+                return True
+                
+        except Exception as e:
+            print(f"更新健康度配置失败: {e}")
+            connection.rollback()
+            return False
+        finally:
+            self.return_connection(connection)
+    
     def assess_machine_status(self, metric: Dict) -> Dict:
         """
         根据监控指标评估机器运行状态
@@ -14589,6 +18627,9 @@ class DatabaseManager:
         Returns:
             包含状态分级和详细信息的字典
         """
+        # 获取健康度配置
+        config = self.get_health_config()
+        
         # 获取关键指标值，处理None值
         cpu_usr = metric.get('cpu_usr', 0) or 0
         cpu_sys = metric.get('cpu_sys', 0) or 0
@@ -14613,9 +18654,8 @@ class DatabaseManager:
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
         
-        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
-        # 1000 Mbps = 125,000 KB/s
-        max_bandwidth_kbps = 125000
+        # 计算网络使用率（使用配置的基准带宽）
+        max_bandwidth_kbps = config['network_base_bandwidth_mbps'] * 125  # Mbps转KB/s
         total_network_usage = net_rx_kbps + net_tx_kbps
         network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
@@ -14625,60 +18665,60 @@ class DatabaseManager:
         warnings = []
         
         # CPU使用率检查
-        if cpu_total >= 90:
+        if cpu_total >= config['cpu_warning_threshold']:
             status_level = "警告"
             issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
-        elif cpu_total >= 70:
+        elif cpu_total >= config['cpu_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
         
         # 内存使用率检查
-        if mem_usage_percent >= 90:
+        if mem_usage_percent >= config['memory_warning_threshold']:
             status_level = "警告"
             issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
-        elif mem_usage_percent >= 70:
+        elif mem_usage_percent >= config['memory_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
         
         # 磁盘使用率检查
-        if disk_used_percent >= 90:
+        if disk_used_percent >= config['disk_warning_threshold']:
             status_level = "警告"
             issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
-        elif disk_used_percent >= 70:
+        elif disk_used_percent >= config['disk_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
         
         # Swap使用率检查
-        if swap_usage_percent >= 50:
+        if swap_usage_percent >= config['swap_warning_threshold']:
             status_level = "警告"
             issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
-        elif swap_usage_percent >= 20:
+        elif swap_usage_percent >= config['swap_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
         # 网络使用率检查
-        if network_usage_percent >= 90:
+        if network_usage_percent >= config['network_warning_threshold']:
             status_level = "警告"
             issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
-        elif network_usage_percent >= 70:
+        elif network_usage_percent >= config['network_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
         
-        # 数据时效性检查（超过1小时无数据视为异常）
+        # 数据时效性检查
         import time
         current_timestamp = int(time.time())
         metric_timestamp = metric.get('ts', 0)
         time_diff_hours = (current_timestamp - metric_timestamp) / 3600
         
-        if time_diff_hours > 1:
+        if time_diff_hours > config['data_freshness_warning_hours']:
             status_level = "警告"
             issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
-        elif time_diff_hours > 0.3:
+        elif time_diff_hours > config['data_freshness_alert_hours']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
@@ -14699,12 +18739,12 @@ class DatabaseManager:
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours, config)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float, config: Dict[str, float] = None) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -14715,35 +18755,38 @@ class DatabaseManager:
             swap_usage: Swap使用率
             network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
+            config: 健康度配置字典
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重（调整为5维评分）
+        if config is None:
+            config = self.get_health_config()
+            
+        # 各项指标的权重
         weights = {
-            'cpu': 0.20,
-            'memory': 0.20,
-            'disk': 0.20,
-            'swap': 0.15,
-            'network': 0.15,
-            'freshness': 0.10
+            'cpu': config['cpu_weight'],
+            'memory': config['memory_weight'],
+            'disk': config['disk_weight'],
+            'swap': config['swap_weight'],
+            'network': config['network_weight'],
+            'freshness': config['freshness_weight']
         }
         
-        # 计算各项得分（0-100分）
-        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
-        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
-        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
-        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        # 计算各项得分（0-100分），基于配置的阈值进行动态调整
+        cpu_score = self._calculate_dimension_score(cpu_usage, config['cpu_alert_threshold'], config['cpu_warning_threshold'], 'cpu', config)
+        mem_score = self._calculate_dimension_score(mem_usage, config['memory_alert_threshold'], config['memory_warning_threshold'], 'memory', config)
+        disk_score = self._calculate_dimension_score(disk_usage, config['disk_alert_threshold'], config['disk_warning_threshold'], 'disk', config)
+        swap_score = self._calculate_dimension_score(swap_usage, config['swap_alert_threshold'], config['swap_warning_threshold'], 'swap', config)
         
-        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
-        # 网络使用率越高得分越高，但超过80%开始扣分
-        if network_usage <= 80:
+        # 网络使用率得分（基于配置的阈值）
+        if network_usage <= config['network_score_threshold']:
             network_score = 100
         else:
-            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_score = max(0, 100 - (network_usage - config['network_score_threshold']) * 2)
         
-        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
-        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        # 数据新鲜度得分（使用配置的衰减率）
+        freshness_score = max(0, 100 - (data_freshness * config['freshness_score_decay_rate']))
         
         # 加权平均
         total_score = (
@@ -14756,6 +18799,44 @@ class DatabaseManager:
         )
         
         return int(max(0, min(100, total_score)))
+    
+    def _calculate_dimension_score(self, usage: float, alert_threshold: float, warning_threshold: float, dimension: str, config: Dict[str, float] = None) -> float:
+        """
+        计算单个维度的健康评分（0-100分）
+        
+        Args:
+            usage: 使用率
+            alert_threshold: 提示阈值
+            warning_threshold: 警告阈值
+            dimension: 维度名称
+            config: 健康度配置字典
+            
+        Returns:
+            维度评分（0-100）
+        """
+        if config is None:
+            config = self.get_health_config()
+        
+        # 根据不同的维度调整评分策略
+        if dimension == 'swap':
+            # Swap使用率影响倍数
+            usage = min(usage * config['swap_multiplier'], 100)
+        
+        # 基于配置的阈值进行评分
+        if usage <= alert_threshold:
+            # 正常范围：基于配置的基础评分和扣分率
+            normal_penalty = usage * config['normal_range_penalty_rate']
+            return max(0, config['normal_range_score_base'] - normal_penalty)
+        elif usage <= warning_threshold:
+            # 提示范围：基于配置的基础评分和扣分率
+            alert_range = warning_threshold - alert_threshold
+            alert_penalty = (usage - alert_threshold) / alert_range * (config['normal_range_score_base'] - config['alert_range_score_base'])
+            return max(0, config['alert_range_score_base'] - alert_penalty)
+        else:
+            # 警告范围：基于配置的基础评分和扣分率
+            warning_range = 100 - warning_threshold
+            warning_penalty = (usage - warning_threshold) / warning_range * (config['alert_range_score_base'] - config['warning_range_score_base'])
+            return max(0, config['warning_range_score_base'] - warning_penalty)
 
     def get_machine_status_by_ip(self, ip: str) -> Dict:
         """
@@ -15158,6 +19239,114 @@ class DatabaseManager:
         finally:
             self.return_connection(connection)
 
+    def get_health_config(self, force_refresh: bool = False) -> Dict[str, float]:
+        """获取健康度配置"""
+        import time
+        
+        # 检查缓存是否有效
+        current_time = time.time()
+        if (not force_refresh and 
+            self._health_config_cache is not None and 
+            current_time - self._health_config_cache_time < self._health_config_cache_ttl):
+            return self._health_config_cache
+        
+        connection = self.get_connection()
+        if not connection:
+            return self._get_default_health_config()
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT config_key, config_value FROM health_config")
+                config_data = cursor.fetchall()
+                
+                config_dict = {}
+                for row in config_data:
+                    # 修复：使用索引而不是字典键访问
+                    config_dict[row[0]] = float(row[1])
+                
+                # 确保所有必要的配置项都存在
+                default_config = self._get_default_health_config()
+                for key, value in default_config.items():
+                    if key not in config_dict:
+                        config_dict[key] = value
+                
+                # 更新缓存
+                self._health_config_cache = config_dict
+                self._health_config_cache_time = current_time
+                
+                return config_dict
+                
+        except Exception as e:
+            print(f"获取健康度配置失败: {e}")
+            return self._get_default_health_config()
+        finally:
+            self.return_connection(connection)
+    
+    def _get_default_health_config(self) -> Dict[str, float]:
+        """获取默认健康度配置"""
+        return {
+            'cpu_warning_threshold': 90.0,
+            'cpu_alert_threshold': 70.0,
+            'memory_warning_threshold': 90.0,
+            'memory_alert_threshold': 70.0,
+            'disk_warning_threshold': 90.0,
+            'disk_alert_threshold': 70.0,
+            'swap_warning_threshold': 50.0,
+            'swap_alert_threshold': 20.0,
+            'network_warning_threshold': 90.0,
+            'network_alert_threshold': 70.0,
+            'data_freshness_warning_hours': 1.0,
+            'data_freshness_alert_hours': 0.3,
+            'cpu_weight': 0.20,
+            'memory_weight': 0.20,
+            'disk_weight': 0.20,
+            'swap_weight': 0.15,
+            'network_weight': 0.15,
+            'freshness_weight': 0.10,
+            'network_base_bandwidth_mbps': 1000.0,
+            'network_score_threshold': 80.0,
+            'freshness_score_decay_rate': 20.0,
+            # 新增评分配置参数
+            'normal_range_score_base': 80.0,
+            'alert_range_score_base': 50.0,
+            'warning_range_score_base': 20.0,
+            'normal_range_penalty_rate': 0.20,
+            'alert_range_penalty_rate': 0.30,
+            'warning_range_penalty_rate': 0.50,
+            'swap_multiplier': 2.0,
+            'network_penalty_multiplier': 2.0
+        }
+    
+    def update_health_config(self, config_key: str, config_value: float) -> bool:
+        """更新健康度配置"""
+        connection = self.get_connection()
+        if not connection:
+            return False
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO health_config (config_key, config_value, updated_at) 
+                    VALUES (%s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (config_key) DO UPDATE SET 
+                    config_value = EXCLUDED.config_value,
+                    updated_at = CURRENT_TIMESTAMP
+                """, (config_key, config_value))
+                connection.commit()
+                
+                # 清除缓存，强制下次读取时刷新
+                self._health_config_cache = None
+                self._health_config_cache_time = 0
+                
+                return True
+                
+        except Exception as e:
+            print(f"更新健康度配置失败: {e}")
+            connection.rollback()
+            return False
+        finally:
+            self.return_connection(connection)
+    
     def assess_machine_status(self, metric: Dict) -> Dict:
         """
         根据监控指标评估机器运行状态
@@ -15168,6 +19357,9 @@ class DatabaseManager:
         Returns:
             包含状态分级和详细信息的字典
         """
+        # 获取健康度配置
+        config = self.get_health_config()
+        
         # 获取关键指标值，处理None值
         cpu_usr = metric.get('cpu_usr', 0) or 0
         cpu_sys = metric.get('cpu_sys', 0) or 0
@@ -15192,9 +19384,8 @@ class DatabaseManager:
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
         
-        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
-        # 1000 Mbps = 125,000 KB/s
-        max_bandwidth_kbps = 125000
+        # 计算网络使用率（使用配置的基准带宽）
+        max_bandwidth_kbps = config['network_base_bandwidth_mbps'] * 125  # Mbps转KB/s
         total_network_usage = net_rx_kbps + net_tx_kbps
         network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
@@ -15204,60 +19395,60 @@ class DatabaseManager:
         warnings = []
         
         # CPU使用率检查
-        if cpu_total >= 90:
+        if cpu_total >= config['cpu_warning_threshold']:
             status_level = "警告"
             issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
-        elif cpu_total >= 70:
+        elif cpu_total >= config['cpu_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
         
         # 内存使用率检查
-        if mem_usage_percent >= 90:
+        if mem_usage_percent >= config['memory_warning_threshold']:
             status_level = "警告"
             issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
-        elif mem_usage_percent >= 70:
+        elif mem_usage_percent >= config['memory_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
         
         # 磁盘使用率检查
-        if disk_used_percent >= 90:
+        if disk_used_percent >= config['disk_warning_threshold']:
             status_level = "警告"
             issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
-        elif disk_used_percent >= 70:
+        elif disk_used_percent >= config['disk_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
         
         # Swap使用率检查
-        if swap_usage_percent >= 50:
+        if swap_usage_percent >= config['swap_warning_threshold']:
             status_level = "警告"
             issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
-        elif swap_usage_percent >= 20:
+        elif swap_usage_percent >= config['swap_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
         # 网络使用率检查
-        if network_usage_percent >= 90:
+        if network_usage_percent >= config['network_warning_threshold']:
             status_level = "警告"
             issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
-        elif network_usage_percent >= 70:
+        elif network_usage_percent >= config['network_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
         
-        # 数据时效性检查（超过1小时无数据视为异常）
+        # 数据时效性检查
         import time
         current_timestamp = int(time.time())
         metric_timestamp = metric.get('ts', 0)
         time_diff_hours = (current_timestamp - metric_timestamp) / 3600
         
-        if time_diff_hours > 1:
+        if time_diff_hours > config['data_freshness_warning_hours']:
             status_level = "警告"
             issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
-        elif time_diff_hours > 0.3:
+        elif time_diff_hours > config['data_freshness_alert_hours']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
@@ -15278,12 +19469,12 @@ class DatabaseManager:
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours, config)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float, config: Dict[str, float] = None) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -15294,35 +19485,38 @@ class DatabaseManager:
             swap_usage: Swap使用率
             network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
+            config: 健康度配置字典
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重（调整为5维评分）
+        if config is None:
+            config = self.get_health_config()
+            
+        # 各项指标的权重
         weights = {
-            'cpu': 0.20,
-            'memory': 0.20,
-            'disk': 0.20,
-            'swap': 0.15,
-            'network': 0.15,
-            'freshness': 0.10
+            'cpu': config['cpu_weight'],
+            'memory': config['memory_weight'],
+            'disk': config['disk_weight'],
+            'swap': config['swap_weight'],
+            'network': config['network_weight'],
+            'freshness': config['freshness_weight']
         }
         
-        # 计算各项得分（0-100分）
-        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
-        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
-        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
-        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        # 计算各项得分（0-100分），基于配置的阈值进行动态调整
+        cpu_score = self._calculate_dimension_score(cpu_usage, config['cpu_alert_threshold'], config['cpu_warning_threshold'], 'cpu', config)
+        mem_score = self._calculate_dimension_score(mem_usage, config['memory_alert_threshold'], config['memory_warning_threshold'], 'memory', config)
+        disk_score = self._calculate_dimension_score(disk_usage, config['disk_alert_threshold'], config['disk_warning_threshold'], 'disk', config)
+        swap_score = self._calculate_dimension_score(swap_usage, config['swap_alert_threshold'], config['swap_warning_threshold'], 'swap', config)
         
-        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
-        # 网络使用率越高得分越高，但超过80%开始扣分
-        if network_usage <= 80:
+        # 网络使用率得分（基于配置的阈值）
+        if network_usage <= config['network_score_threshold']:
             network_score = 100
         else:
-            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_score = max(0, 100 - (network_usage - config['network_score_threshold']) * 2)
         
-        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
-        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        # 数据新鲜度得分（使用配置的衰减率）
+        freshness_score = max(0, 100 - (data_freshness * config['freshness_score_decay_rate']))
         
         # 加权平均
         total_score = (
@@ -15335,6 +19529,44 @@ class DatabaseManager:
         )
         
         return int(max(0, min(100, total_score)))
+    
+    def _calculate_dimension_score(self, usage: float, alert_threshold: float, warning_threshold: float, dimension: str, config: Dict[str, float] = None) -> float:
+        """
+        计算单个维度的健康评分（0-100分）
+        
+        Args:
+            usage: 使用率
+            alert_threshold: 提示阈值
+            warning_threshold: 警告阈值
+            dimension: 维度名称
+            config: 健康度配置字典
+            
+        Returns:
+            维度评分（0-100）
+        """
+        if config is None:
+            config = self.get_health_config()
+        
+        # 根据不同的维度调整评分策略
+        if dimension == 'swap':
+            # Swap使用率影响倍数
+            usage = min(usage * config['swap_multiplier'], 100)
+        
+        # 基于配置的阈值进行评分
+        if usage <= alert_threshold:
+            # 正常范围：基于配置的基础评分和扣分率
+            normal_penalty = usage * config['normal_range_penalty_rate']
+            return max(0, config['normal_range_score_base'] - normal_penalty)
+        elif usage <= warning_threshold:
+            # 提示范围：基于配置的基础评分和扣分率
+            alert_range = warning_threshold - alert_threshold
+            alert_penalty = (usage - alert_threshold) / alert_range * (config['normal_range_score_base'] - config['alert_range_score_base'])
+            return max(0, config['alert_range_score_base'] - alert_penalty)
+        else:
+            # 警告范围：基于配置的基础评分和扣分率
+            warning_range = 100 - warning_threshold
+            warning_penalty = (usage - warning_threshold) / warning_range * (config['alert_range_score_base'] - config['warning_range_score_base'])
+            return max(0, config['warning_range_score_base'] - warning_penalty)
 
     def get_machine_status_by_ip(self, ip: str) -> Dict:
         """
@@ -15725,6 +19957,114 @@ class DatabaseManager:
         finally:
             self.return_connection(connection)
 
+    def get_health_config(self, force_refresh: bool = False) -> Dict[str, float]:
+        """获取健康度配置"""
+        import time
+        
+        # 检查缓存是否有效
+        current_time = time.time()
+        if (not force_refresh and 
+            self._health_config_cache is not None and 
+            current_time - self._health_config_cache_time < self._health_config_cache_ttl):
+            return self._health_config_cache
+        
+        connection = self.get_connection()
+        if not connection:
+            return self._get_default_health_config()
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT config_key, config_value FROM health_config")
+                config_data = cursor.fetchall()
+                
+                config_dict = {}
+                for row in config_data:
+                    # 修复：使用索引而不是字典键访问
+                    config_dict[row[0]] = float(row[1])
+                
+                # 确保所有必要的配置项都存在
+                default_config = self._get_default_health_config()
+                for key, value in default_config.items():
+                    if key not in config_dict:
+                        config_dict[key] = value
+                
+                # 更新缓存
+                self._health_config_cache = config_dict
+                self._health_config_cache_time = current_time
+                
+                return config_dict
+                
+        except Exception as e:
+            print(f"获取健康度配置失败: {e}")
+            return self._get_default_health_config()
+        finally:
+            self.return_connection(connection)
+    
+    def _get_default_health_config(self) -> Dict[str, float]:
+        """获取默认健康度配置"""
+        return {
+            'cpu_warning_threshold': 90.0,
+            'cpu_alert_threshold': 70.0,
+            'memory_warning_threshold': 90.0,
+            'memory_alert_threshold': 70.0,
+            'disk_warning_threshold': 90.0,
+            'disk_alert_threshold': 70.0,
+            'swap_warning_threshold': 50.0,
+            'swap_alert_threshold': 20.0,
+            'network_warning_threshold': 90.0,
+            'network_alert_threshold': 70.0,
+            'data_freshness_warning_hours': 1.0,
+            'data_freshness_alert_hours': 0.3,
+            'cpu_weight': 0.20,
+            'memory_weight': 0.20,
+            'disk_weight': 0.20,
+            'swap_weight': 0.15,
+            'network_weight': 0.15,
+            'freshness_weight': 0.10,
+            'network_base_bandwidth_mbps': 1000.0,
+            'network_score_threshold': 80.0,
+            'freshness_score_decay_rate': 20.0,
+            # 新增评分配置参数
+            'normal_range_score_base': 80.0,
+            'alert_range_score_base': 50.0,
+            'warning_range_score_base': 20.0,
+            'normal_range_penalty_rate': 0.20,
+            'alert_range_penalty_rate': 0.30,
+            'warning_range_penalty_rate': 0.50,
+            'swap_multiplier': 2.0,
+            'network_penalty_multiplier': 2.0
+        }
+    
+    def update_health_config(self, config_key: str, config_value: float) -> bool:
+        """更新健康度配置"""
+        connection = self.get_connection()
+        if not connection:
+            return False
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO health_config (config_key, config_value, updated_at) 
+                    VALUES (%s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (config_key) DO UPDATE SET 
+                    config_value = EXCLUDED.config_value,
+                    updated_at = CURRENT_TIMESTAMP
+                """, (config_key, config_value))
+                connection.commit()
+                
+                # 清除缓存，强制下次读取时刷新
+                self._health_config_cache = None
+                self._health_config_cache_time = 0
+                
+                return True
+                
+        except Exception as e:
+            print(f"更新健康度配置失败: {e}")
+            connection.rollback()
+            return False
+        finally:
+            self.return_connection(connection)
+    
     def assess_machine_status(self, metric: Dict) -> Dict:
         """
         根据监控指标评估机器运行状态
@@ -15735,6 +20075,9 @@ class DatabaseManager:
         Returns:
             包含状态分级和详细信息的字典
         """
+        # 获取健康度配置
+        config = self.get_health_config()
+        
         # 获取关键指标值，处理None值
         cpu_usr = metric.get('cpu_usr', 0) or 0
         cpu_sys = metric.get('cpu_sys', 0) or 0
@@ -15759,9 +20102,8 @@ class DatabaseManager:
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
         
-        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
-        # 1000 Mbps = 125,000 KB/s
-        max_bandwidth_kbps = 125000
+        # 计算网络使用率（使用配置的基准带宽）
+        max_bandwidth_kbps = config['network_base_bandwidth_mbps'] * 125  # Mbps转KB/s
         total_network_usage = net_rx_kbps + net_tx_kbps
         network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
@@ -15771,60 +20113,60 @@ class DatabaseManager:
         warnings = []
         
         # CPU使用率检查
-        if cpu_total >= 90:
+        if cpu_total >= config['cpu_warning_threshold']:
             status_level = "警告"
             issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
-        elif cpu_total >= 70:
+        elif cpu_total >= config['cpu_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
         
         # 内存使用率检查
-        if mem_usage_percent >= 90:
+        if mem_usage_percent >= config['memory_warning_threshold']:
             status_level = "警告"
             issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
-        elif mem_usage_percent >= 70:
+        elif mem_usage_percent >= config['memory_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
         
         # 磁盘使用率检查
-        if disk_used_percent >= 90:
+        if disk_used_percent >= config['disk_warning_threshold']:
             status_level = "警告"
             issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
-        elif disk_used_percent >= 70:
+        elif disk_used_percent >= config['disk_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
         
         # Swap使用率检查
-        if swap_usage_percent >= 50:
+        if swap_usage_percent >= config['swap_warning_threshold']:
             status_level = "警告"
             issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
-        elif swap_usage_percent >= 20:
+        elif swap_usage_percent >= config['swap_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
         # 网络使用率检查
-        if network_usage_percent >= 90:
+        if network_usage_percent >= config['network_warning_threshold']:
             status_level = "警告"
             issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
-        elif network_usage_percent >= 70:
+        elif network_usage_percent >= config['network_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
         
-        # 数据时效性检查（超过1小时无数据视为异常）
+        # 数据时效性检查
         import time
         current_timestamp = int(time.time())
         metric_timestamp = metric.get('ts', 0)
         time_diff_hours = (current_timestamp - metric_timestamp) / 3600
         
-        if time_diff_hours > 1:
+        if time_diff_hours > config['data_freshness_warning_hours']:
             status_level = "警告"
             issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
-        elif time_diff_hours > 0.3:
+        elif time_diff_hours > config['data_freshness_alert_hours']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
@@ -15845,12 +20187,12 @@ class DatabaseManager:
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours, config)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float, config: Dict[str, float] = None) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -15861,35 +20203,38 @@ class DatabaseManager:
             swap_usage: Swap使用率
             network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
+            config: 健康度配置字典
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重（调整为5维评分）
+        if config is None:
+            config = self.get_health_config()
+            
+        # 各项指标的权重
         weights = {
-            'cpu': 0.20,
-            'memory': 0.20,
-            'disk': 0.20,
-            'swap': 0.15,
-            'network': 0.15,
-            'freshness': 0.10
+            'cpu': config['cpu_weight'],
+            'memory': config['memory_weight'],
+            'disk': config['disk_weight'],
+            'swap': config['swap_weight'],
+            'network': config['network_weight'],
+            'freshness': config['freshness_weight']
         }
         
-        # 计算各项得分（0-100分）
-        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
-        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
-        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
-        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        # 计算各项得分（0-100分），基于配置的阈值进行动态调整
+        cpu_score = self._calculate_dimension_score(cpu_usage, config['cpu_alert_threshold'], config['cpu_warning_threshold'], 'cpu', config)
+        mem_score = self._calculate_dimension_score(mem_usage, config['memory_alert_threshold'], config['memory_warning_threshold'], 'memory', config)
+        disk_score = self._calculate_dimension_score(disk_usage, config['disk_alert_threshold'], config['disk_warning_threshold'], 'disk', config)
+        swap_score = self._calculate_dimension_score(swap_usage, config['swap_alert_threshold'], config['swap_warning_threshold'], 'swap', config)
         
-        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
-        # 网络使用率越高得分越高，但超过80%开始扣分
-        if network_usage <= 80:
+        # 网络使用率得分（基于配置的阈值）
+        if network_usage <= config['network_score_threshold']:
             network_score = 100
         else:
-            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_score = max(0, 100 - (network_usage - config['network_score_threshold']) * 2)
         
-        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
-        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        # 数据新鲜度得分（使用配置的衰减率）
+        freshness_score = max(0, 100 - (data_freshness * config['freshness_score_decay_rate']))
         
         # 加权平均
         total_score = (
@@ -15902,6 +20247,44 @@ class DatabaseManager:
         )
         
         return int(max(0, min(100, total_score)))
+    
+    def _calculate_dimension_score(self, usage: float, alert_threshold: float, warning_threshold: float, dimension: str, config: Dict[str, float] = None) -> float:
+        """
+        计算单个维度的健康评分（0-100分）
+        
+        Args:
+            usage: 使用率
+            alert_threshold: 提示阈值
+            warning_threshold: 警告阈值
+            dimension: 维度名称
+            config: 健康度配置字典
+            
+        Returns:
+            维度评分（0-100）
+        """
+        if config is None:
+            config = self.get_health_config()
+        
+        # 根据不同的维度调整评分策略
+        if dimension == 'swap':
+            # Swap使用率影响倍数
+            usage = min(usage * config['swap_multiplier'], 100)
+        
+        # 基于配置的阈值进行评分
+        if usage <= alert_threshold:
+            # 正常范围：基于配置的基础评分和扣分率
+            normal_penalty = usage * config['normal_range_penalty_rate']
+            return max(0, config['normal_range_score_base'] - normal_penalty)
+        elif usage <= warning_threshold:
+            # 提示范围：基于配置的基础评分和扣分率
+            alert_range = warning_threshold - alert_threshold
+            alert_penalty = (usage - alert_threshold) / alert_range * (config['normal_range_score_base'] - config['alert_range_score_base'])
+            return max(0, config['alert_range_score_base'] - alert_penalty)
+        else:
+            # 警告范围：基于配置的基础评分和扣分率
+            warning_range = 100 - warning_threshold
+            warning_penalty = (usage - warning_threshold) / warning_range * (config['alert_range_score_base'] - config['warning_range_score_base'])
+            return max(0, config['warning_range_score_base'] - warning_penalty)
 
     def get_machine_status_by_ip(self, ip: str) -> Dict:
         """
@@ -16311,6 +20694,114 @@ class DatabaseManager:
         finally:
             self.return_connection(connection)
 
+    def get_health_config(self, force_refresh: bool = False) -> Dict[str, float]:
+        """获取健康度配置"""
+        import time
+        
+        # 检查缓存是否有效
+        current_time = time.time()
+        if (not force_refresh and 
+            self._health_config_cache is not None and 
+            current_time - self._health_config_cache_time < self._health_config_cache_ttl):
+            return self._health_config_cache
+        
+        connection = self.get_connection()
+        if not connection:
+            return self._get_default_health_config()
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT config_key, config_value FROM health_config")
+                config_data = cursor.fetchall()
+                
+                config_dict = {}
+                for row in config_data:
+                    # 修复：使用索引而不是字典键访问
+                    config_dict[row[0]] = float(row[1])
+                
+                # 确保所有必要的配置项都存在
+                default_config = self._get_default_health_config()
+                for key, value in default_config.items():
+                    if key not in config_dict:
+                        config_dict[key] = value
+                
+                # 更新缓存
+                self._health_config_cache = config_dict
+                self._health_config_cache_time = current_time
+                
+                return config_dict
+                
+        except Exception as e:
+            print(f"获取健康度配置失败: {e}")
+            return self._get_default_health_config()
+        finally:
+            self.return_connection(connection)
+    
+    def _get_default_health_config(self) -> Dict[str, float]:
+        """获取默认健康度配置"""
+        return {
+            'cpu_warning_threshold': 90.0,
+            'cpu_alert_threshold': 70.0,
+            'memory_warning_threshold': 90.0,
+            'memory_alert_threshold': 70.0,
+            'disk_warning_threshold': 90.0,
+            'disk_alert_threshold': 70.0,
+            'swap_warning_threshold': 50.0,
+            'swap_alert_threshold': 20.0,
+            'network_warning_threshold': 90.0,
+            'network_alert_threshold': 70.0,
+            'data_freshness_warning_hours': 1.0,
+            'data_freshness_alert_hours': 0.3,
+            'cpu_weight': 0.20,
+            'memory_weight': 0.20,
+            'disk_weight': 0.20,
+            'swap_weight': 0.15,
+            'network_weight': 0.15,
+            'freshness_weight': 0.10,
+            'network_base_bandwidth_mbps': 1000.0,
+            'network_score_threshold': 80.0,
+            'freshness_score_decay_rate': 20.0,
+            # 新增评分配置参数
+            'normal_range_score_base': 80.0,
+            'alert_range_score_base': 50.0,
+            'warning_range_score_base': 20.0,
+            'normal_range_penalty_rate': 0.20,
+            'alert_range_penalty_rate': 0.30,
+            'warning_range_penalty_rate': 0.50,
+            'swap_multiplier': 2.0,
+            'network_penalty_multiplier': 2.0
+        }
+    
+    def update_health_config(self, config_key: str, config_value: float) -> bool:
+        """更新健康度配置"""
+        connection = self.get_connection()
+        if not connection:
+            return False
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO health_config (config_key, config_value, updated_at) 
+                    VALUES (%s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (config_key) DO UPDATE SET 
+                    config_value = EXCLUDED.config_value,
+                    updated_at = CURRENT_TIMESTAMP
+                """, (config_key, config_value))
+                connection.commit()
+                
+                # 清除缓存，强制下次读取时刷新
+                self._health_config_cache = None
+                self._health_config_cache_time = 0
+                
+                return True
+                
+        except Exception as e:
+            print(f"更新健康度配置失败: {e}")
+            connection.rollback()
+            return False
+        finally:
+            self.return_connection(connection)
+    
     def assess_machine_status(self, metric: Dict) -> Dict:
         """
         根据监控指标评估机器运行状态
@@ -16321,6 +20812,9 @@ class DatabaseManager:
         Returns:
             包含状态分级和详细信息的字典
         """
+        # 获取健康度配置
+        config = self.get_health_config()
+        
         # 获取关键指标值，处理None值
         cpu_usr = metric.get('cpu_usr', 0) or 0
         cpu_sys = metric.get('cpu_sys', 0) or 0
@@ -16345,9 +20839,8 @@ class DatabaseManager:
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
         
-        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
-        # 1000 Mbps = 125,000 KB/s
-        max_bandwidth_kbps = 125000
+        # 计算网络使用率（使用配置的基准带宽）
+        max_bandwidth_kbps = config['network_base_bandwidth_mbps'] * 125  # Mbps转KB/s
         total_network_usage = net_rx_kbps + net_tx_kbps
         network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
@@ -16357,60 +20850,60 @@ class DatabaseManager:
         warnings = []
         
         # CPU使用率检查
-        if cpu_total >= 90:
+        if cpu_total >= config['cpu_warning_threshold']:
             status_level = "警告"
             issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
-        elif cpu_total >= 70:
+        elif cpu_total >= config['cpu_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
         
         # 内存使用率检查
-        if mem_usage_percent >= 90:
+        if mem_usage_percent >= config['memory_warning_threshold']:
             status_level = "警告"
             issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
-        elif mem_usage_percent >= 70:
+        elif mem_usage_percent >= config['memory_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
         
         # 磁盘使用率检查
-        if disk_used_percent >= 90:
+        if disk_used_percent >= config['disk_warning_threshold']:
             status_level = "警告"
             issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
-        elif disk_used_percent >= 70:
+        elif disk_used_percent >= config['disk_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
         
         # Swap使用率检查
-        if swap_usage_percent >= 50:
+        if swap_usage_percent >= config['swap_warning_threshold']:
             status_level = "警告"
             issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
-        elif swap_usage_percent >= 20:
+        elif swap_usage_percent >= config['swap_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
         # 网络使用率检查
-        if network_usage_percent >= 90:
+        if network_usage_percent >= config['network_warning_threshold']:
             status_level = "警告"
             issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
-        elif network_usage_percent >= 70:
+        elif network_usage_percent >= config['network_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
         
-        # 数据时效性检查（超过1小时无数据视为异常）
+        # 数据时效性检查
         import time
         current_timestamp = int(time.time())
         metric_timestamp = metric.get('ts', 0)
         time_diff_hours = (current_timestamp - metric_timestamp) / 3600
         
-        if time_diff_hours > 1:
+        if time_diff_hours > config['data_freshness_warning_hours']:
             status_level = "警告"
             issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
-        elif time_diff_hours > 0.3:
+        elif time_diff_hours > config['data_freshness_alert_hours']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
@@ -16431,12 +20924,12 @@ class DatabaseManager:
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours, config)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float, config: Dict[str, float] = None) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -16447,35 +20940,38 @@ class DatabaseManager:
             swap_usage: Swap使用率
             network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
+            config: 健康度配置字典
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重（调整为5维评分）
+        if config is None:
+            config = self.get_health_config()
+            
+        # 各项指标的权重
         weights = {
-            'cpu': 0.20,
-            'memory': 0.20,
-            'disk': 0.20,
-            'swap': 0.15,
-            'network': 0.15,
-            'freshness': 0.10
+            'cpu': config['cpu_weight'],
+            'memory': config['memory_weight'],
+            'disk': config['disk_weight'],
+            'swap': config['swap_weight'],
+            'network': config['network_weight'],
+            'freshness': config['freshness_weight']
         }
         
-        # 计算各项得分（0-100分）
-        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
-        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
-        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
-        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        # 计算各项得分（0-100分），基于配置的阈值进行动态调整
+        cpu_score = self._calculate_dimension_score(cpu_usage, config['cpu_alert_threshold'], config['cpu_warning_threshold'], 'cpu', config)
+        mem_score = self._calculate_dimension_score(mem_usage, config['memory_alert_threshold'], config['memory_warning_threshold'], 'memory', config)
+        disk_score = self._calculate_dimension_score(disk_usage, config['disk_alert_threshold'], config['disk_warning_threshold'], 'disk', config)
+        swap_score = self._calculate_dimension_score(swap_usage, config['swap_alert_threshold'], config['swap_warning_threshold'], 'swap', config)
         
-        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
-        # 网络使用率越高得分越高，但超过80%开始扣分
-        if network_usage <= 80:
+        # 网络使用率得分（基于配置的阈值）
+        if network_usage <= config['network_score_threshold']:
             network_score = 100
         else:
-            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_score = max(0, 100 - (network_usage - config['network_score_threshold']) * 2)
         
-        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
-        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        # 数据新鲜度得分（使用配置的衰减率）
+        freshness_score = max(0, 100 - (data_freshness * config['freshness_score_decay_rate']))
         
         # 加权平均
         total_score = (
@@ -16488,6 +20984,44 @@ class DatabaseManager:
         )
         
         return int(max(0, min(100, total_score)))
+    
+    def _calculate_dimension_score(self, usage: float, alert_threshold: float, warning_threshold: float, dimension: str, config: Dict[str, float] = None) -> float:
+        """
+        计算单个维度的健康评分（0-100分）
+        
+        Args:
+            usage: 使用率
+            alert_threshold: 提示阈值
+            warning_threshold: 警告阈值
+            dimension: 维度名称
+            config: 健康度配置字典
+            
+        Returns:
+            维度评分（0-100）
+        """
+        if config is None:
+            config = self.get_health_config()
+        
+        # 根据不同的维度调整评分策略
+        if dimension == 'swap':
+            # Swap使用率影响倍数
+            usage = min(usage * config['swap_multiplier'], 100)
+        
+        # 基于配置的阈值进行评分
+        if usage <= alert_threshold:
+            # 正常范围：基于配置的基础评分和扣分率
+            normal_penalty = usage * config['normal_range_penalty_rate']
+            return max(0, config['normal_range_score_base'] - normal_penalty)
+        elif usage <= warning_threshold:
+            # 提示范围：基于配置的基础评分和扣分率
+            alert_range = warning_threshold - alert_threshold
+            alert_penalty = (usage - alert_threshold) / alert_range * (config['normal_range_score_base'] - config['alert_range_score_base'])
+            return max(0, config['alert_range_score_base'] - alert_penalty)
+        else:
+            # 警告范围：基于配置的基础评分和扣分率
+            warning_range = 100 - warning_threshold
+            warning_penalty = (usage - warning_threshold) / warning_range * (config['alert_range_score_base'] - config['warning_range_score_base'])
+            return max(0, config['warning_range_score_base'] - warning_penalty)
 
     def get_machine_status_by_ip(self, ip: str) -> Dict:
         """
@@ -16876,6 +21410,114 @@ class DatabaseManager:
         finally:
             self.return_connection(connection)
 
+    def get_health_config(self, force_refresh: bool = False) -> Dict[str, float]:
+        """获取健康度配置"""
+        import time
+        
+        # 检查缓存是否有效
+        current_time = time.time()
+        if (not force_refresh and 
+            self._health_config_cache is not None and 
+            current_time - self._health_config_cache_time < self._health_config_cache_ttl):
+            return self._health_config_cache
+        
+        connection = self.get_connection()
+        if not connection:
+            return self._get_default_health_config()
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT config_key, config_value FROM health_config")
+                config_data = cursor.fetchall()
+                
+                config_dict = {}
+                for row in config_data:
+                    # 修复：使用索引而不是字典键访问
+                    config_dict[row[0]] = float(row[1])
+                
+                # 确保所有必要的配置项都存在
+                default_config = self._get_default_health_config()
+                for key, value in default_config.items():
+                    if key not in config_dict:
+                        config_dict[key] = value
+                
+                # 更新缓存
+                self._health_config_cache = config_dict
+                self._health_config_cache_time = current_time
+                
+                return config_dict
+                
+        except Exception as e:
+            print(f"获取健康度配置失败: {e}")
+            return self._get_default_health_config()
+        finally:
+            self.return_connection(connection)
+    
+    def _get_default_health_config(self) -> Dict[str, float]:
+        """获取默认健康度配置"""
+        return {
+            'cpu_warning_threshold': 90.0,
+            'cpu_alert_threshold': 70.0,
+            'memory_warning_threshold': 90.0,
+            'memory_alert_threshold': 70.0,
+            'disk_warning_threshold': 90.0,
+            'disk_alert_threshold': 70.0,
+            'swap_warning_threshold': 50.0,
+            'swap_alert_threshold': 20.0,
+            'network_warning_threshold': 90.0,
+            'network_alert_threshold': 70.0,
+            'data_freshness_warning_hours': 1.0,
+            'data_freshness_alert_hours': 0.3,
+            'cpu_weight': 0.20,
+            'memory_weight': 0.20,
+            'disk_weight': 0.20,
+            'swap_weight': 0.15,
+            'network_weight': 0.15,
+            'freshness_weight': 0.10,
+            'network_base_bandwidth_mbps': 1000.0,
+            'network_score_threshold': 80.0,
+            'freshness_score_decay_rate': 20.0,
+            # 新增评分配置参数
+            'normal_range_score_base': 80.0,
+            'alert_range_score_base': 50.0,
+            'warning_range_score_base': 20.0,
+            'normal_range_penalty_rate': 0.20,
+            'alert_range_penalty_rate': 0.30,
+            'warning_range_penalty_rate': 0.50,
+            'swap_multiplier': 2.0,
+            'network_penalty_multiplier': 2.0
+        }
+    
+    def update_health_config(self, config_key: str, config_value: float) -> bool:
+        """更新健康度配置"""
+        connection = self.get_connection()
+        if not connection:
+            return False
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO health_config (config_key, config_value, updated_at) 
+                    VALUES (%s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (config_key) DO UPDATE SET 
+                    config_value = EXCLUDED.config_value,
+                    updated_at = CURRENT_TIMESTAMP
+                """, (config_key, config_value))
+                connection.commit()
+                
+                # 清除缓存，强制下次读取时刷新
+                self._health_config_cache = None
+                self._health_config_cache_time = 0
+                
+                return True
+                
+        except Exception as e:
+            print(f"更新健康度配置失败: {e}")
+            connection.rollback()
+            return False
+        finally:
+            self.return_connection(connection)
+    
     def assess_machine_status(self, metric: Dict) -> Dict:
         """
         根据监控指标评估机器运行状态
@@ -16886,6 +21528,9 @@ class DatabaseManager:
         Returns:
             包含状态分级和详细信息的字典
         """
+        # 获取健康度配置
+        config = self.get_health_config()
+        
         # 获取关键指标值，处理None值
         cpu_usr = metric.get('cpu_usr', 0) or 0
         cpu_sys = metric.get('cpu_sys', 0) or 0
@@ -16910,9 +21555,8 @@ class DatabaseManager:
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
         
-        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
-        # 1000 Mbps = 125,000 KB/s
-        max_bandwidth_kbps = 125000
+        # 计算网络使用率（使用配置的基准带宽）
+        max_bandwidth_kbps = config['network_base_bandwidth_mbps'] * 125  # Mbps转KB/s
         total_network_usage = net_rx_kbps + net_tx_kbps
         network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
@@ -16922,60 +21566,60 @@ class DatabaseManager:
         warnings = []
         
         # CPU使用率检查
-        if cpu_total >= 90:
+        if cpu_total >= config['cpu_warning_threshold']:
             status_level = "警告"
             issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
-        elif cpu_total >= 70:
+        elif cpu_total >= config['cpu_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
         
         # 内存使用率检查
-        if mem_usage_percent >= 90:
+        if mem_usage_percent >= config['memory_warning_threshold']:
             status_level = "警告"
             issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
-        elif mem_usage_percent >= 70:
+        elif mem_usage_percent >= config['memory_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
         
         # 磁盘使用率检查
-        if disk_used_percent >= 90:
+        if disk_used_percent >= config['disk_warning_threshold']:
             status_level = "警告"
             issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
-        elif disk_used_percent >= 70:
+        elif disk_used_percent >= config['disk_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
         
         # Swap使用率检查
-        if swap_usage_percent >= 50:
+        if swap_usage_percent >= config['swap_warning_threshold']:
             status_level = "警告"
             issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
-        elif swap_usage_percent >= 20:
+        elif swap_usage_percent >= config['swap_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
         # 网络使用率检查
-        if network_usage_percent >= 90:
+        if network_usage_percent >= config['network_warning_threshold']:
             status_level = "警告"
             issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
-        elif network_usage_percent >= 70:
+        elif network_usage_percent >= config['network_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
         
-        # 数据时效性检查（超过1小时无数据视为异常）
+        # 数据时效性检查
         import time
         current_timestamp = int(time.time())
         metric_timestamp = metric.get('ts', 0)
         time_diff_hours = (current_timestamp - metric_timestamp) / 3600
         
-        if time_diff_hours > 1:
+        if time_diff_hours > config['data_freshness_warning_hours']:
             status_level = "警告"
             issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
-        elif time_diff_hours > 0.3:
+        elif time_diff_hours > config['data_freshness_alert_hours']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
@@ -16996,12 +21640,12 @@ class DatabaseManager:
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours, config)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float, config: Dict[str, float] = None) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -17012,35 +21656,38 @@ class DatabaseManager:
             swap_usage: Swap使用率
             network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
+            config: 健康度配置字典
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重（调整为5维评分）
+        if config is None:
+            config = self.get_health_config()
+            
+        # 各项指标的权重
         weights = {
-            'cpu': 0.20,
-            'memory': 0.20,
-            'disk': 0.20,
-            'swap': 0.15,
-            'network': 0.15,
-            'freshness': 0.10
+            'cpu': config['cpu_weight'],
+            'memory': config['memory_weight'],
+            'disk': config['disk_weight'],
+            'swap': config['swap_weight'],
+            'network': config['network_weight'],
+            'freshness': config['freshness_weight']
         }
         
-        # 计算各项得分（0-100分）
-        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
-        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
-        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
-        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        # 计算各项得分（0-100分），基于配置的阈值进行动态调整
+        cpu_score = self._calculate_dimension_score(cpu_usage, config['cpu_alert_threshold'], config['cpu_warning_threshold'], 'cpu', config)
+        mem_score = self._calculate_dimension_score(mem_usage, config['memory_alert_threshold'], config['memory_warning_threshold'], 'memory', config)
+        disk_score = self._calculate_dimension_score(disk_usage, config['disk_alert_threshold'], config['disk_warning_threshold'], 'disk', config)
+        swap_score = self._calculate_dimension_score(swap_usage, config['swap_alert_threshold'], config['swap_warning_threshold'], 'swap', config)
         
-        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
-        # 网络使用率越高得分越高，但超过80%开始扣分
-        if network_usage <= 80:
+        # 网络使用率得分（基于配置的阈值）
+        if network_usage <= config['network_score_threshold']:
             network_score = 100
         else:
-            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_score = max(0, 100 - (network_usage - config['network_score_threshold']) * 2)
         
-        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
-        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        # 数据新鲜度得分（使用配置的衰减率）
+        freshness_score = max(0, 100 - (data_freshness * config['freshness_score_decay_rate']))
         
         # 加权平均
         total_score = (
@@ -17053,6 +21700,44 @@ class DatabaseManager:
         )
         
         return int(max(0, min(100, total_score)))
+    
+    def _calculate_dimension_score(self, usage: float, alert_threshold: float, warning_threshold: float, dimension: str, config: Dict[str, float] = None) -> float:
+        """
+        计算单个维度的健康评分（0-100分）
+        
+        Args:
+            usage: 使用率
+            alert_threshold: 提示阈值
+            warning_threshold: 警告阈值
+            dimension: 维度名称
+            config: 健康度配置字典
+            
+        Returns:
+            维度评分（0-100）
+        """
+        if config is None:
+            config = self.get_health_config()
+        
+        # 根据不同的维度调整评分策略
+        if dimension == 'swap':
+            # Swap使用率影响倍数
+            usage = min(usage * config['swap_multiplier'], 100)
+        
+        # 基于配置的阈值进行评分
+        if usage <= alert_threshold:
+            # 正常范围：基于配置的基础评分和扣分率
+            normal_penalty = usage * config['normal_range_penalty_rate']
+            return max(0, config['normal_range_score_base'] - normal_penalty)
+        elif usage <= warning_threshold:
+            # 提示范围：基于配置的基础评分和扣分率
+            alert_range = warning_threshold - alert_threshold
+            alert_penalty = (usage - alert_threshold) / alert_range * (config['normal_range_score_base'] - config['alert_range_score_base'])
+            return max(0, config['alert_range_score_base'] - alert_penalty)
+        else:
+            # 警告范围：基于配置的基础评分和扣分率
+            warning_range = 100 - warning_threshold
+            warning_penalty = (usage - warning_threshold) / warning_range * (config['alert_range_score_base'] - config['warning_range_score_base'])
+            return max(0, config['warning_range_score_base'] - warning_penalty)
 
     def get_machine_status_by_ip(self, ip: str) -> Dict:
         """
@@ -17455,6 +22140,114 @@ class DatabaseManager:
         finally:
             self.return_connection(connection)
 
+    def get_health_config(self, force_refresh: bool = False) -> Dict[str, float]:
+        """获取健康度配置"""
+        import time
+        
+        # 检查缓存是否有效
+        current_time = time.time()
+        if (not force_refresh and 
+            self._health_config_cache is not None and 
+            current_time - self._health_config_cache_time < self._health_config_cache_ttl):
+            return self._health_config_cache
+        
+        connection = self.get_connection()
+        if not connection:
+            return self._get_default_health_config()
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT config_key, config_value FROM health_config")
+                config_data = cursor.fetchall()
+                
+                config_dict = {}
+                for row in config_data:
+                    # 修复：使用索引而不是字典键访问
+                    config_dict[row[0]] = float(row[1])
+                
+                # 确保所有必要的配置项都存在
+                default_config = self._get_default_health_config()
+                for key, value in default_config.items():
+                    if key not in config_dict:
+                        config_dict[key] = value
+                
+                # 更新缓存
+                self._health_config_cache = config_dict
+                self._health_config_cache_time = current_time
+                
+                return config_dict
+                
+        except Exception as e:
+            print(f"获取健康度配置失败: {e}")
+            return self._get_default_health_config()
+        finally:
+            self.return_connection(connection)
+    
+    def _get_default_health_config(self) -> Dict[str, float]:
+        """获取默认健康度配置"""
+        return {
+            'cpu_warning_threshold': 90.0,
+            'cpu_alert_threshold': 70.0,
+            'memory_warning_threshold': 90.0,
+            'memory_alert_threshold': 70.0,
+            'disk_warning_threshold': 90.0,
+            'disk_alert_threshold': 70.0,
+            'swap_warning_threshold': 50.0,
+            'swap_alert_threshold': 20.0,
+            'network_warning_threshold': 90.0,
+            'network_alert_threshold': 70.0,
+            'data_freshness_warning_hours': 1.0,
+            'data_freshness_alert_hours': 0.3,
+            'cpu_weight': 0.20,
+            'memory_weight': 0.20,
+            'disk_weight': 0.20,
+            'swap_weight': 0.15,
+            'network_weight': 0.15,
+            'freshness_weight': 0.10,
+            'network_base_bandwidth_mbps': 1000.0,
+            'network_score_threshold': 80.0,
+            'freshness_score_decay_rate': 20.0,
+            # 新增评分配置参数
+            'normal_range_score_base': 80.0,
+            'alert_range_score_base': 50.0,
+            'warning_range_score_base': 20.0,
+            'normal_range_penalty_rate': 0.20,
+            'alert_range_penalty_rate': 0.30,
+            'warning_range_penalty_rate': 0.50,
+            'swap_multiplier': 2.0,
+            'network_penalty_multiplier': 2.0
+        }
+    
+    def update_health_config(self, config_key: str, config_value: float) -> bool:
+        """更新健康度配置"""
+        connection = self.get_connection()
+        if not connection:
+            return False
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO health_config (config_key, config_value, updated_at) 
+                    VALUES (%s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (config_key) DO UPDATE SET 
+                    config_value = EXCLUDED.config_value,
+                    updated_at = CURRENT_TIMESTAMP
+                """, (config_key, config_value))
+                connection.commit()
+                
+                # 清除缓存，强制下次读取时刷新
+                self._health_config_cache = None
+                self._health_config_cache_time = 0
+                
+                return True
+                
+        except Exception as e:
+            print(f"更新健康度配置失败: {e}")
+            connection.rollback()
+            return False
+        finally:
+            self.return_connection(connection)
+    
     def assess_machine_status(self, metric: Dict) -> Dict:
         """
         根据监控指标评估机器运行状态
@@ -17465,6 +22258,9 @@ class DatabaseManager:
         Returns:
             包含状态分级和详细信息的字典
         """
+        # 获取健康度配置
+        config = self.get_health_config()
+        
         # 获取关键指标值，处理None值
         cpu_usr = metric.get('cpu_usr', 0) or 0
         cpu_sys = metric.get('cpu_sys', 0) or 0
@@ -17489,9 +22285,8 @@ class DatabaseManager:
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
         
-        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
-        # 1000 Mbps = 125,000 KB/s
-        max_bandwidth_kbps = 125000
+        # 计算网络使用率（使用配置的基准带宽）
+        max_bandwidth_kbps = config['network_base_bandwidth_mbps'] * 125  # Mbps转KB/s
         total_network_usage = net_rx_kbps + net_tx_kbps
         network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
@@ -17501,60 +22296,60 @@ class DatabaseManager:
         warnings = []
         
         # CPU使用率检查
-        if cpu_total >= 90:
+        if cpu_total >= config['cpu_warning_threshold']:
             status_level = "警告"
             issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
-        elif cpu_total >= 70:
+        elif cpu_total >= config['cpu_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
         
         # 内存使用率检查
-        if mem_usage_percent >= 90:
+        if mem_usage_percent >= config['memory_warning_threshold']:
             status_level = "警告"
             issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
-        elif mem_usage_percent >= 70:
+        elif mem_usage_percent >= config['memory_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
         
         # 磁盘使用率检查
-        if disk_used_percent >= 90:
+        if disk_used_percent >= config['disk_warning_threshold']:
             status_level = "警告"
             issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
-        elif disk_used_percent >= 70:
+        elif disk_used_percent >= config['disk_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
         
         # Swap使用率检查
-        if swap_usage_percent >= 50:
+        if swap_usage_percent >= config['swap_warning_threshold']:
             status_level = "警告"
             issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
-        elif swap_usage_percent >= 20:
+        elif swap_usage_percent >= config['swap_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
         # 网络使用率检查
-        if network_usage_percent >= 90:
+        if network_usage_percent >= config['network_warning_threshold']:
             status_level = "警告"
             issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
-        elif network_usage_percent >= 70:
+        elif network_usage_percent >= config['network_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
         
-        # 数据时效性检查（超过1小时无数据视为异常）
+        # 数据时效性检查
         import time
         current_timestamp = int(time.time())
         metric_timestamp = metric.get('ts', 0)
         time_diff_hours = (current_timestamp - metric_timestamp) / 3600
         
-        if time_diff_hours > 1:
+        if time_diff_hours > config['data_freshness_warning_hours']:
             status_level = "警告"
             issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
-        elif time_diff_hours > 0.3:
+        elif time_diff_hours > config['data_freshness_alert_hours']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
@@ -17575,12 +22370,12 @@ class DatabaseManager:
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours, config)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float, config: Dict[str, float] = None) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -17591,35 +22386,38 @@ class DatabaseManager:
             swap_usage: Swap使用率
             network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
+            config: 健康度配置字典
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重（调整为5维评分）
+        if config is None:
+            config = self.get_health_config()
+            
+        # 各项指标的权重
         weights = {
-            'cpu': 0.20,
-            'memory': 0.20,
-            'disk': 0.20,
-            'swap': 0.15,
-            'network': 0.15,
-            'freshness': 0.10
+            'cpu': config['cpu_weight'],
+            'memory': config['memory_weight'],
+            'disk': config['disk_weight'],
+            'swap': config['swap_weight'],
+            'network': config['network_weight'],
+            'freshness': config['freshness_weight']
         }
         
-        # 计算各项得分（0-100分）
-        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
-        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
-        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
-        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        # 计算各项得分（0-100分），基于配置的阈值进行动态调整
+        cpu_score = self._calculate_dimension_score(cpu_usage, config['cpu_alert_threshold'], config['cpu_warning_threshold'], 'cpu', config)
+        mem_score = self._calculate_dimension_score(mem_usage, config['memory_alert_threshold'], config['memory_warning_threshold'], 'memory', config)
+        disk_score = self._calculate_dimension_score(disk_usage, config['disk_alert_threshold'], config['disk_warning_threshold'], 'disk', config)
+        swap_score = self._calculate_dimension_score(swap_usage, config['swap_alert_threshold'], config['swap_warning_threshold'], 'swap', config)
         
-        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
-        # 网络使用率越高得分越高，但超过80%开始扣分
-        if network_usage <= 80:
+        # 网络使用率得分（基于配置的阈值）
+        if network_usage <= config['network_score_threshold']:
             network_score = 100
         else:
-            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_score = max(0, 100 - (network_usage - config['network_score_threshold']) * 2)
         
-        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
-        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        # 数据新鲜度得分（使用配置的衰减率）
+        freshness_score = max(0, 100 - (data_freshness * config['freshness_score_decay_rate']))
         
         # 加权平均
         total_score = (
@@ -17632,6 +22430,44 @@ class DatabaseManager:
         )
         
         return int(max(0, min(100, total_score)))
+    
+    def _calculate_dimension_score(self, usage: float, alert_threshold: float, warning_threshold: float, dimension: str, config: Dict[str, float] = None) -> float:
+        """
+        计算单个维度的健康评分（0-100分）
+        
+        Args:
+            usage: 使用率
+            alert_threshold: 提示阈值
+            warning_threshold: 警告阈值
+            dimension: 维度名称
+            config: 健康度配置字典
+            
+        Returns:
+            维度评分（0-100）
+        """
+        if config is None:
+            config = self.get_health_config()
+        
+        # 根据不同的维度调整评分策略
+        if dimension == 'swap':
+            # Swap使用率影响倍数
+            usage = min(usage * config['swap_multiplier'], 100)
+        
+        # 基于配置的阈值进行评分
+        if usage <= alert_threshold:
+            # 正常范围：基于配置的基础评分和扣分率
+            normal_penalty = usage * config['normal_range_penalty_rate']
+            return max(0, config['normal_range_score_base'] - normal_penalty)
+        elif usage <= warning_threshold:
+            # 提示范围：基于配置的基础评分和扣分率
+            alert_range = warning_threshold - alert_threshold
+            alert_penalty = (usage - alert_threshold) / alert_range * (config['normal_range_score_base'] - config['alert_range_score_base'])
+            return max(0, config['alert_range_score_base'] - alert_penalty)
+        else:
+            # 警告范围：基于配置的基础评分和扣分率
+            warning_range = 100 - warning_threshold
+            warning_penalty = (usage - warning_threshold) / warning_range * (config['alert_range_score_base'] - config['warning_range_score_base'])
+            return max(0, config['warning_range_score_base'] - warning_penalty)
 
     def get_machine_status_by_ip(self, ip: str) -> Dict:
         """
@@ -18006,6 +22842,114 @@ class DatabaseManager:
         finally:
             self.return_connection(connection)
 
+    def get_health_config(self, force_refresh: bool = False) -> Dict[str, float]:
+        """获取健康度配置"""
+        import time
+        
+        # 检查缓存是否有效
+        current_time = time.time()
+        if (not force_refresh and 
+            self._health_config_cache is not None and 
+            current_time - self._health_config_cache_time < self._health_config_cache_ttl):
+            return self._health_config_cache
+        
+        connection = self.get_connection()
+        if not connection:
+            return self._get_default_health_config()
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT config_key, config_value FROM health_config")
+                config_data = cursor.fetchall()
+                
+                config_dict = {}
+                for row in config_data:
+                    # 修复：使用索引而不是字典键访问
+                    config_dict[row[0]] = float(row[1])
+                
+                # 确保所有必要的配置项都存在
+                default_config = self._get_default_health_config()
+                for key, value in default_config.items():
+                    if key not in config_dict:
+                        config_dict[key] = value
+                
+                # 更新缓存
+                self._health_config_cache = config_dict
+                self._health_config_cache_time = current_time
+                
+                return config_dict
+                
+        except Exception as e:
+            print(f"获取健康度配置失败: {e}")
+            return self._get_default_health_config()
+        finally:
+            self.return_connection(connection)
+    
+    def _get_default_health_config(self) -> Dict[str, float]:
+        """获取默认健康度配置"""
+        return {
+            'cpu_warning_threshold': 90.0,
+            'cpu_alert_threshold': 70.0,
+            'memory_warning_threshold': 90.0,
+            'memory_alert_threshold': 70.0,
+            'disk_warning_threshold': 90.0,
+            'disk_alert_threshold': 70.0,
+            'swap_warning_threshold': 50.0,
+            'swap_alert_threshold': 20.0,
+            'network_warning_threshold': 90.0,
+            'network_alert_threshold': 70.0,
+            'data_freshness_warning_hours': 1.0,
+            'data_freshness_alert_hours': 0.3,
+            'cpu_weight': 0.20,
+            'memory_weight': 0.20,
+            'disk_weight': 0.20,
+            'swap_weight': 0.15,
+            'network_weight': 0.15,
+            'freshness_weight': 0.10,
+            'network_base_bandwidth_mbps': 1000.0,
+            'network_score_threshold': 80.0,
+            'freshness_score_decay_rate': 20.0,
+            # 新增评分配置参数
+            'normal_range_score_base': 80.0,
+            'alert_range_score_base': 50.0,
+            'warning_range_score_base': 20.0,
+            'normal_range_penalty_rate': 0.20,
+            'alert_range_penalty_rate': 0.30,
+            'warning_range_penalty_rate': 0.50,
+            'swap_multiplier': 2.0,
+            'network_penalty_multiplier': 2.0
+        }
+    
+    def update_health_config(self, config_key: str, config_value: float) -> bool:
+        """更新健康度配置"""
+        connection = self.get_connection()
+        if not connection:
+            return False
+            
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO health_config (config_key, config_value, updated_at) 
+                    VALUES (%s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (config_key) DO UPDATE SET 
+                    config_value = EXCLUDED.config_value,
+                    updated_at = CURRENT_TIMESTAMP
+                """, (config_key, config_value))
+                connection.commit()
+                
+                # 清除缓存，强制下次读取时刷新
+                self._health_config_cache = None
+                self._health_config_cache_time = 0
+                
+                return True
+                
+        except Exception as e:
+            print(f"更新健康度配置失败: {e}")
+            connection.rollback()
+            return False
+        finally:
+            self.return_connection(connection)
+    
     def assess_machine_status(self, metric: Dict) -> Dict:
         """
         根据监控指标评估机器运行状态
@@ -18016,6 +22960,9 @@ class DatabaseManager:
         Returns:
             包含状态分级和详细信息的字典
         """
+        # 获取健康度配置
+        config = self.get_health_config()
+        
         # 获取关键指标值，处理None值
         cpu_usr = metric.get('cpu_usr', 0) or 0
         cpu_sys = metric.get('cpu_sys', 0) or 0
@@ -18040,9 +22987,8 @@ class DatabaseManager:
         mem_usage_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0
         swap_usage_percent = (swap_used / swap_total * 100) if swap_total > 0 else 0
         
-        # 计算网络使用率（假设1000Mbps为基准带宽，转换为KB/s）
-        # 1000 Mbps = 125,000 KB/s
-        max_bandwidth_kbps = 125000
+        # 计算网络使用率（使用配置的基准带宽）
+        max_bandwidth_kbps = config['network_base_bandwidth_mbps'] * 125  # Mbps转KB/s
         total_network_usage = net_rx_kbps + net_tx_kbps
         network_usage_percent = min(100, (total_network_usage / max_bandwidth_kbps) * 100) if max_bandwidth_kbps > 0 else 0
         
@@ -18052,60 +22998,60 @@ class DatabaseManager:
         warnings = []
         
         # CPU使用率检查
-        if cpu_total >= 90:
+        if cpu_total >= config['cpu_warning_threshold']:
             status_level = "警告"
             issues.append(f"CPU使用率过高: {cpu_total:.1f}%")
-        elif cpu_total >= 70:
+        elif cpu_total >= config['cpu_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"CPU使用率较高: {cpu_total:.1f}%")
         
         # 内存使用率检查
-        if mem_usage_percent >= 90:
+        if mem_usage_percent >= config['memory_warning_threshold']:
             status_level = "警告"
             issues.append(f"内存使用率过高: {mem_usage_percent:.1f}%")
-        elif mem_usage_percent >= 70:
+        elif mem_usage_percent >= config['memory_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"内存使用率较高: {mem_usage_percent:.1f}%")
         
         # 磁盘使用率检查
-        if disk_used_percent >= 90:
+        if disk_used_percent >= config['disk_warning_threshold']:
             status_level = "警告"
             issues.append(f"磁盘使用率过高: {disk_used_percent:.1f}%")
-        elif disk_used_percent >= 70:
+        elif disk_used_percent >= config['disk_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"磁盘使用率较高: {disk_used_percent:.1f}%")
         
         # Swap使用率检查
-        if swap_usage_percent >= 50:
+        if swap_usage_percent >= config['swap_warning_threshold']:
             status_level = "警告"
             issues.append(f"Swap使用率过高: {swap_usage_percent:.1f}%")
-        elif swap_usage_percent >= 20:
+        elif swap_usage_percent >= config['swap_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"Swap使用率较高: {swap_usage_percent:.1f}%")
         
         # 网络使用率检查
-        if network_usage_percent >= 90:
+        if network_usage_percent >= config['network_warning_threshold']:
             status_level = "警告"
             issues.append(f"网络带宽使用率过高: {network_usage_percent:.1f}%")
-        elif network_usage_percent >= 70:
+        elif network_usage_percent >= config['network_alert_threshold']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"网络带宽使用率较高: {network_usage_percent:.1f}%")
         
-        # 数据时效性检查（超过1小时无数据视为异常）
+        # 数据时效性检查
         import time
         current_timestamp = int(time.time())
         metric_timestamp = metric.get('ts', 0)
         time_diff_hours = (current_timestamp - metric_timestamp) / 3600
         
-        if time_diff_hours > 1:
+        if time_diff_hours > config['data_freshness_warning_hours']:
             status_level = "警告"
             issues.append(f"数据已过期: {time_diff_hours:.1f}小时前")
-        elif time_diff_hours > 0.3:
+        elif time_diff_hours > config['data_freshness_alert_hours']:
             if status_level != "警告":
                 status_level = "提示"
             warnings.append(f"数据较旧: {time_diff_hours:.1f}小时前")
@@ -18126,12 +23072,12 @@ class DatabaseManager:
             "issues": issues,
             "warnings": warnings,
             "is_healthy": status_level == "正常",
-            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours)
+            "overall_score": self._calculate_health_score(cpu_total, mem_usage_percent, disk_used_percent, swap_usage_percent, network_usage_percent, time_diff_hours, config)
         }
         
         return result
 
-    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float) -> int:
+    def _calculate_health_score(self, cpu_usage: float, mem_usage: float, disk_usage: float, swap_usage: float, network_usage: float, data_freshness: float, config: Dict[str, float] = None) -> int:
         """
         计算机器健康评分（0-100分）
         
@@ -18142,35 +23088,38 @@ class DatabaseManager:
             swap_usage: Swap使用率
             network_usage: 网络使用率（基于带宽使用率）
             data_freshness: 数据新鲜度（小时）
+            config: 健康度配置字典
             
         Returns:
             健康评分（0-100）
         """
-        # 各项指标的权重（调整为5维评分）
+        if config is None:
+            config = self.get_health_config()
+            
+        # 各项指标的权重
         weights = {
-            'cpu': 0.20,
-            'memory': 0.20,
-            'disk': 0.20,
-            'swap': 0.15,
-            'network': 0.15,
-            'freshness': 0.10
+            'cpu': config['cpu_weight'],
+            'memory': config['memory_weight'],
+            'disk': config['disk_weight'],
+            'swap': config['swap_weight'],
+            'network': config['network_weight'],
+            'freshness': config['freshness_weight']
         }
         
-        # 计算各项得分（0-100分）
-        cpu_score = max(0, 100 - cpu_usage)  # CPU使用率越低得分越高
-        mem_score = max(0, 100 - mem_usage)  # 内存使用率越低得分越高
-        disk_score = max(0, 100 - disk_usage)  # 磁盘使用率越低得分越高
-        swap_score = max(0, 100 - min(swap_usage * 2, 100))  # Swap使用率影响加倍
+        # 计算各项得分（0-100分），基于配置的阈值进行动态调整
+        cpu_score = self._calculate_dimension_score(cpu_usage, config['cpu_alert_threshold'], config['cpu_warning_threshold'], 'cpu', config)
+        mem_score = self._calculate_dimension_score(mem_usage, config['memory_alert_threshold'], config['memory_warning_threshold'], 'memory', config)
+        disk_score = self._calculate_dimension_score(disk_usage, config['disk_alert_threshold'], config['disk_warning_threshold'], 'disk', config)
+        swap_score = self._calculate_dimension_score(swap_usage, config['swap_alert_threshold'], config['swap_warning_threshold'], 'swap', config)
         
-        # 网络使用率得分（基于带宽使用率，假设1000Mbps为基准）
-        # 网络使用率越高得分越高，但超过80%开始扣分
-        if network_usage <= 80:
+        # 网络使用率得分（基于配置的阈值）
+        if network_usage <= config['network_score_threshold']:
             network_score = 100
         else:
-            network_score = max(0, 100 - (network_usage - 80) * 2)  # 超过80%每1%扣2分
+            network_score = max(0, 100 - (network_usage - config['network_score_threshold']) * 2)
         
-        # 数据新鲜度得分（1小时内得100分，超过1小时线性递减）
-        freshness_score = max(0, 100 - (data_freshness * 20))  # 每超过1小时减20分
+        # 数据新鲜度得分（使用配置的衰减率）
+        freshness_score = max(0, 100 - (data_freshness * config['freshness_score_decay_rate']))
         
         # 加权平均
         total_score = (
@@ -18183,6 +23132,44 @@ class DatabaseManager:
         )
         
         return int(max(0, min(100, total_score)))
+    
+    def _calculate_dimension_score(self, usage: float, alert_threshold: float, warning_threshold: float, dimension: str, config: Dict[str, float] = None) -> float:
+        """
+        计算单个维度的健康评分（0-100分）
+        
+        Args:
+            usage: 使用率
+            alert_threshold: 提示阈值
+            warning_threshold: 警告阈值
+            dimension: 维度名称
+            config: 健康度配置字典
+            
+        Returns:
+            维度评分（0-100）
+        """
+        if config is None:
+            config = self.get_health_config()
+        
+        # 根据不同的维度调整评分策略
+        if dimension == 'swap':
+            # Swap使用率影响倍数
+            usage = min(usage * config['swap_multiplier'], 100)
+        
+        # 基于配置的阈值进行评分
+        if usage <= alert_threshold:
+            # 正常范围：基于配置的基础评分和扣分率
+            normal_penalty = usage * config['normal_range_penalty_rate']
+            return max(0, config['normal_range_score_base'] - normal_penalty)
+        elif usage <= warning_threshold:
+            # 提示范围：基于配置的基础评分和扣分率
+            alert_range = warning_threshold - alert_threshold
+            alert_penalty = (usage - alert_threshold) / alert_range * (config['normal_range_score_base'] - config['alert_range_score_base'])
+            return max(0, config['alert_range_score_base'] - alert_penalty)
+        else:
+            # 警告范围：基于配置的基础评分和扣分率
+            warning_range = 100 - warning_threshold
+            warning_penalty = (usage - warning_threshold) / warning_range * (config['alert_range_score_base'] - config['warning_range_score_base'])
+            return max(0, config['warning_range_score_base'] - warning_penalty)
 
     def get_machine_status_by_ip(self, ip: str) -> Dict:
         """
